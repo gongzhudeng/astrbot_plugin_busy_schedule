@@ -1,0 +1,334 @@
+{
+  "基础设置": {
+    "description": "基础配置",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用插件",
+        "type": "bool",
+        "default": true
+      },
+      "debug_mode": {
+        "description": "调试模式",
+        "hint": "开启后会在控制台输出详细的调试信息",
+        "type": "bool",
+        "default": false
+      },
+      "schedule_time": {
+        "description": "每日生成日程的时间 (HH:MM)",
+        "hint": "格式为 HH:MM。每天的这个时候生成日程",
+        "type": "string",
+        "default": "07:00"
+      },
+      "schedule_persona_id": {
+        "description": "指定日程生成的人设",
+        "hint": "可选择已配置的人设，用于生成日程。与对话人格分开，不影响说话风格。留空则使用当前对话的人格",
+        "type": "string",
+        "_special": "select_persona",
+        "default": ""
+      },
+      "llm_provider_schedule": {
+        "description": "日程生成的 LLM 供应商",
+        "hint": "留空则使用当前正在使用的 LLM 供应商",
+        "type": "string",
+        "_special": "select_provider",
+        "default": ""
+      },
+      "custom_prompt": {
+        "description": "自定义注入提示词",
+        "hint": "这段内容会注入到 system_prompt 中插件日程信息的前面。可用于控制语言风格、行为习惯等。留空则不注入。",
+        "type": "text",
+        "default": ""
+      }
+    }
+  },
+  "忙碌时段": {
+    "description": "忙碌时段配置",
+    "type": "object",
+    "items": {
+      "chat_protect_minutes": {
+        "description": "聊天保护时间（分钟）",
+        "hint": "用户多少分钟没发消息才能进入忙碌状态",
+        "type": "int",
+        "slider": {
+          "min": 1,
+          "max": 60,
+          "step": 1
+        },
+        "default": 10
+      },
+      "wake_cooldown_minutes": {
+        "description": "唤醒后冷却时间（分钟）",
+        "hint": "被关键词唤醒后，多少分钟后再重新计算是否进入忙碌",
+        "type": "int",
+        "slider": {
+          "min": 1,
+          "max": 60,
+          "step": 1
+        },
+        "default": 15
+      }
+    }
+  },
+  "关键词设置": {
+    "description": "唤醒关键词配置",
+    "type": "object",
+    "items": {
+      "wake_keywords": {
+        "description": "唤醒关键词列表",
+        "hint": "命中这些关键词会立即唤醒AI响应，可添加多个",
+        "type": "list",
+        "default": [
+          "咋不回我",
+          "快点回我呀",
+          "在吗",
+          "出来",
+          "别忙了"
+        ]
+      },
+      "keyword_match_mode": {
+        "description": "唤醒关键词匹配模式",
+        "hint": "包含关键词模式=消息中包含关键词即命中，完全匹配模式=消息与关键词完全一致才命中",
+        "type": "string",
+        "default": "包含关键词模式",
+        "options": [
+          "包含关键词模式",
+          "完全匹配模式"
+        ]
+      },
+      "busy_filter_keywords": {
+        "description": "忙碌时过滤的关键词",
+        "hint": "忙碌期间，消息命中这些关键词会被静默丢弃（不入队、不回复）。适用于过滤其他插件的主动消息",
+        "type": "list",
+        "default": []
+      },
+      "busy_filter_keyword_match_mode": {
+        "description": "过滤关键词匹配模式",
+        "hint": "包含关键词模式=消息中包含关键词即丢弃，完全匹配模式=消息与关键词完全一致才丢弃",
+        "type": "string",
+        "default": "包含关键词模式",
+        "options": [
+          "包含关键词模式",
+          "完全匹配模式"
+        ]
+      }
+    }
+  },
+  "消息合并": {
+    "description": "消息合并配置",
+    "type": "object",
+    "items": {
+      "max_message_count": {
+        "description": "最大消息数",
+        "hint": "达到此数量立即发送合并消息",
+        "type": "int",
+        "slider": {
+          "min": 3,
+          "max": 50,
+          "step": 1
+        },
+        "default": 20
+      },
+      "send_delay_seconds": {
+        "description": "延迟发送时间（秒）",
+        "hint": "最后一条消息后多少秒发送合并消息",
+        "type": "int",
+        "slider": {
+          "min": 5,
+          "max": 300,
+          "step": 5
+        },
+        "default": 60
+      },
+      "merge_prefix": {
+        "description": "合并消息前缀",
+        "hint": "合并消息前添加的提示，{start_time}和{end_time}会被替换",
+        "type": "text",
+        "default": "[以下是你在忙碌时段（{start_time}-{end_time}）收到的用户消息：]"
+      },
+      "merge_suffix": {
+        "description": "合并消息后缀",
+        "hint": "合并消息后添加的提示",
+        "type": "text",
+        "default": "[请回复用户，并说明你刚才在做什么。]"
+      }
+    }
+  },
+  "智能判断": {
+    "description": "LLM智能判断配置",
+    "type": "object",
+    "items": {
+      "enable_smart_judge": {
+        "description": "启用智能判断",
+        "hint": "使用LLM分析用户消息，智能调整日程和忙碌状态",
+        "type": "bool",
+        "default": false
+      },
+      "llm_provider_judge": {
+        "description": "智能判断的 LLM 供应商",
+        "hint": "留空则使用当前正在使用的 LLM 供应商",
+        "type": "string",
+        "_special": "select_provider",
+        "default": ""
+      },
+      "judge_persona_id": {
+        "description": "智能判断的人设",
+        "hint": "可选择已配置的人设，用于智能判断时理解用户意图。留空则使用当前对话的人格",
+        "type": "string",
+        "_special": "select_persona",
+        "default": ""
+      },
+      "judge_cooldown_minutes": {
+        "description": "判断冷却时间（分钟）",
+        "hint": "两次智能判断之间的最小间隔",
+        "type": "int",
+        "slider": {
+          "min": 1,
+          "max": 60,
+          "step": 1
+        },
+        "default": 5
+      },
+      "judge_history_rounds": {
+        "description": "智能判断参考的对话轮数",
+        "hint": "设为 0 则不参考对话历史",
+        "type": "int",
+        "slider": {
+          "min": 0,
+          "max": 20,
+          "step": 1
+        },
+        "default": 3
+      },
+      "judge_prompt": {
+        "description": "智能判断提示词模板",
+        "hint": "用于分析用户消息并判断是否需要调整日程。支持占位符：{today_schedule}、{current_time}、{user_message}、{conversation_context}",
+        "type": "text",
+        "obvious_hint": true,
+        "editor_mode": true,
+        "editor_language": "markdown",
+        "editor_theme": "vs-dark",
+        "default": "# 任务：分析用户意图，判断是否需要调整日程安排\n\n## 当前日程\n{today_schedule}\n\n## 当前时间\n{current_time}\n\n## 近期对话\n{conversation_context}\n\n## 用户消息\n{user_message}\n\n## 判断规则\n1. 如果用户想让AI取消某个活动（如\"别去了\"、\"别忙了\"、\"陪我聊天\"），应调整该活动\n2. 如果用户想让AI改变睡眠时间（如\"晚点睡\"、\"再陪我一会\"），应调整睡眠时段\n3. 如果用户想让AI提前开始某活动（如\"早点去\"），应调整该活动时间\n4. 如果用户只是普通聊天，不需要调整\n\n## 输出格式\n请严格返回JSON：\n{\n  \"should_adjust\": true/false,\n  \"reason\": \"判断原因\",\n  \"adjustments\": [\n    {\n      \"original_activity\": \"原活动\",\n      \"original_time\": \"原时间 HH:MM-HH:MM\",\n      \"new_activity\": \"新活动（可选）\",\n      \"new_time\": \"新时间 HH:MM-HH:MM（可选）\",\n      \"is_busy\": true/false\n    }\n  ]\n}\n\n如果不需要调整，返回：\n{\"should_adjust\": false, \"reason\": \"普通聊天，无需调整\"}"
+      }
+    }
+  },
+  "日程生成": {
+    "description": "日程生成配置",
+    "type": "object",
+    "items": {
+      "reference_history_days": {
+        "description": "生成时参考的历史日程天数",
+        "type": "int",
+        "slider": {
+          "min": 1,
+          "max": 7,
+          "step": 1
+        },
+        "default": 3
+      },
+      "reference_recent_count": {
+        "description": "生成时参考的近期会话数量",
+        "hint": "设为 0 时，则不参考近期会话",
+        "type": "int",
+        "slider": {
+          "min": 0,
+          "max": 100,
+          "step": 1
+        },
+        "default": 10
+      },
+      "pool": {
+        "description": "创意池",
+        "hint": "每次生成日程时，各个池会随机选择一个来并入日程生成提示词",
+        "type": "object",
+        "items": {
+          "daily_themes": {
+            "description": "今日主题池",
+            "type": "list",
+            "default": [
+              "探索日",
+              "社交日",
+              "宅家日",
+              "工作日",
+              "自我提升日",
+              "休闲放松日",
+              "创意日",
+              "运动日",
+              "整理日",
+              "美食日",
+              "文艺日",
+              "随性漫游日"
+            ]
+          },
+          "mood_colors": {
+            "description": "心情色彩池",
+            "type": "list",
+            "default": [
+              "慵懒",
+              "活力",
+              "优雅",
+              "俏皮",
+              "神秘",
+              "温柔",
+              "冷艳",
+              "甜美",
+              "知性",
+              "随性",
+              "浪漫",
+              "清新"
+            ]
+          },
+          "outfit_styles": {
+            "description": "穿搭风格池",
+            "type": "list",
+            "default": [
+              "知性学院风",
+              "街头休闲风",
+              "温柔淑女风",
+              "酷飒中性风",
+              "慵懒居家风",
+              "精致约会风",
+              "运动活力风",
+              "日系森女风",
+              "法式优雅风",
+              "韩系甜美风",
+              "复古文艺风",
+              "极简都市风",
+              "甜酷混搭风",
+              "民族风情风",
+              "暗黑系风格"
+            ]
+          },
+          "schedule_types": {
+            "description": "日程类型池",
+            "type": "list",
+            "default": [
+              "户外活动型",
+              "社交聚会型",
+              "独处充电型",
+              "技能学习型",
+              "随性漫游型",
+              "家务整理型",
+              "工作专注型",
+              "休闲娱乐型",
+              "健身运动型",
+              "美食探索型",
+              "文化艺术型",
+              "购物采买型"
+            ]
+          }
+        }
+      },
+      "prompt_template": {
+        "description": "日程生成提示词模板",
+        "hint": "支持占位符：{date_str}、{weekday}、{holiday}、{persona_desc}、{daily_theme}、{mood_color}、{outfit_style}、{schedule_type}、{history_schedules}、{recent_chats}、{last_yesterday_activity}",
+        "type": "text",
+        "obvious_hint": true,
+        "editor_mode": true,
+        "editor_language": "markdown",
+        "editor_theme": "vs-dark",
+        "default": "# Role: Life Scheduler\n请根据以下信息，为自己规划一份今天的生活安排。\n\n## Context\n- 日期：{date_str} {weekday} {holiday}\n- 人设：{persona_desc}\n\n## 今日创意约束（必须遵循）\n- 今日主题：【{daily_theme}】\n- 心情色彩：【{mood_color}】\n- 穿搭风格（必须严格遵循）：【{outfit_style}】\n- 日程类型：【{schedule_type}】\n\n## 昨日最后活动（今日日程必须从这里衔接）\n{last_yesterday_activity}\n\n如果昨日有睡眠/休息记录，今日日程必须从「起床/醒来」开始。\n\n## 需要避免的重复内容\n{history_schedules}\n\n## 参考信息\n{recent_chats}\n\n## 重要：日程格式要求\n1. 必须包含睡眠时段（如 23:00-07:00 睡觉）\n2. 每个活动必须标记忙碌状态：\n   - 【可回消息】：可以随时回复用户消息的活动（如刷手机、休息、散步等）\n   - 【忙碌】：不能及时回复的活动（如看电影、开会、运动、睡觉等）\n3. 时间格式：HH:MM-HH:MM 活动描述 【忙碌/可回消息】\n4. **排序规则**：\n   - 活动必须按时间顺序排列（从早到晚）\n   - 跨天的睡眠时段（如 03:00-12:00）必须放在日程的**最后**，而不是最前面\n   - 示例正确顺序：12:00-13:00 午餐 -> 13:00-18:00 活动 -> 18:00-22:00 活动 -> 22:00-03:00 睡觉\n\n## 强制约束（必须严格遵循）\n- 你必须严格遵循穿搭风格：【{outfit_style}】（不得替换/混用其他风格）\n- 你必须只输出 JSON 对象本体（不要 Markdown/代码块/解释）\n- JSON 必须包含字段 \\\"outfit_style\\\"，且其值必须严格等于 \\\"{outfit_style}\\\"\n- 字段 \\\"outfit\\\" 的第一行必须以 \\\"风格：{outfit_style}\\\" 开头\n\n## 约束\n- schedule 和 outfit 必须简洁，不要写多余解释\n- outfit 控制在5行以内\n- schedule 每个活动一行，总共不超过15行\n- 不要添加额外的说明文字\n\n## Tasks\n1. outfit: 今日穿搭描述。必须完整覆盖所有层次，不得省略任何一层：\n   a-1) 内衣（文胸/背心）—— 必须单独列出，写明款式或颜色\n   a-2) 内裤 —— 必须单独列出，写明款式或颜色\n   **禁止**将内衣和内裤合并为一条（如「内衣套装」），必须各自单独一行\n   b) 上装（打底/内搭 + 外套/外层）\n   c) 下装（裤子/裙子等）\n   d) 袜子\n   e) 鞋子\n   f) 配饰（如有）\n   从里到外、从上到下逐层描述，5行以内\n   **禁止**使用「内搭省略」「贴身衣物略」等省略话术，必须写出具体内容\n2. schedule: 规划今日日程，包含睡眠时段，每个活动必须标记忙碌状态，每行一个活动，总共不超过15行。**跨天睡眠放最后！**\n\n## Output Format\n请严格返回 JSON：\n{{\n  \\\"outfit_style\\\": \\\"{outfit_style}\\\",\n  \\\"outfit\\\": \\\"...\\\",\n  \\\"schedule\\\": \\\"...\\\"\n}}"
+      }
+    }
+  }
+}

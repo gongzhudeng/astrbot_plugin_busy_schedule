@@ -1,0 +1,12 @@
+name: astrbot_plugin_busy_schedule
+display_name: 灵犀 · AI忙碌时段管理
+desc: >
+  让AI拥有真实的生活节奏！自动计算忙碌时段、智能拦截合并消息、
+  提前通知、特殊关键词唤醒，打造拟人化聊天体验。
+version: v1.0.0
+author: 灵犀
+repo: https://github.com/gongzhudeng/astrbot_plugin_busy_schedule
+credits: |
+  日程生成功能基于 astrbot_plugin_life_scheduler 改编
+  原作者：木友知 (muyouzhi6)
+  原项目：https://github.com/muyouzhi6/astrbot_plugin_life_scheduler
