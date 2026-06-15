@@ -75,6 +75,22 @@ class BusySchedulePlugin(Star):
         # Expose a force-check callable so downstream plugins can get an immediate state refresh
         self.context._busy_schedule_force_check = self.busy_mgr.check_and_update_state
 
+        # Expose wake-and-flush for Spark: wake AI from busy and send queued messages first
+        async def _wake_and_flush(umo: str):
+            period = self.busy_mgr._current_busy_period
+            has_queue = self.interceptor.has_queued_messages(umo)
+            if self.busy_mgr.is_busy:
+                if has_queue and period:
+                    await self._send_merged_messages(umo, period)
+                await self.busy_mgr.wake_up("external")
+            elif has_queue:
+                _period = period or BusyPeriod(
+                    start_time="??:??", end_time=datetime.now().strftime("%H:%M"), activity="忙碌时段"
+                )
+                await self._send_merged_messages(umo, _period)
+
+        self.context._busy_schedule_wake_and_flush = _wake_and_flush
+
         # Start background tasks
         self._state_check_task = asyncio.create_task(self._state_check_loop())
 
@@ -224,30 +240,58 @@ class BusySchedulePlugin(Star):
         # Use the last event as template
         last_event = events[-1]
 
-        # Prepend wake_prefix so WakingCheckStage passes even when
-        # friend_message_needs_wake_prefix is enabled. The stage strips it automatically.
-        wake_prefixes = self.context.get_config().get("wake_prefix", [])
-        prefix = wake_prefixes[0] if wake_prefixes else ""
-        prefixed_text = f"{prefix}{merged_text}" if prefix else merged_text
+        # Prepend wake_prefix so WakingCheckStage re-evaluates is_wake=True
+        # (it ignores pre-set is_wake and recalculates from scratch each time)
+        wake_prefixes = self.context.get_config().get("wake_prefix", ["/"])
+        wake_prefix = wake_prefixes[0] if wake_prefixes else "/"
+        prefixed_text = wake_prefix + merged_text
 
-        # Mutate event with merged message content (mirror chat_merger pattern)
-        last_event.message_str = prefixed_text
-        last_event.message_obj.message_str = prefixed_text
-        if hasattr(last_event.message_obj, "message"):
-            last_event.message_obj.message = [Plain(prefixed_text)] + extra_components
+        # Build a clean event instead of reusing or deep-copying a stopped one
+        reinjected_message = last_event.message_obj.__class__()
+        reinjected_message.__dict__.update(last_event.message_obj.__dict__)
+        reinjected_message.type = last_event.get_message_type()
+        reinjected_message.message_str = prefixed_text
+        reinjected_message.raw_message = getattr(last_event.message_obj, "raw_message", None)
+        reinjected_message.self_id = last_event.get_self_id()
+        reinjected_message.sender = last_event.message_obj.sender
+        reinjected_message.group = getattr(last_event.message_obj, "group", None)
+        reinjected_message.session_id = last_event.session_id
+        reinjected_message.message_id = getattr(last_event.message_obj, "message_id", None)
+        if hasattr(reinjected_message, "message"):
+            reinjected_message.message = [Plain(prefixed_text)] + extra_components
 
-        # Reset event flags so it can go through the full pipeline
-        last_event._force_stopped = False
-        last_event._result = None
-        last_event._has_send_oper = False
-        last_event.call_llm = False
-        last_event.is_at_or_wake_command = True
-        last_event.is_wake = True
+        event_kwargs = {
+            "message_str": prefixed_text,
+            "message_obj": reinjected_message,
+            "platform_meta": last_event.platform_meta,
+            "session_id": last_event.session_id,
+        }
+        if hasattr(last_event, "bot"):
+            event_kwargs["bot"] = last_event.bot
+        if hasattr(last_event, "client"):
+            event_kwargs["client"] = last_event.client
+        if hasattr(last_event, "interaction_followup_webhook"):
+            event_kwargs["interaction_followup_webhook"] = last_event.interaction_followup_webhook
+
+        reinjected_event = last_event.__class__(**event_kwargs)
+
+        # Preserve only the message identity and clear runtime state
+        reinjected_event.role = "member"
+        reinjected_event.is_at_or_wake_command = False
+        reinjected_event.is_wake = False
+        reinjected_event._force_stopped = False
+        reinjected_event._result = None
+        reinjected_event._has_send_oper = False
+        reinjected_event.call_llm = False
+        reinjected_event.plugins_name = None
+        reinjected_event._extras = {}
+        reinjected_event._temporary_local_files = []
+        reinjected_event.platform = last_event.platform_meta
 
         # Mark as busy_schedule merged to prevent re-interception
-        last_event.set_extra("busy_schedule_merged", True)
+        reinjected_event.set_extra("busy_schedule_merged", True)
         # Also mark as chat_merger merged so chat_merger does not re-intercept
-        last_event.set_extra("chat_merger_merged", True)
+        reinjected_event.set_extra("chat_merger_merged", True)
 
         logger.info(
             f"[BusySchedule] Sending merged messages for {user_id}: "
@@ -259,7 +303,7 @@ class BusySchedulePlugin(Star):
 
         # Re-inject into event queue
         try:
-            self.context.get_event_queue().put_nowait(last_event)
+            self.context.get_event_queue().put_nowait(reinjected_event)
         except Exception as e:
             logger.error(f"[BusySchedule] Failed to re-inject event for {user_id}: {e}")
 
@@ -298,18 +342,18 @@ class BusySchedulePlugin(Star):
 
     def _get_config(self, key: str, default=None):
         """Get config value with schema default fallback."""
-        # Try flat key first
-        value = self.config.get(key)
-        if value is not None and value != "" and value != {} and value != []:
-            return value
-
-        # Try nested groups
+        # Nested groups take priority — user-edited values live here
         for group_name in ["基础设置", "忙碌时段", "关键词设置", "消息合并", "智能判断", "日程生成"]:
             group = self.config.get(group_name, {})
             if isinstance(group, dict) and key in group:
                 val = group[key]
                 if val is not None and val != "" and val != {} and val != []:
                     return val
+
+        # Flat key (may carry schema defaults merged by AstrBotConfig)
+        value = self.config.get(key)
+        if value is not None and value != "" and value != {} and value != []:
+            return value
 
         # Fall back to schema defaults
         schema_default = _SCHEMA_DEFAULTS.get(key)
@@ -351,15 +395,26 @@ class BusySchedulePlugin(Star):
 
         # Check for wake keywords first
         if self._check_wake_keywords(message_text):
+            extra_comps = [c for c in event.message_obj.message if not isinstance(c, Plain)] if hasattr(event.message_obj, "message") else []
+            has_queue = self.interceptor.has_queued_messages(user_id)
             if self.busy_mgr.is_busy:
                 # Queue the wake keyword message itself so it's included in the merged batch
-                extra_comps = [c for c in event.message_obj.message if not isinstance(c, Plain)] if hasattr(event.message_obj, "message") else []
                 self.interceptor.queue_message(user_id, message_text, event, extra_components=extra_comps)
                 await self.busy_mgr.wake_up("keyword")
                 event.stop_event()
                 return
+            elif has_queue:
+                # state_check_loop may have already exited busy before the wake keyword arrived;
+                # the queue is still non-empty so flush it now.
+                now = datetime.now()
+                period = self.busy_mgr._current_busy_period or BusyPeriod(
+                    start_time="??:??", end_time=now.strftime("%H:%M"), activity="忙碌时段"
+                )
+                await self._send_merged_messages(user_id, period)
+                event.stop_event()
+                return
             else:
-                # Not busy, let message through normally
+                # Not busy and no queue, let message through normally
                 return
 
         # If busy, intercept the message (do NOT update chat protection)

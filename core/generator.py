@@ -155,17 +155,18 @@ class ScheduleGenerator:
 
     def _cfg(self, key: str, default=None):
         """Get config value with schema default fallback."""
-        value = self.config.get(key)
-        if value is not None and value != "" and value != {} and value != []:
-            return value
-
-        # Try nested groups
+        # Nested groups take priority — user-edited values live here
         for group_name in ["基础设置", "忙碌时段", "关键词设置", "消息合并", "智能判断", "日程生成"]:
             group = self.config.get(group_name, {})
             if isinstance(group, dict) and key in group:
                 val = group[key]
                 if val is not None and val != "" and val != {} and val != []:
                     return val
+
+        # Flat key (may carry schema defaults merged by AstrBotConfig)
+        value = self.config.get(key)
+        if value is not None and value != "" and value != {} and value != []:
+            return value
 
         schema_default = _SCHEMA_DEFAULTS.get(key)
         if schema_default is not None:

@@ -16,15 +16,15 @@ class PromptInjector:
 
     def _cfg(self, key: str, default=None):
         """Get config value with nested group fallback."""
-        value = self.config.get(key)
-        if value is not None and value != "" and value != {} and value != []:
-            return value
         for group_name in ["基础设置", "忙碌时段", "关键词设置", "消息合并", "智能判断", "日程生成"]:
             group = self.config.get(group_name, {})
             if isinstance(group, dict) and key in group:
                 val = group[key]
                 if val is not None and val != "" and val != {} and val != []:
                     return val
+        value = self.config.get(key)
+        if value is not None and value != "" and value != {} and value != []:
+            return value
         return default
 
     def build_custom_injection(self) -> str:
