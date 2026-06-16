@@ -215,7 +215,7 @@ class ScheduleGenerator:
 
             # Look up persona system_prompt by id
             if persona_id:
-                persona_mgr = self.context.get_config_manager().persona_mgr
+                persona_mgr = self.context.persona_manager
                 if persona_mgr:
                     for persona in persona_mgr.personas:
                         if persona.persona_id == persona_id:
