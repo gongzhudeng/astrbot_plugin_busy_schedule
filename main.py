@@ -25,7 +25,7 @@ from .core.prompt_injector import PromptInjector
     "astrbot_plugin_busy_schedule",
     "灵犀 · AI忙碌时段管理",
     "让AI拥有真实的生活节奏！自动计算忙碌时段、智能拦截合并消息、特殊关键词唤醒",
-    "v1.0.6",
+    "v1.0.7",
     "https://github.com/gongzhudeng/astrbot_plugin_busy_schedule",
 )
 class BusySchedulePlugin(Star):
@@ -145,6 +145,8 @@ class BusySchedulePlugin(Star):
 
     def _sync_schedule_to_context(self, today: date):
         """Sync today's schedule data to context for downstream plugins."""
+        custom_prompt = self._get_config("custom_prompt", "")
+        self.context._busy_schedule_custom_prompt = custom_prompt or ""
         data = self.data_mgr.get(today)
         if data and data.status == "completed":
             self.context._busy_schedule_today_schedule = data.schedule
