@@ -25,7 +25,7 @@ from .core.prompt_injector import PromptInjector
     "astrbot_plugin_busy_schedule",
     "灵犀 · AI忙碌时段管理",
     "让AI拥有真实的生活节奏！自动计算忙碌时段、智能拦截合并消息、特殊关键词唤醒",
-    "v1.0.4",
+    "v1.0.5",
     "https://github.com/gongzhudeng/astrbot_plugin_busy_schedule",
 )
 class BusySchedulePlugin(Star):
@@ -144,11 +144,28 @@ class BusySchedulePlugin(Star):
         self._sync_schedule_to_context(today)
 
     def _sync_schedule_to_context(self, today: date):
-        """Sync today's schedule text to context for downstream plugins."""
+        """Sync today's schedule data to context for downstream plugins."""
         data = self.data_mgr.get(today)
-        self.context._busy_schedule_today_schedule = (
-            data.schedule if data and data.status == "completed" else ""
-        )
+        if data and data.status == "completed":
+            self.context._busy_schedule_today_schedule = data.schedule
+            self.context._busy_schedule_outfit = data.outfit or ""
+            now = datetime.now()
+            current = self.injector._find_current_activity(data, now)
+            self.context._busy_schedule_current_activity = current or ""
+            next_act = ""
+            next_start = ""
+            if data.busy_periods:
+                for period in sorted(data.busy_periods, key=lambda p: p.start_time):
+                    if period.start_datetime > now:
+                        next_act = period.activity
+                        next_start = period.start_time
+                        break
+            self.context._busy_schedule_next_activity = f"{next_act}（{next_start}开始）" if next_act else ""
+        else:
+            self.context._busy_schedule_today_schedule = ""
+            self.context._busy_schedule_outfit = ""
+            self.context._busy_schedule_current_activity = ""
+            self.context._busy_schedule_next_activity = ""
 
     async def _daily_refresh_loop(self):
         """Background loop that waits until schedule_time each day, then refreshes."""
