@@ -25,7 +25,7 @@ from .core.prompt_injector import PromptInjector
     "astrbot_plugin_busy_schedule",
     "灵犀 · AI忙碌时段管理",
     "让AI拥有真实的生活节奏！自动计算忙碌时段、智能拦截合并消息、特殊关键词唤醒",
-    "v1.0.0",
+    "v1.0.4",
     "https://github.com/gongzhudeng/astrbot_plugin_busy_schedule",
 )
 class BusySchedulePlugin(Star):
@@ -71,6 +71,7 @@ class BusySchedulePlugin(Star):
 
         # Reset the flag so downstream plugins never see a stale value from a previous run
         self.context._busy_schedule_is_busy = False
+        self.context._busy_schedule_today_schedule = ""
 
         # Expose a force-check callable so downstream plugins can get an immediate state refresh
         self.context._busy_schedule_force_check = self.busy_mgr.check_and_update_state
@@ -140,6 +141,15 @@ class BusySchedulePlugin(Star):
             except Exception as e:
                 logger.error(f"[BusySchedule] Failed to generate schedule: {e}")
 
+        self._sync_schedule_to_context(today)
+
+    def _sync_schedule_to_context(self, today: date):
+        """Sync today's schedule text to context for downstream plugins."""
+        data = self.data_mgr.get(today)
+        self.context._busy_schedule_today_schedule = (
+            data.schedule if data and data.status == "completed" else ""
+        )
+
     async def _daily_refresh_loop(self):
         """Background loop that waits until schedule_time each day, then refreshes."""
         while True:
@@ -172,6 +182,8 @@ class BusySchedulePlugin(Star):
                     logger.info(f"[BusySchedule] Daily schedule refreshed for {today}")
                 except Exception as e:
                     logger.error(f"[BusySchedule] Daily refresh failed: {e}")
+
+                self._sync_schedule_to_context(today)
 
             except asyncio.CancelledError:
                 break
@@ -586,6 +598,8 @@ class BusySchedulePlugin(Star):
                 f"👗 今日穿搭：{data.outfit}\n"
                 f"📝 日程安排：\n{data.schedule}"
             )
+
+            self._sync_schedule_to_context(today)
 
             # Refresh busy state so current_busy_period matches new schedule
             if self.busy_mgr.is_busy:
