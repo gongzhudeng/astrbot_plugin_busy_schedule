@@ -191,6 +191,36 @@ class ScheduleGenerator:
                 return provider
         return self.context.get_using_provider()
 
+    async def _get_judge_persona(self, umo: Optional[str] = None) -> str:
+        """Get persona system_prompt for smart judgment.
+
+        Priority: judge_persona_id config > current conversation persona > empty.
+        """
+        try:
+            persona_id = self._cfg("judge_persona_id", "")
+
+            if not persona_id and umo:
+                try:
+                    conv_mgr = self.context.conversation_manager
+                    if conv_mgr:
+                        cid = await conv_mgr.get_curr_conversation_id(umo)
+                        if cid:
+                            conv = await conv_mgr.get_conversation(umo, cid)
+                            if conv and getattr(conv, "persona_id", None):
+                                persona_id = conv.persona_id
+                except Exception:
+                    pass
+
+            if persona_id:
+                persona_mgr = self.context.persona_manager
+                if persona_mgr:
+                    for persona in persona_mgr.personas:
+                        if persona.persona_id == persona_id and persona.system_prompt:
+                            return persona.system_prompt
+        except Exception as e:
+            logger.warning(f"[BusySchedule] Failed to resolve judge persona: {e}")
+        return ""
+
     async def _get_persona_desc(self, umo: Optional[str] = None) -> str:
         """Get bot persona description for schedule generation.
 
@@ -444,11 +474,11 @@ class ScheduleGenerator:
         except Exception:
             pass
 
-    async def _call_llm(self, prompt: str, provider, session_id: str) -> str:
+    async def _call_llm(self, prompt: str, provider, session_id: str, system_prompt: str = "") -> str:
         """Call LLM and return completion text. Retries on empty response."""
         for attempt in range(self._MAX_RETRIES):
             try:
-                resp = await provider.text_chat(prompt=prompt, session_id=session_id)
+                resp = await provider.text_chat(prompt=prompt, session_id=session_id, system_prompt=system_prompt or None)
                 text = _extract_completion_text(resp)
                 if text:
                     return text
@@ -649,8 +679,9 @@ class ScheduleGenerator:
 
         sid = f"busy_schedule_judge_{target_date.strftime('%Y%m%d')}_{uuid.uuid4().hex[:6]}"
         try:
-            logger.info(f"[BusySchedule] Calling LLM for judge, sid={sid}, prompt_len={len(prompt)}")
-            content = await self._call_llm(prompt, provider, sid)
+            judge_persona = await self._get_judge_persona(umo)
+            logger.info(f"[BusySchedule] Calling LLM for judge, sid={sid}, prompt_len={len(prompt)}, persona={'yes' if judge_persona else 'no'}")
+            content = await self._call_llm(prompt, provider, sid, system_prompt=judge_persona)
             logger.info(f"[BusySchedule] LLM response len={len(content) if content else 0}, preview={content[:200] if content else 'EMPTY'}")
             result = _extract_json_obj(content)
 
