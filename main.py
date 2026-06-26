@@ -528,23 +528,12 @@ class BusySchedulePlugin(Star):
         busy_marker = "<!-- BUSY_SCHEDULE_BUSY -->"
         busy_end_marker = "<!-- /BUSY_SCHEDULE_BUSY -->"
 
-        # Part 1+2: insert cache block in optimal position for KV cache
-        # Order: persona → busy_schedule_cache → knowledge_base → tool_prompt
-        # This ensures the cache prefix (persona + busy_schedule) is stable
-        kb_marker = "[Related Knowledge Base Results]:"
+        # Part 1+2: insert cache block after persona for optimal KV cache
         if cache_marker in current_prompt:
-            # Replace existing cache block
             pattern = f"{re.escape(cache_marker)}.*?{re.escape(cache_end_marker)}"
             new_cache = f"{cache_marker}\n{cacheable_injection}\n{cache_end_marker}"
             current_prompt = re.sub(pattern, new_cache, current_prompt, flags=re.DOTALL)
-        elif kb_marker in current_prompt:
-            # Insert before knowledge base results to keep cache prefix stable
-            idx = current_prompt.index(kb_marker)
-            cache_block = f"{cache_marker}\n{cacheable_injection}\n{cache_end_marker}\n\n"
-            current_prompt = current_prompt[:idx] + cache_block + current_prompt[idx:]
-            logger.info(f"[BusySchedule] Inserting cache block before knowledge base results")
         else:
-            # No cache marker and no KB - append at end
             logger.info(f"[BusySchedule] Appending cache block at end")
             current_prompt = f"{current_prompt}\n\n{cache_marker}\n{cacheable_injection}\n{cache_end_marker}"
 
