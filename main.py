@@ -1,6 +1,7 @@
 """AI Busy Schedule Plugin - Let AI have a real life rhythm."""
 
 import asyncio
+import random
 import re
 from datetime import datetime, date, timedelta
 from pathlib import Path
@@ -25,7 +26,7 @@ from .core.prompt_injector import PromptInjector
     "astrbot_plugin_busy_schedule",
     "灵犀 · AI忙碌时段管理",
     "让AI拥有真实的生活节奏！自动计算忙碌时段、智能拦截合并消息、特殊关键词唤醒",
-    "v1.0.7",
+    "v1.2.0",
     "https://github.com/gongzhudeng/astrbot_plugin_busy_schedule",
 )
 class BusySchedulePlugin(Star):
@@ -51,6 +52,9 @@ class BusySchedulePlugin(Star):
         self._state_check_task: Optional[asyncio.Task] = None
         self._schedule_gen_task: Optional[asyncio.Task] = None
         self._daily_refresh_task: Optional[asyncio.Task] = None
+
+        # Peek timers: per-user tasks for random in-busy message delivery
+        self._peek_timers: dict[str, asyncio.Task] = {}
 
     async def initialize(self):
         """Initialize plugin and all modules."""
@@ -117,6 +121,11 @@ class BusySchedulePlugin(Star):
 
         # Cancel all message timers
         self.interceptor.cancel_all_timers()
+
+        # Cancel all peek timers
+        for task in list(self._peek_timers.values()):
+            task.cancel()
+        self._peek_timers.clear()
 
         logger.info("[BusySchedule] Plugin terminated")
 
@@ -243,11 +252,47 @@ class BusySchedulePlugin(Star):
         logger.info(f"[BusySchedule] Exiting busy: {period.activity}")
         self.context._busy_schedule_is_busy = False
 
-        # Process queued messages for all users
+        # Process queued messages for all users with random delay
         user_ids = self.interceptor.get_all_queued_user_ids()
         for user_id in user_ids:
             if self.interceptor.has_queued_messages(user_id):
+                if user_id in self._peek_timers and not self._peek_timers[user_id].done():
+                    # Peek timer is running — it will send the messages, skip
+                    logger.info(f"[BusySchedule] Peek timer active for {user_id}, skipping exit send")
+                    continue
+                asyncio.create_task(self._delayed_send(user_id, period))
+
+    async def _delayed_send(self, user_id: str, period: BusyPeriod):
+        """Send merged messages after a random delay following busy exit."""
+        delay_min = self._get_config("exit_delay_min_seconds", 10)
+        delay_max = self._get_config("exit_delay_max_seconds", 120)
+        delay = random.uniform(delay_min, delay_max)
+        logger.info(f"[BusySchedule] Delayed send for {user_id}: {delay:.1f}s")
+        await asyncio.sleep(delay)
+        if self.interceptor.has_queued_messages(user_id):
+            await self._send_merged_messages(user_id, period)
+
+    def _start_peek_timer(self, user_id: str, period: BusyPeriod):
+        """Start a peek timer that fires after a random delay to send queued messages early."""
+        self._cancel_peek_timer(user_id)
+        delay_min = self._get_config("peek_delay_min_seconds", 5)
+        delay_max = self._get_config("peek_delay_max_seconds", 30)
+        delay = random.uniform(delay_min, delay_max)
+        logger.info(f"[BusySchedule] Peek timer started for {user_id}: {delay:.1f}s")
+
+        async def _callback():
+            await asyncio.sleep(delay)
+            self._peek_timers.pop(user_id, None)
+            if self.interceptor.has_queued_messages(user_id):
                 await self._send_merged_messages(user_id, period)
+
+        self._peek_timers[user_id] = asyncio.create_task(_callback())
+
+    def _cancel_peek_timer(self, user_id: str):
+        """Cancel an active peek timer for a user."""
+        task = self._peek_timers.pop(user_id, None)
+        if task and not task.done():
+            task.cancel()
 
     async def _send_merged_messages(self, user_id: str, period: BusyPeriod):
         """Send merged messages after busy period ends by re-injecting into pipeline."""
@@ -467,6 +512,19 @@ class BusySchedulePlugin(Star):
 
             if result == "queued":
                 event.stop_event()
+                # Peek: randomly deliver queued messages early while still busy
+                if self._get_config("peek_enabled", False):
+                    if user_id in self._peek_timers and not self._peek_timers[user_id].done():
+                        # Reset timer so new message is included
+                        period = self.busy_mgr._current_busy_period or BusyPeriod(
+                            start_time="??:??", end_time=datetime.now().strftime("%H:%M"), activity="忙碌时段"
+                        )
+                        self._start_peek_timer(user_id, period)
+                    elif random.random() < self._get_config("peek_probability", 0.05):
+                        period = self.busy_mgr._current_busy_period or BusyPeriod(
+                            start_time="??:??", end_time=datetime.now().strftime("%H:%M"), activity="忙碌时段"
+                        )
+                        self._start_peek_timer(user_id, period)
             elif result == "force_send":
                 # Will be handled by timer or next state check
                 event.stop_event()
@@ -528,13 +586,15 @@ class BusySchedulePlugin(Star):
         busy_marker = "<!-- BUSY_SCHEDULE_BUSY -->"
         busy_end_marker = "<!-- /BUSY_SCHEDULE_BUSY -->"
 
-        # Part 1+2: insert cache block after persona for optimal KV cache
+        # Part 1+2: insert after persona prompt (cache-friendly block)
         if cache_marker in current_prompt:
             pattern = f"{re.escape(cache_marker)}.*?{re.escape(cache_end_marker)}"
             new_cache = f"{cache_marker}\n{cacheable_injection}\n{cache_end_marker}"
             current_prompt = re.sub(pattern, new_cache, current_prompt, flags=re.DOTALL)
         else:
-            logger.info(f"[BusySchedule] Appending cache block at end")
+            # No persona end marker - append at end (persona is at the beginning)
+            # This ensures: persona → static → dynamic (at end)
+            logger.info(f"[BusySchedule] Appending cache block at end (after persona)")
             current_prompt = f"{current_prompt}\n\n{cache_marker}\n{cacheable_injection}\n{cache_end_marker}"
 
         # Part 3: busy flag (append at end, only when busy)

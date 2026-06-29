@@ -67,6 +67,68 @@
           "step": 1
         },
         "default": 15
+      },
+      "exit_delay_min_seconds": {
+        "description": "忙碌结束后最短延迟（秒）",
+        "hint": "忙碌结束或跳过词触发后，随机延迟多少秒再发送消息。最小值。",
+        "type": "int",
+        "slider": {
+          "min": 0,
+          "max": 300,
+          "step": 5
+        },
+        "default": 10
+      },
+      "exit_delay_max_seconds": {
+        "description": "忙碌结束后最长延迟（秒）",
+        "hint": "忙碌结束或跳过词触发后，随机延迟多少秒再发送消息。最大值。",
+        "type": "int",
+        "slider": {
+          "min": 0,
+          "max": 600,
+          "step": 5
+        },
+        "default": 120
+      }
+    }
+  },
+  "随机接收": {
+    "description": "忙碌期间随机偷偷接收消息",
+    "type": "object",
+    "items": {
+      "peek_enabled": {
+        "description": "启用随机接收",
+        "hint": "忙碌期间，每条新消息有一定概率触发「偷偷接收」：等待一段随机时间后合并发送，不再等忙碌结束",
+        "type": "bool",
+        "default": false
+      },
+      "peek_probability": {
+        "description": "随机接收概率（0~1）",
+        "hint": "每条新消息触发随机接收的概率，0.05 = 5%。建议设置较小的值",
+        "type": "float",
+        "default": 0.05
+      },
+      "peek_delay_min_seconds": {
+        "description": "随机接收最短等待（秒）",
+        "hint": "触发随机接收后，最短等待多少秒再合并发送",
+        "type": "int",
+        "slider": {
+          "min": 5,
+          "max": 300,
+          "step": 5
+        },
+        "default": 5
+      },
+      "peek_delay_max_seconds": {
+        "description": "随机接收最长等待（秒）",
+        "hint": "触发随机接收后，最长等待多少秒再合并发送",
+        "type": "int",
+        "slider": {
+          "min": 5,
+          "max": 600,
+          "step": 5
+        },
+        "default": 30
       }
     }
   },
