@@ -26,7 +26,7 @@ from .core.prompt_injector import PromptInjector
     "astrbot_plugin_busy_schedule",
     "灵犀 · AI忙碌时段管理",
     "让AI拥有真实的生活节奏！自动计算忙碌时段、智能拦截合并消息、特殊关键词唤醒",
-    "v1.3.0",
+    "v1.3.1",
     "https://github.com/gongzhudeng/astrbot_plugin_busy_schedule",
 )
 class BusySchedulePlugin(Star):
@@ -362,12 +362,25 @@ class BusySchedulePlugin(Star):
                     continue
 
                 # Triggered — send queued messages for all users (skip if peek already handling)
+                quiet = self._get_config("poll_quiet_seconds", 30)
                 user_ids = self.interceptor.get_all_queued_user_ids()
                 for user_id in user_ids:
                     if not self.interceptor.has_queued_messages(user_id):
                         continue
                     if user_id in self._peek_timers and not self._peek_timers[user_id].done():
                         continue
+                    # Quiet period check: skip if user sent a message recently
+                    if quiet > 0:
+                        queue_msgs = self.interceptor.get_queued_messages(user_id)
+                        if queue_msgs:
+                            newest = max(
+                                datetime.fromisoformat(m["timestamp"]) for m in queue_msgs
+                            )
+                            if (datetime.now() - newest).total_seconds() < quiet:
+                                logger.info(
+                                    f"[BusySchedule] Poll skipped for {user_id}: quiet period active"
+                                )
+                                continue
                     current_period = self.busy_mgr._current_busy_period or period
                     logger.info(f"[BusySchedule] Poll triggered send for {user_id}")
                     asyncio.create_task(self._delayed_send(user_id, current_period))
