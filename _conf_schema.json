@@ -132,6 +132,52 @@
       }
     }
   },
+  "定时检查": {
+    "description": "忙碌期间定时概率检查",
+    "type": "object",
+    "items": {
+      "poll_enabled": {
+        "description": "启用定时检查",
+        "hint": "忙碌期间，后台每隔随机时间检查一次，有积累消息时按概率决定是否合并发送（不依赖用户发消息触发）",
+        "type": "bool",
+        "default": false
+      },
+      "poll_interval_min_minutes": {
+        "description": "检查最短间隔（分钟）",
+        "hint": "每次检查之间的随机等待时间下限",
+        "type": "int",
+        "slider": {
+          "min": 1,
+          "max": 60,
+          "step": 1
+        },
+        "default": 5
+      },
+      "poll_interval_max_minutes": {
+        "description": "检查最长间隔（分钟）",
+        "hint": "每次检查之间的随机等待时间上限",
+        "type": "int",
+        "slider": {
+          "min": 1,
+          "max": 120,
+          "step": 1
+        },
+        "default": 15
+      },
+      "poll_probability": {
+        "description": "检查触发概率（0~1）",
+        "hint": "每次定时检查命中后，实际发送的概率。0.3 = 30%",
+        "type": "float",
+        "default": 0.3
+      },
+      "poll_activity_rules": {
+        "description": "按活动关键词配置规则（高级）",
+        "hint": "每条格式：关键词:概率:最小分钟-最大分钟。例如「洗澡:0.02:20-45」「炒菜:0.20:3-8」。留空则全部使用上方全局值",
+        "type": "list",
+        "default": []
+      }
+    }
+  },
   "关键词设置": {
     "description": "唤醒关键词配置",
     "type": "object",

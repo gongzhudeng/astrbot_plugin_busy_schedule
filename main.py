@@ -26,7 +26,7 @@ from .core.prompt_injector import PromptInjector
     "astrbot_plugin_busy_schedule",
     "灵犀 · AI忙碌时段管理",
     "让AI拥有真实的生活节奏！自动计算忙碌时段、智能拦截合并消息、特殊关键词唤醒",
-    "v1.2.0",
+    "v1.3.0",
     "https://github.com/gongzhudeng/astrbot_plugin_busy_schedule",
 )
 class BusySchedulePlugin(Star):
@@ -55,6 +55,9 @@ class BusySchedulePlugin(Star):
 
         # Peek timers: per-user tasks for random in-busy message delivery
         self._peek_timers: dict[str, asyncio.Task] = {}
+
+        # Periodic poll task: background loop that fires while busy
+        self._busy_poll_task: Optional[asyncio.Task] = None
 
     async def initialize(self):
         """Initialize plugin and all modules."""
@@ -126,6 +129,11 @@ class BusySchedulePlugin(Star):
         for task in list(self._peek_timers.values()):
             task.cancel()
         self._peek_timers.clear()
+
+        # Cancel poll task
+        if self._busy_poll_task and not self._busy_poll_task.done():
+            self._busy_poll_task.cancel()
+        self._busy_poll_task = None
 
         logger.info("[BusySchedule] Plugin terminated")
 
@@ -247,10 +255,21 @@ class BusySchedulePlugin(Star):
         logger.info(f"[BusySchedule] Entering busy: {period.activity}")
         self.context._busy_schedule_is_busy = True
 
+        # Start periodic poll loop if enabled
+        if self._get_config("poll_enabled", False):
+            if self._busy_poll_task and not self._busy_poll_task.done():
+                self._busy_poll_task.cancel()
+            self._busy_poll_task = asyncio.create_task(self._busy_poll_loop(period))
+
     async def _on_exit_busy(self, period: BusyPeriod):
         """Callback when exiting busy state."""
         logger.info(f"[BusySchedule] Exiting busy: {period.activity}")
         self.context._busy_schedule_is_busy = False
+
+        # Stop poll loop
+        if self._busy_poll_task and not self._busy_poll_task.done():
+            self._busy_poll_task.cancel()
+        self._busy_poll_task = None
 
         # Process queued messages for all users with random delay
         user_ids = self.interceptor.get_all_queued_user_ids()
@@ -293,6 +312,67 @@ class BusySchedulePlugin(Star):
         task = self._peek_timers.pop(user_id, None)
         if task and not task.done():
             task.cancel()
+
+    def _get_poll_params(self, activity: str) -> tuple[float, float, float]:
+        """Return (probability, min_minutes, max_minutes) for the given activity.
+
+        Checks poll_activity_rules for a matching keyword first; falls back to
+        global poll_probability / poll_interval_min/max_minutes.
+        Rule format: 'keyword:probability:min-max'  e.g. '洗澡:0.02:20-45'
+        """
+        rules = self._get_config("poll_activity_rules", [])
+        for rule in rules:
+            rule = str(rule).strip()
+            if not rule:
+                continue
+            parts = rule.split(":")
+            if len(parts) != 3:
+                continue
+            keyword, prob_str, interval_str = parts[0].strip(), parts[1].strip(), parts[2].strip()
+            if keyword and keyword in activity:
+                try:
+                    prob = float(prob_str)
+                    mn, mx = interval_str.split("-")
+                    return prob, float(mn), float(mx)
+                except Exception:
+                    continue
+        # Global defaults
+        prob = self._get_config("poll_probability", 0.3)
+        mn = self._get_config("poll_interval_min_minutes", 5)
+        mx = self._get_config("poll_interval_max_minutes", 15)
+        return float(prob), float(mn), float(mx)
+
+    async def _busy_poll_loop(self, period: BusyPeriod):
+        """Background loop that fires periodically while busy and may send queued messages."""
+        try:
+            while self.busy_mgr.is_busy:
+                activity = self.busy_mgr.current_activity or ""
+                prob, mn_min, mx_min = self._get_poll_params(activity)
+                wait_seconds = random.uniform(mn_min * 60, mx_min * 60)
+                logger.info(
+                    f"[BusySchedule] Poll loop: next check in {wait_seconds:.0f}s "
+                    f"(activity={activity!r}, prob={prob})"
+                )
+                await asyncio.sleep(wait_seconds)
+
+                if not self.busy_mgr.is_busy:
+                    break
+
+                if random.random() >= prob:
+                    continue
+
+                # Triggered — send queued messages for all users (skip if peek already handling)
+                user_ids = self.interceptor.get_all_queued_user_ids()
+                for user_id in user_ids:
+                    if not self.interceptor.has_queued_messages(user_id):
+                        continue
+                    if user_id in self._peek_timers and not self._peek_timers[user_id].done():
+                        continue
+                    current_period = self.busy_mgr._current_busy_period or period
+                    logger.info(f"[BusySchedule] Poll triggered send for {user_id}")
+                    asyncio.create_task(self._delayed_send(user_id, current_period))
+        except asyncio.CancelledError:
+            pass
 
     async def _send_merged_messages(self, user_id: str, period: BusyPeriod):
         """Send merged messages after busy period ends by re-injecting into pipeline."""
@@ -640,15 +720,6 @@ class BusySchedulePlugin(Star):
             data.schedule,
             "",
         ]
-
-        # Show busy periods
-        if data.busy_periods:
-            response_parts.append("⏰ 忙碌时段：")
-            for period in data.busy_periods:
-                status = "🔴 忙碌" if period.is_busy else "🟢 可回消息"
-                response_parts.append(
-                    f"  {period.start_time}-{period.end_time} {period.activity} {status}"
-                )
 
         # Show current status
         if self.busy_mgr.is_busy:
