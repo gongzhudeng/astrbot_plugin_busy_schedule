@@ -73,32 +73,37 @@ class BusyPeriodManager:
         return elapsed < cooldown_minutes
 
     def get_current_busy_period(self, now: datetime) -> Optional[BusyPeriod]:
-        """Get the busy period that contains the current time."""
-        today = now.date()
-        data = self.data_mgr.get(today)
+        """Get the busy period that contains the current time.
 
-        if not data or not data.busy_periods:
-            return None
-
-        for period in data.busy_periods:
-            if period.is_busy and period.contains(now):
-                return period
-
+        Checks yesterday's data first to handle cross-midnight periods (e.g.
+        23:00-07:00) that started on the previous calendar day.
+        """
+        for target_date in [now.date() - timedelta(days=1), now.date()]:
+            data = self.data_mgr.get(target_date)
+            if not data or not data.busy_periods:
+                continue
+            for period in data.busy_periods:
+                if period.is_busy and period.contains(now):
+                    return period
         return None
 
     def get_next_busy_period(self, now: datetime) -> Optional[BusyPeriod]:
-        """Get the next upcoming busy period."""
-        today = now.date()
-        data = self.data_mgr.get(today)
+        """Get the next upcoming busy period.
 
-        if not data or not data.busy_periods:
+        Checks today and tomorrow so cross-midnight periods are visible before
+        they start.
+        """
+        candidates = []
+        for target_date in [now.date(), now.date() + timedelta(days=1)]:
+            data = self.data_mgr.get(target_date)
+            if not data or not data.busy_periods:
+                continue
+            for period in data.busy_periods:
+                if period.is_busy and period.start_datetime > now:
+                    candidates.append(period)
+        if not candidates:
             return None
-
-        for period in sorted(data.busy_periods, key=lambda p: p.start_time):
-            if period.is_busy and period.start_datetime > now:
-                return period
-
-        return None
+        return min(candidates, key=lambda p: p.start_datetime)
 
     async def check_and_update_state(self):
         """Check current time and update busy state accordingly."""
