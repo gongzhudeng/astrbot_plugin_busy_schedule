@@ -26,7 +26,7 @@ from .core.prompt_injector import PromptInjector
     "astrbot_plugin_busy_schedule",
     "灵犀 · AI忙碌时段管理",
     "让AI拥有真实的生活节奏！自动计算忙碌时段、智能拦截合并消息、特殊关键词唤醒",
-    "v1.3.2",
+    "v1.3.3",
     "https://github.com/gongzhudeng/astrbot_plugin_busy_schedule",
 )
 class BusySchedulePlugin(Star):
@@ -186,6 +186,30 @@ class BusySchedulePlugin(Star):
             self.context._busy_schedule_current_activity = ""
             self.context._busy_schedule_next_activity = ""
 
+    def _get_effective_date(self) -> date:
+        """Return the date whose schedule should be used for display/injection.
+
+        After midnight and before the daily schedule_time, yesterday's completed
+        schedule is still the active one.  Switch to today only once today has a
+        completed schedule, or when today's schedule_time has passed.
+        """
+        today = date.today()
+        today_data = self.data_mgr.get(today)
+        if today_data and today_data.status == "completed":
+            return today
+        yesterday = today - timedelta(days=1)
+        schedule_time_str = self._get_config("schedule_time", "07:00")
+        try:
+            h, m = map(int, schedule_time_str.split(":"))
+        except Exception:
+            h, m = 7, 0
+        now = datetime.now()
+        if now < now.replace(hour=h, minute=m, second=0, microsecond=0):
+            ydata = self.data_mgr.get(yesterday)
+            if ydata and ydata.status == "completed":
+                return yesterday
+        return today
+
     async def _daily_refresh_loop(self):
         """Background loop that waits until schedule_time each day, then refreshes."""
         while True:
@@ -242,7 +266,7 @@ class BusySchedulePlugin(Star):
             finally:
                 # Always sync the flag so downstream plugins never see a stale value
                 self.context._busy_schedule_is_busy = self.busy_mgr.is_busy
-                self._sync_schedule_to_context(date.today())
+                self._sync_schedule_to_context(self._get_effective_date())
                 if self.busy_mgr.is_busy:
                     logger.info(
                         f"[BusySchedule] State sync: is_busy=True, "
@@ -641,7 +665,7 @@ class BusySchedulePlugin(Star):
         if not self._get_config("enabled", True):
             return
 
-        today = date.today()
+        today = self._get_effective_date()
         data = self.data_mgr.get(today)
 
         if not data or data.status != "completed":
@@ -711,7 +735,7 @@ class BusySchedulePlugin(Star):
     @filter.command("忙碌日程", alias={"busy show", "busy schedule"})
     async def cmd_show_schedule(self, event: AstrMessageEvent):
         """查看今日的日程和忙碌时段"""
-        today = date.today()
+        today = self._get_effective_date()
         today_str = today.strftime("%Y-%m-%d")
         data = self.data_mgr.get(today)
 
@@ -782,7 +806,7 @@ class BusySchedulePlugin(Star):
     async def cmd_busy_status(self, event: AstrMessageEvent):
         """查看当前忙碌状态"""
         now = datetime.now()
-        today = date.today()
+        today = self._get_effective_date()
         data = self.data_mgr.get(today)
 
         response_parts = ["📊 忙碌状态信息", ""]
@@ -864,7 +888,7 @@ class BusySchedulePlugin(Star):
             yield event.plain_result("智能判断功能未启用，请在配置中开启 enable_smart_judge")
             return
 
-        today = date.today()
+        today = self._get_effective_date()
         data = self.data_mgr.get(today)
 
         if not data or data.status != "completed":
@@ -976,7 +1000,7 @@ class BusySchedulePlugin(Star):
     @filter.command("忙碌预览", alias={"busy preview", "忙碌注入"})
     async def cmd_preview_injection(self, event: AstrMessageEvent):
         """展示当前注入到 LLM 的提示词内容"""
-        today = date.today()
+        today = self._get_effective_date()
         data = self.data_mgr.get(today)
 
         if not data or data.status != "completed":
