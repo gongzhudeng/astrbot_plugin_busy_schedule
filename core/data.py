@@ -30,28 +30,21 @@ class BusyPeriod:
         today = date.today()
         return datetime.strptime(f"{today} {self.end_time}", "%Y-%m-%d %H:%M")
 
-    def contains(self, time: datetime) -> bool:
+    def contains(self, time: datetime, owner_date: Optional[date] = None) -> bool:
         """Check if a given time is within this busy period.
 
-        Handles cross-midnight periods (e.g. 23:00-07:00) by extending end to
-        the next day when end <= start.  Also checks whether `time` falls in the
-        second half of a cross-midnight period that started yesterday.
+        owner_date should be the schedule-cycle date that owns this period
+        (determined by schedule_time boundary, not calendar midnight).  When
+        provided it is used as the base for reconstructing absolute datetimes,
+        which correctly handles cross-midnight periods (e.g. 23:00-07:00).
+        Falls back to time.date() when owner_date is not supplied.
         """
-        base = time.date()
+        base = owner_date if owner_date is not None else time.date()
         start = datetime.strptime(f"{base} {self.start_time}", "%Y-%m-%d %H:%M")
         end = datetime.strptime(f"{base} {self.end_time}", "%Y-%m-%d %H:%M")
         if end <= start:
             end += timedelta(days=1)
-        if start <= time < end:
-            return True
-        # time may be in the tail of a cross-midnight period that started yesterday
-        yesterday = base - timedelta(days=1)
-        s2 = datetime.strptime(f"{yesterday} {self.start_time}", "%Y-%m-%d %H:%M")
-        e2 = datetime.strptime(f"{yesterday} {self.end_time}", "%Y-%m-%d %H:%M")
-        if e2 <= s2:
-            e2 += timedelta(days=1)
-            return s2 <= time < e2
-        return False
+        return start <= time < end
 
 
 @dataclass

@@ -26,7 +26,7 @@ from .core.prompt_injector import PromptInjector
     "astrbot_plugin_busy_schedule",
     "灵犀 · AI忙碌时段管理",
     "让AI拥有真实的生活节奏！自动计算忙碌时段、智能拦截合并消息、特殊关键词唤醒",
-    "v1.3.3",
+    "v1.3.4",
     "https://github.com/gongzhudeng/astrbot_plugin_busy_schedule",
 )
 class BusySchedulePlugin(Star):
@@ -187,28 +187,12 @@ class BusySchedulePlugin(Star):
             self.context._busy_schedule_next_activity = ""
 
     def _get_effective_date(self) -> date:
-        """Return the date whose schedule should be used for display/injection.
+        """Return the schedule-cycle date for display/injection.
 
-        After midnight and before the daily schedule_time, yesterday's completed
-        schedule is still the active one.  Switch to today only once today has a
-        completed schedule, or when today's schedule_time has passed.
+        Delegates to BusyPeriodManager._get_schedule_owner_date() so the same
+        schedule_time boundary is used everywhere in the plugin.
         """
-        today = date.today()
-        today_data = self.data_mgr.get(today)
-        if today_data and today_data.status == "completed":
-            return today
-        yesterday = today - timedelta(days=1)
-        schedule_time_str = self._get_config("schedule_time", "07:00")
-        try:
-            h, m = map(int, schedule_time_str.split(":"))
-        except Exception:
-            h, m = 7, 0
-        now = datetime.now()
-        if now < now.replace(hour=h, minute=m, second=0, microsecond=0):
-            ydata = self.data_mgr.get(yesterday)
-            if ydata and ydata.status == "completed":
-                return yesterday
-        return today
+        return self.busy_mgr._get_schedule_owner_date(datetime.now())
 
     async def _daily_refresh_loop(self):
         """Background loop that waits until schedule_time each day, then refreshes."""

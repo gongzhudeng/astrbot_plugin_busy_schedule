@@ -72,38 +72,61 @@ class BusyPeriodManager:
         elapsed = (now - self._wakeup_time).total_seconds() / 60
         return elapsed < cooldown_minutes
 
+    def _get_schedule_owner_date(self, now: datetime) -> date:
+        """Return the schedule-cycle date that owns the given moment.
+
+        A schedule's validity period runs from schedule_time on its own date to
+        schedule_time on the next date.  This means moments between midnight and
+        schedule_time still belong to the previous calendar day's schedule.
+        """
+        schedule_time_str = self.config.get("schedule_time", "07:00")
+        try:
+            h, m = map(int, schedule_time_str.split(":"))
+        except Exception:
+            h, m = 7, 0
+        cutoff = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        return now.date() if now >= cutoff else (now - timedelta(days=1)).date()
+
     def get_current_busy_period(self, now: datetime) -> Optional[BusyPeriod]:
         """Get the busy period that contains the current time.
 
-        Checks yesterday's data first to handle cross-midnight periods (e.g.
-        23:00-07:00) that started on the previous calendar day.
+        Uses schedule_time as the cycle boundary instead of calendar midnight,
+        so a single schedule is consulted regardless of whether now has crossed
+        midnight within the same cycle.
         """
-        for target_date in [now.date() - timedelta(days=1), now.date()]:
-            data = self.data_mgr.get(target_date)
-            if not data or not data.busy_periods:
-                continue
-            for period in data.busy_periods:
-                if period.is_busy and period.contains(now):
-                    return period
+        owner_date = self._get_schedule_owner_date(now)
+        data = self.data_mgr.get(owner_date)
+        if not data or not data.busy_periods:
+            return None
+        for period in data.busy_periods:
+            if period.is_busy and period.contains(now, owner_date=owner_date):
+                return period
         return None
 
     def get_next_busy_period(self, now: datetime) -> Optional[BusyPeriod]:
         """Get the next upcoming busy period.
 
-        Checks today and tomorrow so cross-midnight periods are visible before
-        they start.
+        Checks the current cycle and the next one so periods near the boundary
+        are always visible.
         """
+        owner_date = self._get_schedule_owner_date(now)
         candidates = []
-        for target_date in [now.date(), now.date() + timedelta(days=1)]:
-            data = self.data_mgr.get(target_date)
+        for d in [owner_date, owner_date + timedelta(days=1)]:
+            data = self.data_mgr.get(d)
             if not data or not data.busy_periods:
                 continue
             for period in data.busy_periods:
-                if period.is_busy and period.start_datetime > now:
-                    candidates.append(period)
+                if not period.is_busy:
+                    continue
+                start = datetime.strptime(f"{d} {period.start_time}", "%Y-%m-%d %H:%M")
+                end = datetime.strptime(f"{d} {period.end_time}", "%Y-%m-%d %H:%M")
+                if end <= start:
+                    end += timedelta(days=1)
+                if start > now:
+                    candidates.append((start, period))
         if not candidates:
             return None
-        return min(candidates, key=lambda p: p.start_datetime)
+        return min(candidates, key=lambda x: x[0])[1]
 
     async def check_and_update_state(self):
         """Check current time and update busy state accordingly."""
@@ -119,7 +142,9 @@ class BusyPeriodManager:
                 await self._enter_busy(current_period)
         elif not current_period and self._is_busy:
             # Should exit busy — always allow exit regardless of cooldown
-            if self._current_busy_period and self._current_busy_period.contains(now):
+            if self._current_busy_period and self._current_busy_period.contains(
+                now, owner_date=self._get_schedule_owner_date(now)
+            ):
                 logger.debug(
                     f"[BusySchedule] Still in manual period "
                     f"{self._current_busy_period.start_time}-{self._current_busy_period.end_time}, "
