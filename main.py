@@ -26,7 +26,7 @@ from .core.prompt_injector import PromptInjector
     "astrbot_plugin_busy_schedule",
     "灵犀 · AI忙碌时段管理",
     "让AI拥有真实的生活节奏！自动计算忙碌时段、智能拦截合并消息、特殊关键词唤醒",
-    "v1.3.4",
+    "v1.3.5",
     "https://github.com/gongzhudeng/astrbot_plugin_busy_schedule",
 )
 class BusySchedulePlugin(Star):
@@ -59,11 +59,17 @@ class BusySchedulePlugin(Star):
         # Periodic poll task: background loop that fires while busy
         self._busy_poll_task: Optional[asyncio.Task] = None
 
+        # Target umo for daily schedule generation (persisted across restarts)
+        self._schedule_target_umo: Optional[str] = None
+        self._state_file: Optional[Path] = None
+
     async def initialize(self):
         """Initialize plugin and all modules."""
         logger.info("[BusySchedule] Initializing plugin...")
 
         # Initialize modules
+        self._state_file = self.data_dir / "plugin_state.json"
+        self._load_state()
         self.data_mgr = ScheduleDataManager(self.schedule_data_file)
         self.generator = ScheduleGenerator(self.context, self.config, self.data_mgr)
         self.busy_mgr = BusyPeriodManager(self.config, self.data_mgr)
@@ -222,7 +228,7 @@ class BusySchedulePlugin(Star):
                 logger.info(f"[BusySchedule] Daily refresh triggered at {datetime.now().strftime('%H:%M')}")
                 today = date.today()
                 try:
-                    await self.generator.generate_schedule(today)
+                    await self.generator.generate_schedule(today, umo=self._schedule_target_umo)
                     logger.info(f"[BusySchedule] Daily schedule refreshed for {today}")
                 except Exception as e:
                     logger.error(f"[BusySchedule] Daily refresh failed: {e}")
@@ -518,6 +524,30 @@ class BusySchedulePlugin(Star):
                     return True
         return False
 
+    def _load_state(self):
+        """Load persisted plugin state (e.g. schedule_target_umo)."""
+        if not self._state_file or not self._state_file.exists():
+            return
+        try:
+            import json
+            data = json.loads(self._state_file.read_text(encoding="utf-8"))
+            self._schedule_target_umo = data.get("schedule_target_umo") or None
+            if self._schedule_target_umo:
+                logger.info(f"[BusySchedule] Loaded schedule_target_umo: {self._schedule_target_umo}")
+        except Exception as e:
+            logger.warning(f"[BusySchedule] Failed to load plugin state: {e}")
+
+    def _save_state(self):
+        """Persist plugin state to disk."""
+        if not self._state_file:
+            return
+        try:
+            import json
+            data = {"schedule_target_umo": self._schedule_target_umo or ""}
+            self._state_file.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"[BusySchedule] Failed to save plugin state: {e}")
+
     def _get_config(self, key: str, default=None):
         """Get config value with schema default fallback."""
         # Nested groups take priority — user-edited values live here
@@ -648,6 +678,12 @@ class BusySchedulePlugin(Star):
         """
         if not self._get_config("enabled", True):
             return
+
+        # Record the umo for use in daily auto-generation
+        umo = event.unified_msg_origin
+        if umo and umo != self._schedule_target_umo:
+            self._schedule_target_umo = umo
+            self._save_state()
 
         today = self._get_effective_date()
         data = self.data_mgr.get(today)
