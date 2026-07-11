@@ -771,7 +771,7 @@ class BusySchedulePlugin(Star):
         response_parts = [
             f"📅 {today_str}",
             "",
-            f"👗 今日穿搭：{data.outfit}",
+            f"👗 今日穿搭：{data.outfit}" + (f"\n发型：{data.hairstyle}" if data.hairstyle else ""),
             "",
             "📝 日程安排：",
             data.schedule,
@@ -799,9 +799,10 @@ class BusySchedulePlugin(Star):
 
         try:
             data = await self.generator.generate_schedule(today, umo=event.unified_msg_origin, extra=extra if extra else None)
+            hairstyle_line = f"\n发型：{data.hairstyle}" if data.hairstyle else ""
             yield event.plain_result(
                 f"📅 {today.strftime('%Y-%m-%d')}\n"
-                f"👗 今日穿搭：{data.outfit}\n"
+                f"👗 今日穿搭：{data.outfit}{hairstyle_line}\n"
                 f"📝 日程安排：\n{data.schedule}"
             )
 
