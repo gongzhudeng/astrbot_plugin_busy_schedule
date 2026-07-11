@@ -46,7 +46,12 @@ class PromptInjector:
         parts = [
             "<character_static>",
             "## 今日穿搭",
-            data.outfit if data.outfit else "未设置",
+        ]
+        outfit_text = data.outfit if data.outfit else "未设置"
+        if data.hairstyle:
+            outfit_text += f"\n发型：{data.hairstyle}"
+        parts.append(outfit_text)
+        parts += [
             "",
             "## 今日日程安排",
             data.schedule if data.schedule else "未安排",

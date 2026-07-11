@@ -3,7 +3,7 @@ display_name: 灵犀 · AI忙碌时段管理
 desc: >
   让AI拥有真实的生活节奏！自动计算忙碌时段、智能拦截合并消息、
   提前通知、特殊关键词唤醒，打造拟人化聊天体验。
-version: v1.3.5
+version: v1.3.6
 author: 灵犀
 repo: https://github.com/gongzhudeng/astrbot_plugin_busy_schedule
 credits: |

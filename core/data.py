@@ -54,6 +54,7 @@ class ScheduleData:
     date: str  # YYYY-MM-DD format
     outfit_style: str = ""
     outfit: str = ""
+    hairstyle: str = ""  # optional, e.g. "双马尾"; empty means use reference image default
     schedule: str = ""
     busy_periods: list[BusyPeriod] = field(default_factory=list)
     status: str = "pending"  # pending, generating, completed, failed

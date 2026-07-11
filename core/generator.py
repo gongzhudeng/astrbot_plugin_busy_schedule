@@ -562,6 +562,7 @@ class ScheduleGenerator:
             # Update data
             data.outfit_style = result.get("outfit_style", "")
             data.outfit = result.get("outfit", "")
+            data.hairstyle = result.get("hairstyle", "")
             data.schedule = result.get("schedule", "")
             data.busy_periods = self._parse_busy_periods_from_schedule(data.schedule)
             data.status = "completed"
