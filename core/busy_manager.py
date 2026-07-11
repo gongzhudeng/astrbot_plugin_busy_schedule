@@ -72,6 +72,14 @@ class BusyPeriodManager:
         elapsed = (now - self._wakeup_time).total_seconds() / 60
         return elapsed < cooldown_minutes
 
+    def _parse_schedule_time(self) -> tuple[int, int]:
+        """Return (hour, minute) for the configured schedule_time."""
+        try:
+            h, m = map(int, self.config.get("schedule_time", "07:00").split(":"))
+            return h, m
+        except Exception:
+            return 7, 0
+
     def _get_schedule_owner_date(self, now: datetime) -> date:
         """Return the schedule-cycle date that owns the given moment.
 
@@ -95,11 +103,12 @@ class BusyPeriodManager:
         midnight within the same cycle.
         """
         owner_date = self._get_schedule_owner_date(now)
+        sh, sm = self._parse_schedule_time()
         data = self.data_mgr.get(owner_date)
         if not data or not data.busy_periods:
             return None
         for period in data.busy_periods:
-            if period.is_busy and period.contains(now, owner_date=owner_date):
+            if period.is_busy and period.contains(now, owner_date=owner_date, schedule_time=(sh, sm)):
                 return period
         return None
 
@@ -110,6 +119,7 @@ class BusyPeriodManager:
         are always visible.
         """
         owner_date = self._get_schedule_owner_date(now)
+        sh, sm = self._parse_schedule_time()
         candidates = []
         for d in [owner_date, owner_date + timedelta(days=1)]:
             data = self.data_mgr.get(d)
@@ -118,10 +128,7 @@ class BusyPeriodManager:
             for period in data.busy_periods:
                 if not period.is_busy:
                     continue
-                start = datetime.strptime(f"{d} {period.start_time}", "%Y-%m-%d %H:%M")
-                end = datetime.strptime(f"{d} {period.end_time}", "%Y-%m-%d %H:%M")
-                if end <= start:
-                    end += timedelta(days=1)
+                start, _ = period.to_absolute_datetimes(d, sh, sm)
                 if start > now:
                     candidates.append((start, period))
         if not candidates:
@@ -132,6 +139,7 @@ class BusyPeriodManager:
         """Check current time and update busy state accordingly."""
         now = datetime.now()
         in_cooldown = self._is_in_wakeup_cooldown(now)
+        sh, sm = self._parse_schedule_time()
 
         # Check if should be busy
         current_period = self.get_current_busy_period(now)
@@ -143,7 +151,7 @@ class BusyPeriodManager:
         elif not current_period and self._is_busy:
             # Should exit busy — always allow exit regardless of cooldown
             if self._current_busy_period and self._current_busy_period.contains(
-                now, owner_date=self._get_schedule_owner_date(now)
+                now, owner_date=self._get_schedule_owner_date(now), schedule_time=(sh, sm)
             ):
                 logger.debug(
                     f"[BusySchedule] Still in manual period "
