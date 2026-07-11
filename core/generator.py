@@ -15,6 +15,17 @@ from astrbot.api.star import Context
 
 from .data import ScheduleData, ScheduleDataManager, BusyPeriod
 
+try:
+    from astrbot.core.cron.events import CronMessageEvent
+    from astrbot.core.provider.entities import ProviderRequest
+    from astrbot.core.platform.message_session import MessageSession
+    from astrbot.core.pipeline.context import call_event_hook
+    from astrbot.core.star.star_handler import EventType
+
+    HAS_PIPELINE = True
+except ImportError:
+    HAS_PIPELINE = False
+
 
 def _load_schema_defaults() -> dict:
     """Load default values from _conf_schema.json."""
@@ -393,6 +404,70 @@ class ScheduleGenerator:
             logger.warning(f"[BusySchedule] Failed to get conversation contexts: {e}")
             return []
 
+    async def _get_rag_context(self, umo: Optional[str] = None) -> str:
+        """Query knowledge base and memory plugins via OnLLMRequestEvent hook.
+
+        Uses the last N rounds of conversation as the retrieval query so the
+        daily schedule can reflect dynamic memories and knowledge rather than
+        only fixed persona/history information.
+
+        Returns the injected system_prompt text (truncated), or "" when the
+        pipeline API is unavailable, the feature is disabled, or any error occurs.
+        """
+        if not HAS_PIPELINE:
+            return ""
+        if not self._cfg("enable_rag_for_schedule", True):
+            return ""
+        if not umo:
+            return ""
+
+        try:
+            rounds = int(self._cfg("rag_query_rounds", 5) or 5)
+            query_max = int(self._cfg("rag_query_max_chars", 500) or 500)
+            result_max = int(self._cfg("rag_result_max_chars", 800) or 800)
+
+            contexts = await self._get_conversation_contexts(umo, rounds)
+            if not contexts:
+                return ""
+
+            # Build a compact query from recent conversation turns
+            lines = []
+            for msg in contexts:
+                role = msg.get("role", "")
+                content = str(msg.get("content", "")).strip()
+                if not content:
+                    continue
+                speaker = "用户" if role == "user" else "我"
+                lines.append(f"{speaker}: {content}")
+            query = "\n".join(lines)
+            if len(query) > query_max:
+                query = query[-query_max:]
+
+            session = MessageSession.from_str(umo)
+            cron_event = CronMessageEvent(
+                context=self.context,
+                session=session,
+                message=query,
+            )
+            req = ProviderRequest()
+            req.prompt = query
+            req.system_prompt = ""
+
+            # Trigger knowledge base / memory plugins
+            await call_event_hook(cron_event, EventType.OnLLMRequestEvent, req)
+
+            injected = (req.system_prompt or "").strip()
+            if not injected:
+                return ""
+            if len(injected) > result_max:
+                injected = injected[:result_max]
+            logger.debug(f"[BusySchedule] RAG context injected ({len(injected)} chars) for schedule generation")
+            return injected
+
+        except Exception as e:
+            logger.warning(f"[BusySchedule] _get_rag_context failed: {e}")
+            return ""
+
     async def _build_prompt(self, target_date: date, extra: Optional[str] = None, umo: Optional[str] = None) -> str:
         """Build the prompt for schedule generation.
 
@@ -420,6 +495,7 @@ class ScheduleGenerator:
             "history_schedules": self._get_history_schedules(target_date),
             "last_yesterday_activity": self._get_yesterday_last_activity(target_date),
             "recent_chats": await self._get_recent_chats(umo),
+            "rag_context": await self._get_rag_context(umo),
         }
 
         try:
