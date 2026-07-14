@@ -16,11 +16,14 @@ from astrbot.core.provider.entities import ProviderRequest
 from astrbot.core.star.star_tools import StarTools
 
 from .core.data import (
+    ActiveSchedule,
+    ResolvedPeriod,
     ScheduleDataManager,
     ScheduleData,
     BusyPeriod,
     get_schedule_owner_date,
     parse_schedule_time,
+    resolve_schedule_periods,
 )
 from .core.generator import ScheduleGenerator, _SCHEMA_DEFAULTS
 from .core.busy_manager import BusyPeriodManager
@@ -187,16 +190,45 @@ class BusySchedulePlugin(Star):
 
     def _get_active_schedule(
         self, now: Optional[datetime] = None
-    ) -> Optional[tuple[date, ScheduleData]]:
-        """Return active data together with the date that owns its periods."""
+    ) -> Optional[ActiveSchedule]:
+        """Return completed data projected onto the current owner cycle."""
         current = now or datetime.now()
         owner_date = get_schedule_owner_date(
             current, parse_schedule_time(self._get_config("schedule_time", "07:00"))
         )
-        data = self.data_mgr.get(owner_date)
-        if data and data.status == "completed":
-            return owner_date, data
-        return self.data_mgr.get_latest_completed(owner_date)
+        return self.data_mgr.get_active(owner_date)
+
+    def _get_resolved_timeline(
+        self, owner_date: date, include_previous_sleep: bool = True
+    ) -> list[ResolvedPeriod]:
+        """Resolve current activities and any sleep carried over at the boundary."""
+        schedule_time = parse_schedule_time(
+            self._get_config("schedule_time", "07:00")
+        )
+        resolved = []
+        cycle_dates = (
+            (owner_date - timedelta(days=1), owner_date)
+            if include_previous_sleep
+            else (owner_date,)
+        )
+        for cycle_date in cycle_dates:
+            active = self.data_mgr.get_active(cycle_date)
+            next_active = self.data_mgr.get_active(cycle_date + timedelta(days=1))
+            if not active:
+                continue
+            try:
+                periods = resolve_schedule_periods(
+                    active, schedule_time, next_active
+                )
+            except ValueError as exc:
+                logger.warning(
+                    f"[BusySchedule] Failed to resolve cycle {cycle_date}: {exc}"
+                )
+                continue
+            if cycle_date == owner_date - timedelta(days=1):
+                periods = [item for item in periods if item.period.is_open_sleep]
+            resolved.extend(periods)
+        return sorted(resolved, key=lambda item: item.start)
 
     def _sync_schedule_to_context(self):
         """Sync active schedule data to context for downstream plugins."""
@@ -205,25 +237,18 @@ class BusySchedulePlugin(Star):
         now = datetime.now()
         active = self._get_active_schedule(now)
         if active:
-            owner_date, data = active
-            schedule_time = parse_schedule_time(
-                self._get_config("schedule_time", "07:00")
-            )
+            data = active.data
+            timeline = self._get_resolved_timeline(active.owner_date)
             self.context._busy_schedule_today_schedule = data.schedule
             self.context._busy_schedule_outfit = data.outfit or ""
-            current = self.injector._find_current_activity(
-                data, owner_date, schedule_time, now
-            )
+            current = self.injector._find_current_activity(timeline, now)
             self.context._busy_schedule_current_activity = current or ""
-            candidates = []
-            for period in data.busy_periods:
-                start, _ = period.to_absolute_datetimes(owner_date, *schedule_time)
-                if start > now:
-                    candidates.append((start, period))
+            candidates = [item for item in timeline if item.start > now]
             if candidates:
-                start, period = min(candidates, key=lambda item: item[0])
+                resolved = min(candidates, key=lambda item: item.start)
                 self.context._busy_schedule_next_activity = (
-                    f"{period.activity}（{start.strftime('%H:%M')}开始）"
+                    f"{resolved.period.activity}"
+                    f"（{resolved.start.strftime('%H:%M')}开始）"
                 )
             else:
                 self.context._busy_schedule_next_activity = ""
@@ -740,15 +765,13 @@ class BusySchedulePlugin(Star):
         active = self._get_active_schedule(now)
         if not active:
             return
-        owner_date, data = active
-        schedule_time = parse_schedule_time(
-            self._get_config("schedule_time", "07:00")
-        )
+        data = active.data
+        timeline = self._get_resolved_timeline(active.owner_date)
 
         # Part 1 + 2: static (outfit+schedule) + semi-static (current/next activity)
         static_injection = self.injector.build_static_injection(data)
         schedule_injection = self.injector.build_schedule_injection(
-            data, owner_date, schedule_time, now
+            data, timeline, now
         )
         custom_injection = self.injector.build_custom_injection()
 
@@ -811,9 +834,9 @@ class BusySchedulePlugin(Star):
         """查看今日的日程和忙碌时段"""
         owner_date = self._get_effective_date()
         active = self._get_active_schedule()
-        data = active[1] if active else None
+        data = active.data if active else None
 
-        if not data or active[0] != owner_date:
+        if not data or active.source_owner_date != owner_date:
             yield event.plain_result("当前周期日程尚未生成，正在生成...")
             try:
                 data = await self.generator.generate_schedule_or_wait(
@@ -874,15 +897,15 @@ class BusySchedulePlugin(Star):
                 now = datetime.now()
                 current = self.busy_mgr.get_current_busy_period(now)
                 if current:
-                    owner_date, new_period = current
-                    self.busy_mgr._current_busy_period = new_period
-                    self.busy_mgr._current_busy_owner_date = owner_date
+                    self.busy_mgr._current_busy_period = current.period
+                    self.busy_mgr._current_resolved_period = current
+                    self.busy_mgr._current_busy_owner_date = current.owner_date
                     self.busy_mgr._current_busy_schedule_time = (
                         self.busy_mgr._parse_schedule_time()
                     )
                     logger.info(
                         f"[BusySchedule] Refreshed busy period after rewrite: "
-                        f"{new_period.activity}"
+                        f"{current.period.activity}"
                     )
                 else:
                     # Current time is no longer in any busy period
@@ -903,18 +926,9 @@ class BusySchedulePlugin(Star):
         if self.busy_mgr.is_busy:
             activity = self.busy_mgr.current_activity or "未知活动"
             response_parts.append(f"💤 当前状态：忙碌中（{activity}）")
-            # Show remaining time in minutes
-            current_period = self.busy_mgr._current_busy_period
-            owner_date = self.busy_mgr._current_busy_owner_date
-            schedule_time = (
-                self.busy_mgr._current_busy_schedule_time
-                or self.busy_mgr._parse_schedule_time()
-            )
-            if current_period and owner_date:
-                _, end_dt = current_period.to_absolute_datetimes(
-                    owner_date, *schedule_time
-                )
-                remaining_secs = (end_dt - now).total_seconds()
+            resolved = self.busy_mgr._current_resolved_period
+            if resolved:
+                remaining_secs = (resolved.end - now).total_seconds()
                 if remaining_secs > 0:
                     remaining_mins = int(remaining_secs / 60)
                     response_parts.append(f"⏱️ 剩余时间：约 {remaining_mins} 分钟")
@@ -922,10 +936,13 @@ class BusySchedulePlugin(Star):
             response_parts.append("✅ 当前状态：在线")
 
         # Next busy period
-        next_period = self.busy_mgr.get_next_busy_period(now)
-        if next_period:
+        next_resolved = self.busy_mgr.get_next_busy_period(now)
+        if next_resolved:
+            period = next_resolved.period
             response_parts.append(
-                f"\n⏰ 下一个忙碌时段：{next_period.start_time}-{next_period.end_time} {next_period.activity}"
+                f"\n⏰ 下一个忙碌时段："
+                f"{next_resolved.start.strftime('%m-%d %H:%M')}-"
+                f"{next_resolved.end.strftime('%m-%d %H:%M')} {period.activity}"
             )
 
         # Chat protection status
@@ -1047,10 +1064,8 @@ class BusySchedulePlugin(Star):
         if not active:
             yield event.plain_result("当前没有可用的已完成日程")
             return
-        owner_date, data = active
-        schedule_time = parse_schedule_time(
-            self._get_config("schedule_time", "07:00")
-        )
+        data = active.data
+        timeline = self._get_resolved_timeline(active.owner_date)
 
         # Part 0: custom user-defined injection
         custom_text = self.injector.build_custom_injection()
@@ -1060,7 +1075,7 @@ class BusySchedulePlugin(Star):
 
         # Part 2: semi-static (current + next activity)
         schedule_text = self.injector.build_schedule_injection(
-            data, owner_date, schedule_time, now
+            data, timeline, now
         )
 
         # Part 3: busy flag (only when busy)

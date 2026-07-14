@@ -13,7 +13,12 @@ from pathlib import Path
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.star import Context
 
-from .data import ScheduleData, ScheduleDataManager, BusyPeriod
+from .data import (
+    BusyPeriod,
+    ScheduleData,
+    ScheduleDataManager,
+    parse_schedule_time,
+)
 
 try:
     from astrbot.core.cron.events import CronMessageEvent
@@ -519,31 +524,83 @@ class ScheduleGenerator:
         return prompt
 
     def _parse_busy_periods_from_schedule(self, schedule_text: str) -> list[BusyPeriod]:
-        """Parse busy periods from schedule text with markers."""
+        """Parse ordinary ranges and one optional open-ended sleep entry."""
         periods = []
-        pattern = r"(\d{1,2}:\d{2})\s*[-~到至]\s*(\d{1,2}:\d{2})\s+(.+?)(?:\s*【(忙碌|可回消息)】)?(?:\n|$)"
+        line_pattern = re.compile(
+            r"^(\d{1,2}:\d{2})(?:\s*[-~到至]\s*(\d{1,2}:\d{2}))?\s+(.+)$"
+        )
+        for raw_line in schedule_text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            match = line_pattern.match(line)
+            if not match:
+                raise ValueError(f"无法解析日程行：{line}")
 
-        for match in re.finditer(pattern, schedule_text):
-            start_time = match.group(1)
-            end_time = match.group(2)
-            activity = match.group(3).strip()
-            marker = match.group(4)
+            start_time, end_time = match.group(1), match.group(2)
+            activity_text = match.group(3).strip()
+            marker_match = re.search(r"\s*【(忙碌|可回消息)】$", activity_text)
+            marker = marker_match.group(1) if marker_match else None
+            activity = (
+                activity_text[: marker_match.start()].strip()
+                if marker_match
+                else activity_text
+            )
+            is_sleep = "睡" in activity
+            if end_time is None and not is_sleep:
+                raise ValueError(f"只有睡觉活动可以省略结束时间：{line}")
 
-            is_busy = True
-            if marker == "可回消息":
-                is_busy = False
-            elif marker is None:
-                non_busy_keywords = ["刷手机", "休息", "散步", "闲逛", "发呆", "赖床", "看剧", "玩"]
+            is_busy = marker != "可回消息"
+            if marker is None and not is_sleep:
+                non_busy_keywords = [
+                    "刷手机",
+                    "休息",
+                    "散步",
+                    "闲逛",
+                    "发呆",
+                    "赖床",
+                    "看剧",
+                    "玩",
+                ]
                 is_busy = not any(kw in activity for kw in non_busy_keywords)
 
-            periods.append(BusyPeriod(
-                start_time=start_time,
-                end_time=end_time,
-                activity=activity,
-                is_busy=is_busy,
-            ))
+            periods.append(
+                BusyPeriod(
+                    start_time=start_time,
+                    end_time=end_time,
+                    activity=activity,
+                    is_busy=is_busy,
+                )
+            )
 
+        if len(periods) < 2:
+            raise ValueError("日程必须包含至少一条普通活动和最后一条睡觉活动")
+        if not periods[-1].is_open_sleep or "睡" not in periods[-1].activity:
+            raise ValueError("日程最后一项必须是没有结束时间的睡觉活动")
+        if any(period.is_open_sleep for period in periods[:-1]):
+            raise ValueError("只有日程最后一项可以省略结束时间")
         return periods
+
+    @staticmethod
+    def _validate_period_order(
+        periods: list[BusyPeriod], target_date: date, schedule_time: tuple[int, int]
+    ) -> None:
+        """Validate period order on the cycle's absolute timeline."""
+        starts = []
+        for period in periods:
+            hour, minute = map(int, period.start_time.split(":"))
+            base = (
+                target_date + timedelta(days=1)
+                if (hour, minute) < schedule_time
+                else target_date
+            )
+            starts.append(datetime(base.year, base.month, base.day, hour, minute))
+        if starts != sorted(starts):
+            raise ValueError("日程活动没有按周期内的绝对时间排序")
+        first_ordinary = next(period for period in periods if not period.is_open_sleep)
+        first_hour, first_minute = map(int, first_ordinary.start_time.split(":"))
+        if (first_hour, first_minute) < schedule_time:
+            raise ValueError("日程第一条普通活动不得早于日程生成时间")
 
     async def _cleanup_session(self, session_id: str):
         """Clean up LLM session."""
@@ -609,18 +666,38 @@ class ScheduleGenerator:
             content = await self._call_llm(prompt, provider, sid)
 
             result = _extract_json_obj(content)
+            validation_error = ""
 
-            # Retry with repair prompt if JSON is invalid or missing fields
             for attempt in range(1, self._MAX_RETRIES + 1):
                 if result and result.get("schedule"):
-                    break
+                    try:
+                        periods = self._parse_busy_periods_from_schedule(
+                            result["schedule"]
+                        )
+                        self._validate_period_order(
+                            periods,
+                            target_date,
+                            parse_schedule_time(
+                                self._cfg("schedule_time", "07:00")
+                            ),
+                        )
+                        validation_error = ""
+                        break
+                    except (TypeError, ValueError) as exc:
+                        validation_error = str(exc)
 
-                reason = "未能解析出 JSON 对象" if not result else "schedule 字段为空"
+                reason = (
+                    "未能解析出 JSON 对象"
+                    if not result
+                    else validation_error or "schedule 字段为空"
+                )
                 repair_prompt = (
                     f"你之前的输出未通过校验，需要重写。\n"
                     f"校验原因：{reason}\n\n"
                     f"请只输出 JSON 对象本体，不要 Markdown，不要解释。\n"
-                    f"输出 JSON 必须包含字段：outfit_style、outfit、schedule。\n\n"
+                    f"输出 JSON 必须包含字段：outfit_style、outfit、schedule。\n"
+                    f"schedule 必须至少有一条普通活动，最后一项必须为 "
+                    f"HH:MM 睡觉 【忙碌】，睡觉不写结束时间。\n\n"
                     f"你之前的输出（供参考）：\n{content[:500]}\n\n"
                     f"原始任务：\n{prompt}"
                 )
@@ -629,8 +706,23 @@ class ScheduleGenerator:
                 content = await self._call_llm(repair_prompt, provider, sid)
                 result = _extract_json_obj(content)
 
-            if not result or not result.get("schedule"):
-                raise RuntimeError(f"Failed to get valid schedule after {self._MAX_RETRIES} attempts")
+            if result and result.get("schedule"):
+                try:
+                    periods = self._parse_busy_periods_from_schedule(result["schedule"])
+                    self._validate_period_order(
+                        periods,
+                        target_date,
+                        parse_schedule_time(self._cfg("schedule_time", "07:00")),
+                    )
+                    validation_error = ""
+                except (TypeError, ValueError) as exc:
+                    validation_error = str(exc)
+
+            if not result or not result.get("schedule") or validation_error:
+                reason = validation_error or "缺少有效 schedule"
+                raise RuntimeError(
+                    f"Failed to get valid schedule after {self._MAX_RETRIES} attempts: {reason}"
+                )
 
             # Commit only after the complete result has passed validation.
             data = ScheduleData(
@@ -641,7 +733,7 @@ class ScheduleGenerator:
                 schedule=result.get("schedule", ""),
                 status="completed",
             )
-            data.busy_periods = self._parse_busy_periods_from_schedule(data.schedule)
+            data.busy_periods = periods
             self.data_mgr.set(target_date, data)
 
             logger.info(f"[BusySchedule] Schedule generated with {len(data.busy_periods)} busy periods")

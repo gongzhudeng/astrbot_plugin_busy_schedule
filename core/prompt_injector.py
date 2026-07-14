@@ -1,11 +1,11 @@
 """Prompt injector module - handles system prompt injection for different states."""
 
-from datetime import datetime, date
+from datetime import datetime
 from typing import Optional
 
 from astrbot.api import logger
 
-from .data import ScheduleData, BusyPeriod
+from .data import BusyPeriod, ResolvedPeriod, ScheduleData
 
 
 class PromptInjector:
@@ -74,49 +74,30 @@ class PromptInjector:
     def build_schedule_injection(
         self,
         data: ScheduleData,
-        owner_date: date,
-        schedule_time: tuple[int, int],
+        resolved_periods: list[ResolvedPeriod],
         current_time: Optional[datetime] = None,
     ) -> str:
-        """Build semi-static schedule injection (current activity + next activity + start time).
-
-        This changes only on activity transitions (~10-12 times/day), making it
-        very cache-friendly. Placed right after static injection (outfit + schedule)
-        and before LLM persona.
-        """
+        """Build current and next activity injection from one resolved timeline."""
         if not data or data.status != "completed":
             return ""
 
         now = current_time or datetime.now()
-
-        # Find current activity
-        current_activity = self._find_current_activity(
-            data, owner_date, schedule_time, now
-        )
-
-        # Find next upcoming activity (busy or free)
-        next_activity = None
-        next_start = None
-        candidates = []
-        for period in data.busy_periods:
-            start, _ = period.to_absolute_datetimes(owner_date, *schedule_time)
-            if start > now:
-                candidates.append((start, period))
-        if candidates:
-            _, next_period = min(candidates, key=lambda item: item[0])
-            next_activity = next_period.activity
-            next_start = next_period.start_time
+        current_activity = self._find_current_activity(resolved_periods, now)
+        candidates = [item for item in resolved_periods if item.start > now]
+        next_period = min(candidates, key=lambda item: item.start) if candidates else None
 
         parts = [
             "<character_schedule>",
-            f"## 当前活动：{current_activity}" if current_activity else "## 当前活动：自由时间",
+            f"## 当前活动：{current_activity}"
+            if current_activity
+            else "## 当前活动：自由时间",
         ]
-
-        if next_activity and next_start:
-            parts.append(f"## 下一个活动：{next_activity}（{next_start}开始）")
-
+        if next_period:
+            parts.append(
+                f"## 下一个活动：{next_period.period.activity}"
+                f"（{next_period.start.strftime('%H:%M')}开始）"
+            )
         parts.append("</character_schedule>")
-
         return "\n".join(parts)
 
     def build_busy_exit_injection(
@@ -140,18 +121,13 @@ class PromptInjector:
 
     def _find_current_activity(
         self,
-        data: ScheduleData,
-        owner_date: date,
-        schedule_time: tuple[int, int],
+        resolved_periods: list[ResolvedPeriod],
         current_time: datetime,
     ) -> Optional[str]:
-        """Find the current activity on the schedule's absolute timeline."""
-        if not data.busy_periods:
-            return None
-
-        for period in data.busy_periods:
-            if period.contains(current_time, owner_date, schedule_time):
-                return period.activity
+        """Find the current activity on a resolved absolute timeline."""
+        for resolved in resolved_periods:
+            if resolved.contains(current_time):
+                return resolved.period.activity
         return None
 
     def _parse_activity_from_text(

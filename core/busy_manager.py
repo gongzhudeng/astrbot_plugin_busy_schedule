@@ -5,11 +5,13 @@ from typing import Optional
 from astrbot.api import logger
 
 from .data import (
-    ScheduleData,
-    ScheduleDataManager,
+    ActiveSchedule,
     BusyPeriod,
+    ResolvedPeriod,
+    ScheduleDataManager,
     get_schedule_owner_date,
     parse_schedule_time,
+    resolve_schedule_periods,
 )
 
 
@@ -23,6 +25,8 @@ class BusyPeriodManager:
         # State tracking
         self._is_busy: bool = False
         self._current_busy_period: Optional[BusyPeriod] = None
+        self._current_resolved_period: Optional[ResolvedPeriod] = None
+        self._is_manual_period: bool = False
         self._current_busy_owner_date: Optional[date] = None
         self._current_busy_schedule_time: Optional[tuple[int, int]] = None
         self._busy_start_time: Optional[datetime] = None
@@ -96,54 +100,48 @@ class BusyPeriodManager:
         """Return the schedule-cycle date that owns the given moment."""
         return get_schedule_owner_date(now, self._parse_schedule_time())
 
-    def _get_active_schedule(
-        self, now: datetime
-    ) -> Optional[tuple[date, ScheduleData]]:
-        """Resolve the active completed schedule without rebasing old periods."""
-        owner_date = self._get_schedule_owner_date(now)
-        data = self.data_mgr.get(owner_date)
-        if data and data.status == "completed":
-            return owner_date, data
-        return self.data_mgr.get_latest_completed(owner_date)
+    def _get_active_schedule(self, now: datetime) -> Optional[ActiveSchedule]:
+        """Resolve completed data projected onto the current cycle."""
+        return self.data_mgr.get_active(self._get_schedule_owner_date(now))
+
+    def _resolve_cycle(self, owner_date: date) -> list[ResolvedPeriod]:
+        """Resolve a cycle against the following effective schedule."""
+        active = self.data_mgr.get_active(owner_date)
+        next_active = self.data_mgr.get_active(owner_date + timedelta(days=1))
+        if not active:
+            return []
+        try:
+            return resolve_schedule_periods(
+                active, self._parse_schedule_time(), next_active
+            )
+        except ValueError as exc:
+            logger.warning(
+                f"[BusySchedule] Failed to resolve cycle {owner_date}: {exc}"
+            )
+            return []
 
     def get_current_busy_period(
         self, now: datetime
-    ) -> Optional[tuple[date, BusyPeriod]]:
-        """Get the busy period and its real schedule owner date."""
-        active = self._get_active_schedule(now)
-        schedule_time = self._parse_schedule_time()
-        if not active:
-            return None
-        owner_date, data = active
-        for period in data.busy_periods:
-            if period.is_busy and period.contains(
-                now, owner_date=owner_date, schedule_time=schedule_time
-            ):
-                return owner_date, period
+    ) -> Optional[ResolvedPeriod]:
+        """Return the current busy period on the absolute timeline."""
+        owner_date = self._get_schedule_owner_date(now)
+        for cycle_date in (owner_date - timedelta(days=1), owner_date):
+            for resolved in self._resolve_cycle(cycle_date):
+                if resolved.period.is_busy and resolved.contains(now):
+                    return resolved
         return None
 
-    def get_next_busy_period(self, now: datetime) -> Optional[BusyPeriod]:
-        """Get the next upcoming busy period.
-
-        Checks the current cycle and the next one so periods near the boundary
-        are always visible.
-        """
+    def get_next_busy_period(self, now: datetime) -> Optional[ResolvedPeriod]:
+        """Return the next busy period across the current and next cycle."""
         owner_date = self._get_schedule_owner_date(now)
-        sh, sm = self._parse_schedule_time()
         candidates = []
-        for d in [owner_date, owner_date + timedelta(days=1)]:
-            data = self.data_mgr.get(d)
-            if not data or not data.busy_periods:
-                continue
-            for period in data.busy_periods:
-                if not period.is_busy:
-                    continue
-                start, _ = period.to_absolute_datetimes(d, sh, sm)
-                if start > now:
-                    candidates.append((start, period))
-        if not candidates:
-            return None
-        return min(candidates, key=lambda x: x[0])[1]
+        for cycle_date in (owner_date, owner_date + timedelta(days=1)):
+            candidates.extend(
+                resolved
+                for resolved in self._resolve_cycle(cycle_date)
+                if resolved.period.is_busy and resolved.start > now
+            )
+        return min(candidates, key=lambda item: item.start) if candidates else None
 
     async def check_and_update_state(self):
         """Check current time and update busy state accordingly."""
@@ -152,25 +150,34 @@ class BusyPeriodManager:
         current = self.get_current_busy_period(now)
 
         if current and not self._is_busy:
-            owner_date, current_period = current
             if not in_cooldown and self._can_enter_busy(now):
-                await self._enter_busy(current_period, owner_date)
+                await self._enter_busy(current)
+        elif current and self._is_busy:
+            active_range = self._current_resolved_period
+            if (
+                not self._is_manual_period
+                and active_range != current
+            ):
+                self._current_busy_period = current.period
+                self._current_resolved_period = current
+                self._current_busy_owner_date = current.owner_date
+                self._current_busy_schedule_time = self._parse_schedule_time()
+                logger.info(
+                    f"[BusySchedule] Busy activity changed: "
+                    f"{current.period.activity}"
+                )
         elif not current and self._is_busy:
-            if self._current_busy_period and self._current_busy_owner_date:
-                if self._current_busy_period.contains(
-                    now,
-                    owner_date=self._current_busy_owner_date,
-                    schedule_time=(
-                        self._current_busy_schedule_time
-                        or self._parse_schedule_time()
-                    ),
-                ):
-                    logger.debug(
-                        f"[BusySchedule] Still in manual period "
-                        f"{self._current_busy_period.start_time}-{self._current_busy_period.end_time}, "
-                        f"not exiting"
-                    )
-                    return
+            if (
+                self._is_manual_period
+                and self._current_resolved_period
+                and self._current_resolved_period.contains(now)
+            ):
+                logger.debug(
+                    f"[BusySchedule] Still in manual period "
+                    f"{self._current_busy_period.start_time}-"
+                    f"{self._current_busy_period.end_time}, not exiting"
+                )
+                return
             logger.info(
                 f"[BusySchedule] No active period found (current_period=None, "
                 f"manual={self._current_busy_period is not None}), forcing exit busy"
@@ -178,20 +185,39 @@ class BusyPeriodManager:
             await self._exit_busy()
 
     async def _enter_busy(
-        self, period: BusyPeriod, owner_date: Optional[date] = None
+        self,
+        period: BusyPeriod | ResolvedPeriod,
+        owner_date: Optional[date] = None,
     ):
-        """Enter busy state and preserve the period's timeline owner."""
+        """Enter busy state and retain its resolved absolute range."""
+        resolved = period if isinstance(period, ResolvedPeriod) else None
+        raw_period = resolved.period if resolved else period
+        effective_owner = owner_date or self._get_schedule_owner_date(datetime.now())
+        if resolved is None and raw_period.end_time:
+            try:
+                start, end = raw_period.to_absolute_datetimes(
+                    effective_owner, *self._parse_schedule_time()
+                )
+                resolved = ResolvedPeriod(
+                    effective_owner, raw_period, start, end
+                )
+            except (TypeError, ValueError):
+                resolved = None
         self._is_busy = True
-        self._current_busy_period = period
-        self._current_busy_owner_date = owner_date or self._get_schedule_owner_date(
-            datetime.now()
+        self._current_busy_period = raw_period
+        self._current_resolved_period = resolved
+        self._is_manual_period = not isinstance(period, ResolvedPeriod)
+        self._current_busy_owner_date = (
+            resolved.owner_date
+            if resolved
+            else effective_owner
         )
         self._current_busy_schedule_time = self._parse_schedule_time()
         self._busy_start_time = datetime.now()
-        logger.info(f"[BusySchedule] Entering busy state: {period.activity}")
+        logger.info(f"[BusySchedule] Entering busy state: {raw_period.activity}")
 
         if self._on_enter_busy:
-            await self._on_enter_busy(period)
+            await self._on_enter_busy(raw_period)
 
     async def _exit_busy(self):
         """Exit busy state."""
@@ -201,6 +227,8 @@ class BusyPeriodManager:
         self._is_busy = False
         exiting_period = self._current_busy_period
         self._current_busy_period = None
+        self._current_resolved_period = None
+        self._is_manual_period = False
         self._current_busy_owner_date = None
         self._current_busy_schedule_time = None
         self._busy_start_time = None
