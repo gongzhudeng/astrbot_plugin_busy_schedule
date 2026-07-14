@@ -1,6 +1,5 @@
 """Message interceptor module - handles message queueing and merging during busy periods."""
 
-import asyncio
 from datetime import datetime
 from typing import Optional
 from collections import defaultdict
@@ -17,36 +16,39 @@ class MessageInterceptor:
 
         # Message queues per user (unified_msg_origin)
         self._message_queues: dict[str, list[dict]] = defaultdict(list)
-        self._message_timers: dict[str, asyncio.Task] = {}
         self._event_refs: dict[str, list[AstrMessageEvent]] = defaultdict(list)
 
-        # State
-        self._is_processing: dict[str, bool] = defaultdict(bool)
+    def _config_value(self, key: str, default):
+        group = self.config.get("消息合并", {})
+        if isinstance(group, dict) and key in group:
+            value = group[key]
+            if value is not None and value != "":
+                return value
+        value = self.config.get(key)
+        return default if value is None or value == "" else value
 
     @property
     def max_message_count(self) -> int:
         """Get max messages before force send."""
-        return self.config.get("max_message_count", 20)
-
-    @property
-    def send_delay_seconds(self) -> int:
-        """Get delay before sending merged message."""
-        return self.config.get("send_delay_seconds", 60)
+        try:
+            return max(1, int(self._config_value("max_message_count", 20)))
+        except (TypeError, ValueError):
+            return 20
 
     @property
     def merge_prefix(self) -> str:
         """Get merge message prefix template."""
-        return self.config.get(
+        return self._config_value(
             "merge_prefix",
-            "[以下是你在忙碌时段（{start_time}-{end_time}）收到的用户消息：]"
+            "[以下是你在忙碌时段（{start_time}-{end_time}）收到的用户消息：]",
         )
 
     @property
     def merge_suffix(self) -> str:
         """Get merge message suffix."""
-        return self.config.get(
+        return self._config_value(
             "merge_suffix",
-            "[请回复用户，并说明你刚才在做什么。]"
+            "[请回复用户，并说明你刚才在做什么。]",
         )
 
     def queue_message(
@@ -73,31 +75,7 @@ class MessageInterceptor:
             logger.info(f"[BusySchedule] Max message count reached for {user_id}")
             return "force_send"
 
-        # Reset timer
-        self._reset_timer(user_id)
         return "queued"
-
-    def _reset_timer(self, user_id: str):
-        """Reset the send timer for a user."""
-        # Cancel existing timer
-        if user_id in self._message_timers:
-            self._message_timers[user_id].cancel()
-
-        # Start new timer
-        self._message_timers[user_id] = asyncio.create_task(
-            self._timer_callback(user_id)
-        )
-
-    async def _timer_callback(self, user_id: str):
-        """Timer callback to send merged message after delay."""
-        try:
-            await asyncio.sleep(self.send_delay_seconds)
-            logger.info(f"[BusySchedule] Timer expired for {user_id}")
-            # The actual sending will be handled by the main plugin
-            # We just mark it as ready to send
-            self._is_processing[user_id] = True
-        except asyncio.CancelledError:
-            pass
 
     def get_queued_messages(self, user_id: str) -> list[dict]:
         """Get queued messages for a user."""
@@ -141,11 +119,6 @@ class MessageInterceptor:
             del self._message_queues[user_id]
         if user_id in self._event_refs:
             del self._event_refs[user_id]
-        if user_id in self._message_timers:
-            self._message_timers[user_id].cancel()
-            del self._message_timers[user_id]
-        if user_id in self._is_processing:
-            del self._is_processing[user_id]
 
     def get_all_queued_user_ids(self) -> list[str]:
         """Get all user IDs with queued messages."""
@@ -155,19 +128,9 @@ class MessageInterceptor:
         """Check if a user has queued messages."""
         return len(self._message_queues.get(user_id, [])) > 0
 
-    def is_ready_to_send(self, user_id: str) -> bool:
-        """Check if messages are ready to be sent."""
-        return self._is_processing.get(user_id, False)
-
     def mark_sent(self, user_id: str):
         """Mark messages as sent and clear queue."""
         self.clear_queue(user_id)
-
-    def cancel_all_timers(self):
-        """Cancel all pending timers."""
-        for timer in self._message_timers.values():
-            timer.cancel()
-        self._message_timers.clear()
 
     def get_queue_stats(self) -> dict:
         """Get queue statistics."""

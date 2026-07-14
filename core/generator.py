@@ -546,9 +546,9 @@ class ScheduleGenerator:
                 if marker_match
                 else activity_text
             )
-            is_sleep = "睡" in activity
-            if end_time is None and not is_sleep:
-                raise ValueError(f"只有睡觉活动可以省略结束时间：{line}")
+            is_sleep = end_time is None
+            if is_sleep and marker == "可回消息":
+                raise ValueError(f"睡眠活动必须标记为忙碌：{line}")
 
             is_busy = marker != "可回消息"
             if marker is None and not is_sleep:
@@ -570,13 +570,14 @@ class ScheduleGenerator:
                     end_time=end_time,
                     activity=activity,
                     is_busy=is_busy,
+                    period_type="sleep" if is_sleep else "activity",
                 )
             )
 
         if len(periods) < 2:
             raise ValueError("日程必须包含至少一条普通活动和最后一条睡觉活动")
-        if not periods[-1].is_open_sleep or "睡" not in periods[-1].activity:
-            raise ValueError("日程最后一项必须是没有结束时间的睡觉活动")
+        if not periods[-1].is_open_sleep:
+            raise ValueError("日程最后一项必须是没有结束时间的睡眠活动")
         if any(period.is_open_sleep for period in periods[:-1]):
             raise ValueError("只有日程最后一项可以省略结束时间")
         return periods

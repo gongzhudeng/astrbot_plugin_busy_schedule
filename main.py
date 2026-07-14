@@ -66,8 +66,14 @@ class BusySchedulePlugin(Star):
         self._refresh_retry_owner_date: Optional[date] = None
         self._refresh_retry_after: Optional[datetime] = None
 
-        # Peek timers: per-user tasks for random in-busy message delivery
+        # Peek state: probability stays latched until its delivery transaction finishes
         self._peek_timers: dict[str, asyncio.Task] = {}
+        self._peek_latched: set[str] = set()
+
+        # One queued-message delivery transaction per user
+        self._delivery_tasks: dict[str, asyncio.Task] = {}
+        self._delivery_locks: dict[str, asyncio.Lock] = {}
+        self._suppress_exit_delivery = False
 
         # Periodic poll task: background loop that fires while busy
         self._busy_poll_task: Optional[asyncio.Task] = None
@@ -106,15 +112,19 @@ class BusySchedulePlugin(Star):
         async def _wake_and_flush(umo: str):
             period = self.busy_mgr._current_busy_period
             has_queue = self.interceptor.has_queued_messages(umo)
+            if self.busy_mgr.is_busy and period and period.is_sleep:
+                return
             if self.busy_mgr.is_busy:
                 if has_queue and period:
-                    await self._send_merged_messages(umo, period)
+                    await self._deliver_queued_messages(umo, period, "external")
                 await self.busy_mgr.wake_up("external")
             elif has_queue:
-                _period = period or BusyPeriod(
-                    start_time="??:??", end_time=datetime.now().strftime("%H:%M"), activity="忙碌时段"
+                fallback_period = period or BusyPeriod(
+                    start_time="??:??",
+                    end_time=datetime.now().strftime("%H:%M"),
+                    activity="忙碌时段",
                 )
-                await self._send_merged_messages(umo, _period)
+                await self._deliver_queued_messages(umo, fallback_period, "external")
 
         self.context._busy_schedule_wake_and_flush = _wake_and_flush
 
@@ -141,13 +151,15 @@ class BusySchedulePlugin(Star):
         if self._daily_refresh_task:
             self._daily_refresh_task.cancel()
 
-        # Cancel all message timers
-        self.interceptor.cancel_all_timers()
-
-        # Cancel all peek timers
+        # Cancel all automatic delivery tasks
         for task in list(self._peek_timers.values()):
             task.cancel()
         self._peek_timers.clear()
+        self._peek_latched.clear()
+        for task in list(self._delivery_tasks.values()):
+            task.cancel()
+        self._delivery_tasks.clear()
+        self._delivery_locks.clear()
 
         # Cancel poll task
         if self._busy_poll_task and not self._busy_poll_task.done():
@@ -333,6 +345,7 @@ class BusySchedulePlugin(Star):
                 # Always sync the flag so downstream plugins never see a stale value
                 self.context._busy_schedule_is_busy = self.busy_mgr.is_busy
                 self._sync_schedule_to_context()
+                self._reconcile_automatic_tasks()
                 if self.busy_mgr.is_busy:
                     logger.info(
                         f"[BusySchedule] State sync: is_busy=True, "
@@ -340,12 +353,59 @@ class BusySchedulePlugin(Star):
                         f"cooldown={self.busy_mgr._is_in_wakeup_cooldown(datetime.now())}"
                     )
 
+    def _current_period(self) -> Optional[BusyPeriod]:
+        return self.busy_mgr._current_busy_period
+
+    def _is_sleeping(self) -> bool:
+        period = self._current_period()
+        return bool(self.busy_mgr.is_busy and period and period.is_sleep)
+
+    def _reconcile_automatic_tasks(self):
+        """Align automatic tasks with the current structural busy period."""
+        period = self._current_period()
+        if not self.busy_mgr.is_busy or not period or period.is_sleep:
+            if self._busy_poll_task and not self._busy_poll_task.done():
+                self._busy_poll_task.cancel()
+            self._busy_poll_task = None
+            if period and period.is_sleep:
+                for user_id in list(self._peek_timers):
+                    self._cancel_peek_timer(user_id, clear_latch=True)
+            return
+
+        if self._get_config("poll_enabled", False) and (
+            not self._busy_poll_task or self._busy_poll_task.done()
+        ):
+            self._busy_poll_task = asyncio.create_task(self._busy_poll_loop(period))
+
+    @staticmethod
+    def _normalized_range(first: object, second: object) -> tuple[float, float]:
+        try:
+            lower = max(0.0, float(first))
+        except (TypeError, ValueError):
+            lower = 0.0
+        try:
+            upper = max(0.0, float(second))
+        except (TypeError, ValueError):
+            upper = lower
+        return (lower, upper) if lower <= upper else (upper, lower)
+
+    @staticmethod
+    def _normalized_probability(value: object) -> float:
+        try:
+            return min(1.0, max(0.0, float(value)))
+        except (TypeError, ValueError):
+            return 0.0
+
     async def _on_enter_busy(self, period: BusyPeriod):
         """Callback when entering busy state."""
         logger.info(f"[BusySchedule] Entering busy: {period.activity}")
         self.context._busy_schedule_is_busy = True
 
-        # Start periodic poll loop if enabled
+        if period.is_sleep:
+            for user_id in list(self._peek_timers):
+                self._cancel_peek_timer(user_id, clear_latch=True)
+            return
+
         if self._get_config("poll_enabled", False):
             if self._busy_poll_task and not self._busy_poll_task.done():
                 self._busy_poll_task.cancel()
@@ -356,52 +416,128 @@ class BusySchedulePlugin(Star):
         logger.info(f"[BusySchedule] Exiting busy: {period.activity}")
         self.context._busy_schedule_is_busy = False
 
-        # Stop poll loop
         if self._busy_poll_task and not self._busy_poll_task.done():
             self._busy_poll_task.cancel()
         self._busy_poll_task = None
 
-        # Process queued messages for all users with random delay
-        user_ids = self.interceptor.get_all_queued_user_ids()
-        for user_id in user_ids:
-            if self.interceptor.has_queued_messages(user_id):
-                if user_id in self._peek_timers and not self._peek_timers[user_id].done():
-                    # Peek timer is running — it will send the messages, skip
-                    logger.info(f"[BusySchedule] Peek timer active for {user_id}, skipping exit send")
-                    continue
-                asyncio.create_task(self._delayed_send(user_id, period))
+        if self._suppress_exit_delivery:
+            return
 
-    async def _delayed_send(self, user_id: str, period: BusyPeriod):
-        """Send merged messages after a random delay following busy exit."""
-        delay_min = self._get_config("exit_delay_min_seconds", 10)
-        delay_max = self._get_config("exit_delay_max_seconds", 120)
-        delay = random.uniform(delay_min, delay_max)
-        logger.info(f"[BusySchedule] Delayed send for {user_id}: {delay:.1f}s")
-        await asyncio.sleep(delay)
-        if self.interceptor.has_queued_messages(user_id):
-            await self._send_merged_messages(user_id, period)
+        for user_id in self.interceptor.get_all_queued_user_ids():
+            if not self.interceptor.has_queued_messages(user_id):
+                continue
+            if user_id in self._peek_latched:
+                continue
+            self._schedule_delivery(
+                user_id,
+                period,
+                reason="exit",
+                delay_range=self._normalized_range(
+                    self._get_config("exit_delay_min_seconds", 10),
+                    self._get_config("exit_delay_max_seconds", 120),
+                ),
+            )
+
+    def _schedule_delivery(
+        self,
+        user_id: str,
+        period: BusyPeriod,
+        reason: str,
+        delay_range: tuple[float, float] = (0.0, 0.0),
+    ) -> asyncio.Task:
+        current = self._delivery_tasks.get(user_id)
+        if current and not current.done():
+            if reason == "peek":
+                current.add_done_callback(
+                    lambda _task: self._peek_latched.discard(user_id)
+                )
+            return current
+
+        async def _run():
+            try:
+                delay = random.uniform(*delay_range)
+                if delay > 0:
+                    logger.info(
+                        f"[BusySchedule] Delivery delay for {user_id}: {delay:.1f}s"
+                    )
+                    await asyncio.sleep(delay)
+                await self._deliver_queued_messages(user_id, period, reason)
+            finally:
+                if self._delivery_tasks.get(user_id) is asyncio.current_task():
+                    self._delivery_tasks.pop(user_id, None)
+                if reason == "peek":
+                    self._peek_latched.discard(user_id)
+
+        task = asyncio.create_task(_run())
+        self._delivery_tasks[user_id] = task
+        return task
+
+    async def _deliver_queued_messages(
+        self, user_id: str, period: BusyPeriod, reason: str
+    ) -> bool:
+        lock = self._delivery_locks.setdefault(user_id, asyncio.Lock())
+        async with lock:
+            if not self.interceptor.has_queued_messages(user_id):
+                return False
+
+            guarded_delivery = reason in {"peek", "poll", "max_count", "exit"}
+            if guarded_delivery:
+                await self.busy_mgr.check_and_update_state()
+            current_period = self._current_period()
+            if guarded_delivery and self._is_sleeping():
+                logger.info(
+                    f"[BusySchedule] Delivery cancelled during sleep: {user_id}"
+                )
+                return False
+
+            automatic_wake = reason in {"peek", "poll", "max_count"}
+            if automatic_wake and self.busy_mgr.is_busy:
+                if not current_period:
+                    return False
+                period = current_period
+                self.busy_mgr.update_last_message_time()
+                self._suppress_exit_delivery = True
+                try:
+                    await self.busy_mgr.wake_up(reason)
+                finally:
+                    self._suppress_exit_delivery = False
+
+            return await self._send_merged_messages(user_id, period)
 
     def _start_peek_timer(self, user_id: str, period: BusyPeriod):
-        """Start a peek timer that fires after a random delay to send queued messages early."""
-        self._cancel_peek_timer(user_id)
-        delay_min = self._get_config("peek_delay_min_seconds", 5)
-        delay_max = self._get_config("peek_delay_max_seconds", 30)
-        delay = random.uniform(delay_min, delay_max)
+        """Start or reset the latched peek countdown for one user."""
+        self._cancel_peek_timer(user_id, clear_latch=False)
+        self._peek_latched.add(user_id)
+        delay_range = self._normalized_range(
+            self._get_config("peek_delay_min_seconds", 5),
+            self._get_config("peek_delay_max_seconds", 30),
+        )
+        delay = random.uniform(*delay_range)
         logger.info(f"[BusySchedule] Peek timer started for {user_id}: {delay:.1f}s")
 
         async def _callback():
-            await asyncio.sleep(delay)
-            self._peek_timers.pop(user_id, None)
-            if self.interceptor.has_queued_messages(user_id):
-                await self._send_merged_messages(user_id, period)
+            try:
+                await asyncio.sleep(delay)
+                if self._is_sleeping():
+                    return
+                self._schedule_delivery(user_id, period, reason="peek")
+            except asyncio.CancelledError:
+                raise
+            finally:
+                if self._peek_timers.get(user_id) is asyncio.current_task():
+                    self._peek_timers.pop(user_id, None)
+                if self._is_sleeping():
+                    self._peek_latched.discard(user_id)
 
         self._peek_timers[user_id] = asyncio.create_task(_callback())
 
-    def _cancel_peek_timer(self, user_id: str):
-        """Cancel an active peek timer for a user."""
+    def _cancel_peek_timer(self, user_id: str, clear_latch: bool = False):
+        """Cancel a peek countdown without reopening probability unless requested."""
         task = self._peek_timers.pop(user_id, None)
         if task and not task.done():
             task.cancel()
+        if clear_latch:
+            self._peek_latched.discard(user_id)
 
     def _get_poll_params(self, activity: str) -> tuple[float, float, float]:
         """Return (probability, min_minutes, max_minutes) for the given activity.
@@ -421,21 +557,26 @@ class BusySchedulePlugin(Star):
             keyword, prob_str, interval_str = parts[0].strip(), parts[1].strip(), parts[2].strip()
             if keyword and keyword in activity:
                 try:
-                    prob = float(prob_str)
+                    prob = self._normalized_probability(prob_str)
                     mn, mx = interval_str.split("-")
-                    return prob, float(mn), float(mx)
+                    mn_value, mx_value = self._normalized_range(mn, mx)
+                    return prob, mn_value, mx_value
                 except Exception:
                     continue
         # Global defaults
-        prob = self._get_config("poll_probability", 0.3)
-        mn = self._get_config("poll_interval_min_minutes", 5)
-        mx = self._get_config("poll_interval_max_minutes", 15)
-        return float(prob), float(mn), float(mx)
+        prob = self._normalized_probability(
+            self._get_config("poll_probability", 0.3)
+        )
+        mn, mx = self._normalized_range(
+            self._get_config("poll_interval_min_minutes", 5),
+            self._get_config("poll_interval_max_minutes", 15),
+        )
+        return prob, mn, mx
 
     async def _busy_poll_loop(self, period: BusyPeriod):
         """Background loop that fires periodically while busy and may send queued messages."""
         try:
-            while self.busy_mgr.is_busy:
+            while self.busy_mgr.is_busy and not self._is_sleeping():
                 activity = self.busy_mgr.current_activity or ""
                 prob, mn_min, mx_min = self._get_poll_params(activity)
                 wait_seconds = random.uniform(mn_min * 60, mx_min * 60)
@@ -445,14 +586,16 @@ class BusySchedulePlugin(Star):
                 )
                 await asyncio.sleep(wait_seconds)
 
-                if not self.busy_mgr.is_busy:
+                if not self.busy_mgr.is_busy or self._is_sleeping():
                     break
 
                 if random.random() >= prob:
                     continue
 
                 # Triggered — send queued messages for all users (skip if peek already handling)
-                quiet = self._get_config("poll_quiet_seconds", 30)
+                _, quiet = self._normalized_range(
+                    self._get_config("poll_quiet_seconds", 30), 0
+                )
                 user_ids = self.interceptor.get_all_queued_user_ids()
                 for user_id in user_ids:
                     if not self.interceptor.has_queued_messages(user_id):
@@ -471,31 +614,36 @@ class BusySchedulePlugin(Star):
                                     f"[BusySchedule] Poll skipped for {user_id}: quiet period active"
                                 )
                                 continue
-                    current_period = self.busy_mgr._current_busy_period or period
+                    current_period = self._current_period() or period
+                    if current_period.is_sleep:
+                        break
                     logger.info(f"[BusySchedule] Poll triggered send for {user_id}")
-                    asyncio.create_task(self._delayed_send(user_id, current_period))
+                    self._schedule_delivery(user_id, current_period, reason="poll")
         except asyncio.CancelledError:
             pass
 
-    async def _send_merged_messages(self, user_id: str, period: BusyPeriod):
-        """Send merged messages after busy period ends by re-injecting into pipeline."""
+    async def _send_merged_messages(
+        self, user_id: str, period: BusyPeriod
+    ) -> bool:
+        """Re-inject one merged queue and commit it only after enqueue succeeds."""
         merged_text = self.interceptor.get_merged_message(
             user_id,
             period.start_time,
-            period.end_time,
+            period.end_time or datetime.now().strftime("%H:%M"),
         )
 
         if not merged_text:
-            return
+            return False
 
         extra_components = self.interceptor.get_extra_components(user_id)
 
         # Get stored event reference
         events = self.interceptor._event_refs.get(user_id, [])
         if not events:
-            logger.warning(f"[BusySchedule] No event ref for {user_id}, cannot send merged messages")
-            self.interceptor.mark_sent(user_id)
-            return
+            logger.warning(
+                f"[BusySchedule] No event ref for {user_id}, cannot send merged messages"
+            )
+            return False
 
         # Use the last event as template
         last_event = events[-1]
@@ -558,14 +706,14 @@ class BusySchedulePlugin(Star):
             f"{len(merged_text)} chars, content: {merged_text[:80]}..."
         )
 
-        # Clean up queue and refs before re-injection
-        self.interceptor.mark_sent(user_id)
-
-        # Re-inject into event queue
         try:
             self.context.get_event_queue().put_nowait(reinjected_event)
         except Exception as e:
             logger.error(f"[BusySchedule] Failed to re-inject event for {user_id}: {e}")
+            return False
+
+        self.interceptor.mark_sent(user_id)
+        return True
 
     def _check_wake_keywords(self, message_text: str) -> bool:
         """Check if message contains wake keywords."""
@@ -627,7 +775,15 @@ class BusySchedulePlugin(Star):
     def _get_config(self, key: str, default=None):
         """Get config value with schema default fallback."""
         # Nested groups take priority — user-edited values live here
-        for group_name in ["基础设置", "忙碌时段", "关键词设置", "消息合并", "日程生成"]:
+        for group_name in [
+            "基础设置",
+            "忙碌时段",
+            "随机接收",
+            "定时检查",
+            "关键词设置",
+            "消息合并",
+            "日程生成",
+        ]:
             group = self.config.get(group_name, {})
             if isinstance(group, dict) and key in group:
                 val = group[key]
@@ -682,8 +838,14 @@ class BusySchedulePlugin(Star):
             extra_comps = [c for c in event.message_obj.message if not isinstance(c, Plain)] if hasattr(event.message_obj, "message") else []
             has_queue = self.interceptor.has_queued_messages(user_id)
             if self.busy_mgr.is_busy:
-                # Queue the wake keyword message itself so it's included in the merged batch
-                self.interceptor.queue_message(user_id, message_text, event, extra_components=extra_comps)
+                self._cancel_peek_timer(user_id, clear_latch=True)
+                self.interceptor.queue_message(
+                    user_id,
+                    message_text,
+                    event,
+                    extra_components=extra_comps,
+                )
+                self.busy_mgr.update_last_message_time()
                 await self.busy_mgr.wake_up("keyword")
                 event.stop_event()
                 return
@@ -719,22 +881,32 @@ class BusySchedulePlugin(Star):
 
             if result == "queued":
                 event.stop_event()
-                # Peek: randomly deliver queued messages early while still busy
-                if self._get_config("peek_enabled", False):
-                    if user_id in self._peek_timers and not self._peek_timers[user_id].done():
-                        # Reset timer so new message is included
-                        period = self.busy_mgr._current_busy_period or BusyPeriod(
-                            start_time="??:??", end_time=datetime.now().strftime("%H:%M"), activity="忙碌时段"
-                        )
-                        self._start_peek_timer(user_id, period)
-                    elif random.random() < self._get_config("peek_probability", 0.05):
-                        period = self.busy_mgr._current_busy_period or BusyPeriod(
-                            start_time="??:??", end_time=datetime.now().strftime("%H:%M"), activity="忙碌时段"
-                        )
+                if (
+                    not self._is_sleeping()
+                    and self._get_config("peek_enabled", False)
+                ):
+                    period = self._current_period() or BusyPeriod(
+                        start_time="??:??",
+                        end_time=datetime.now().strftime("%H:%M"),
+                        activity="忙碌时段",
+                    )
+                    if user_id in self._peek_latched:
+                        if user_id in self._peek_timers:
+                            self._start_peek_timer(user_id, period)
+                    elif random.random() < self._normalized_probability(
+                        self._get_config("peek_probability", 0.05)
+                    ):
                         self._start_peek_timer(user_id, period)
             elif result == "force_send":
-                # Will be handled by timer or next state check
                 event.stop_event()
+                if not self._is_sleeping():
+                    period = self._current_period() or BusyPeriod(
+                        start_time="??:??",
+                        end_time=datetime.now().strftime("%H:%M"),
+                        activity="忙碌时段",
+                    )
+                    self._cancel_peek_timer(user_id, clear_latch=True)
+                    self._schedule_delivery(user_id, period, reason="max_count")
             return
 
         # Not busy - update last message time for chat protection

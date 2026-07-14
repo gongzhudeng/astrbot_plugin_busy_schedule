@@ -248,17 +248,6 @@
         },
         "default": 20
       },
-      "send_delay_seconds": {
-        "description": "延迟发送时间（秒）",
-        "hint": "最后一条消息后多少秒发送合并消息",
-        "type": "int",
-        "slider": {
-          "min": 5,
-          "max": 300,
-          "step": 5
-        },
-        "default": 60
-      },
       "merge_prefix": {
         "description": "合并消息前缀",
         "hint": "合并消息前添加的提示，{start_time}和{end_time}会被替换",

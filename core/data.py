@@ -48,11 +48,23 @@ class BusyPeriod:
     end_time: Optional[str]
     activity: str
     is_busy: bool = True
+    period_type: str = "activity"
+
+    def __post_init__(self):
+        if self.end_time is None:
+            self.period_type = "sleep"
+        elif self.period_type not in {"activity", "sleep"}:
+            self.period_type = "activity"
+
+    @property
+    def is_sleep(self) -> bool:
+        """Return whether this period is structurally marked as sleep."""
+        return self.period_type == "sleep"
 
     @property
     def is_open_sleep(self) -> bool:
         """Return whether this period is an open-ended sleep entry."""
-        return self.end_time is None
+        return self.is_sleep and self.end_time is None
 
     def to_absolute_datetimes(
         self,
@@ -131,7 +143,7 @@ def get_first_activity_start(
     """Return the first ordinary activity start on an effective timeline."""
     starts = []
     for period in data.busy_periods:
-        if period.is_open_sleep:
+        if period.is_sleep:
             continue
         hour, minute = parse_clock_time(period.start_time)
         base = (
@@ -194,9 +206,18 @@ class ScheduleData:
         payload = dict(data)
         busy_periods_data = payload.pop("busy_periods", [])
         busy_periods = []
+        legacy_sleep_keywords = ("睡觉", "睡眠", "就寝", "入睡", "休眠")
         for item in busy_periods_data:
             period = dict(item)
             period.setdefault("end_time", None)
+            if "period_type" not in period:
+                activity = str(period.get("activity", ""))
+                period["period_type"] = (
+                    "sleep"
+                    if period["end_time"] is None
+                    or any(keyword in activity for keyword in legacy_sleep_keywords)
+                    else "activity"
+                )
             busy_periods.append(BusyPeriod(**period))
         return cls(**payload, busy_periods=busy_periods)
 
