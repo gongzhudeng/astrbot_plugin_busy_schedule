@@ -273,64 +273,6 @@
       }
     }
   },
-  "智能判断": {
-    "description": "LLM智能判断配置",
-    "type": "object",
-    "items": {
-      "enable_smart_judge": {
-        "description": "启用智能判断",
-        "hint": "使用LLM分析用户消息，智能调整日程和忙碌状态",
-        "type": "bool",
-        "default": false
-      },
-      "llm_provider_judge": {
-        "description": "智能判断的 LLM 供应商",
-        "hint": "留空则使用当前正在使用的 LLM 供应商",
-        "type": "string",
-        "_special": "select_provider",
-        "default": ""
-      },
-      "judge_persona_id": {
-        "description": "智能判断的人设",
-        "hint": "可选择已配置的人设，用于智能判断时理解用户意图。留空则使用当前对话的人格",
-        "type": "string",
-        "_special": "select_persona",
-        "default": ""
-      },
-      "judge_cooldown_minutes": {
-        "description": "判断冷却时间（分钟）",
-        "hint": "两次智能判断之间的最小间隔",
-        "type": "int",
-        "slider": {
-          "min": 1,
-          "max": 60,
-          "step": 1
-        },
-        "default": 5
-      },
-      "judge_history_rounds": {
-        "description": "智能判断参考的对话轮数",
-        "hint": "设为 0 则不参考对话历史",
-        "type": "int",
-        "slider": {
-          "min": 0,
-          "max": 20,
-          "step": 1
-        },
-        "default": 3
-      },
-      "judge_prompt": {
-        "description": "智能判断提示词模板",
-        "hint": "用于分析用户消息并判断是否需要调整日程。支持占位符：{today_schedule}、{current_time}、{user_message}、{conversation_context}",
-        "type": "text",
-        "obvious_hint": true,
-        "editor_mode": true,
-        "editor_language": "markdown",
-        "editor_theme": "vs-dark",
-        "default": "# 任务：分析用户意图，判断是否需要调整日程安排\n\n## 当前日程\n{today_schedule}\n\n## 当前时间\n{current_time}\n\n## 近期对话\n{conversation_context}\n\n## 用户消息\n{user_message}\n\n## 判断规则\n1. 如果用户想让AI取消某个活动（如\"别去了\"、\"别忙了\"、\"陪我聊天\"），应调整该活动\n2. 如果用户想让AI改变睡眠时间（如\"晚点睡\"、\"再陪我一会\"），应调整睡眠时段\n3. 如果用户想让AI提前开始某活动（如\"早点去\"），应调整该活动时间\n4. 如果用户只是普通聊天，不需要调整\n\n## 输出格式\n请严格返回JSON：\n{\n  \"should_adjust\": true/false,\n  \"reason\": \"判断原因\",\n  \"adjustments\": [\n    {\n      \"original_activity\": \"原活动\",\n      \"original_time\": \"原时间 HH:MM-HH:MM\",\n      \"new_activity\": \"新活动（可选）\",\n      \"new_time\": \"新时间 HH:MM-HH:MM（可选）\",\n      \"is_busy\": true/false\n    }\n  ]\n}\n\n如果不需要调整，返回：\n{\"should_adjust\": false, \"reason\": \"普通聊天，无需调整\"}"
-      }
-    }
-  },
   "日程生成": {
     "description": "日程生成配置",
     "type": "object",
@@ -346,8 +288,8 @@
         "default": 3
       },
       "reference_recent_count": {
-        "description": "生成时参考的近期会话数量",
-        "hint": "设为 0 时，则不参考近期会话",
+        "description": "生成时参考的近期对话轮数",
+        "hint": "按最近 N 个用户轮次读取真实会话；设为 0 时不参考近期会话",
         "type": "int",
         "slider": {
           "min": 0,
@@ -457,10 +399,10 @@
       },
       "rag_query_max_chars": {
         "description": "检索 query 字数上限",
-        "hint": "对话太长时从末尾截取，防止 query 过长",
+        "hint": "对每条选中消息公平分配长度并保留消息开头，避免较早的明确安排被挤掉；0 表示不额外截断",
         "type": "int",
         "slider": {
-          "min": 100,
+          "min": 0,
           "max": 2000,
           "step": 100
         },
@@ -468,10 +410,10 @@
       },
       "rag_result_max_chars": {
         "description": "检索结果字数上限",
-        "hint": "知识库/记忆注入内容超过此长度时截断，防止撑大 prompt",
+        "hint": "知识库/记忆注入内容超过此长度时截断，防止撑大 prompt；0 表示不额外截断",
         "type": "int",
         "slider": {
-          "min": 200,
+          "min": 0,
           "max": 3000,
           "step": 100
         },
@@ -485,7 +427,7 @@
         "editor_mode": true,
         "editor_language": "markdown",
         "editor_theme": "vs-dark",
-        "default": "# Role: Life Scheduler\n请根据以下信息，为自己规划一份今天的生活安排。\n\n## Context\n- 日期：{date_str} {weekday} {holiday}\n- 人设：{persona_desc}\n\n## 今日创意约束（必须遵循）\n- 今日主题：【{daily_theme}】\n- 心情色彩：【{mood_color}】\n- 穿搭风格（必须严格遵循）：【{outfit_style}】\n- 日程类型：【{schedule_type}】\n\n## 昨日最后活动（今日日程必须从这里衔接）\n{last_yesterday_activity}\n\n如果昨日有睡眠/休息记录，今日日程必须从「起床/醒来」开始。\n\n## 需要避免的重复内容\n{history_schedules}\n\n## 参考信息\n{recent_chats}\n\n## 相关记忆与知识\n{rag_context}\n\n## 重要：日程格式要求\n1. 必须包含睡眠时段（如 23:00-07:00 睡觉）\n2. 每个活动必须标记忙碌状态：\n   - 【可回消息】：可以随时回复用户消息的活动（如刷手机、休息、散步等）\n   - 【忙碌】：不能及时回复的活动（如看电影、开会、运动、睡觉等）\n3. 时间格式：HH:MM-HH:MM 活动描述 【忙碌/可回消息】\n4. **排序规则**：\n   - 活动必须按时间顺序排列（从早到晚）\n   - 跨天的睡眠时段（如 03:00-12:00）必须放在日程的**最后**，而不是最前面\n   - 示例正确顺序：12:00-13:00 午餐 -> 13:00-18:00 活动 -> 18:00-22:00 活动 -> 22:00-03:00 睡觉\n\n## 强制约束（必须严格遵循）\n- 你必须严格遵循穿搭风格：【{outfit_style}】（不得替换/混用其他风格）\n- 你必须只输出 JSON 对象本体（不要 Markdown/代码块/解释）\n- JSON 必须包含字段 \\\"outfit_style\\\"，且其值必须严格等于 \\\"{outfit_style}\\\"\n- 字段 \\\"outfit\\\" 的第一行必须以 \\\"风格：{outfit_style}\\\" 开头\n\n## 约束\n- schedule 和 outfit 必须简洁，不要写多余解释\n- outfit 控制在5行以内\n- schedule 每个活动一行，总共不超过15行\n- 不要添加额外的说明文字\n\n## Tasks\n1. outfit: 今日穿搭描述。必须完整覆盖所有层次，不得省略任何一层：\n   a-1) 内衣（文胸/背心）—— 必须单独列出，写明款式或颜色\n   a-2) 内裤 —— 必须单独列出，写明款式或颜色\n   **禁止**将内衣和内裤合并为一条（如「内衣套装」），必须各自单独一行\n   b) 上装（打底/内搭 + 外套/外层）\n   c) 下装（裤子/裙子等）\n   d) 袜子\n   e) 鞋子\n   f) 配饰（如有）\n   从里到外、从上到下逐层描述，5行以内\n   **禁止**使用「内搭省略」「贴身衣物略」等省略话术，必须写出具体内容\n2. schedule: 规划今日日程，包含睡眠时段，每个活动必须标记忙碌状态，每行一个活动，总共不超过15行。**跨天睡眠放最后！**\n\n## Output Format\n请严格返回 JSON：\n{{\n  \\\"outfit_style\\\": \\\"{outfit_style}\\\",\n  \\\"outfit\\\": \\\"...\\\",\n  \\\"schedule\\\": \\\"...\\\"\n}}"
+        "default": "# Role: Life Scheduler\n请根据以下信息，为自己规划一份今天的生活安排。\n\n## Context\n- 日期：{date_str} {weekday} {holiday}\n- 人设：{persona_desc}\n\n## 今日创意约束（必须遵循）\n- 今日主题：【{daily_theme}】\n- 心情色彩：【{mood_color}】\n- 穿搭风格（必须严格遵循）：【{outfit_style}】\n- 日程类型：【{schedule_type}】\n\n## 昨日最后活动（今日日程必须从这里衔接）\n{last_yesterday_activity}\n\n如果昨日有睡眠/休息记录，今日日程必须从「起床/醒来」开始。\n\n## 需要避免的重复内容\n{history_schedules}\n\n## 参考信息\n{recent_chats}\n\n## 相关记忆与知识\n{rag_context}\n\n## 信息优先级\n近期对话中已经明确约定的未来计划（如明天出门、地点和时间）必须优先执行；随机主题和日程类型只能补充，不能覆盖明确约定。\n\n## 重要：日程格式要求\n1. 必须包含睡眠时段（如 23:00-07:00 睡觉）\n2. 每个活动必须标记忙碌状态：\n   - 【可回消息】：可以随时回复用户消息的活动（如刷手机、休息、散步等）\n   - 【忙碌】：不能及时回复的活动（如看电影、开会、运动、睡觉等）\n3. 时间格式：HH:MM-HH:MM 活动描述 【忙碌/可回消息】\n4. **排序规则**：\n   - 活动必须按时间顺序排列（从早到晚）\n   - 跨天的睡眠时段（如 03:00-12:00）必须放在日程的**最后**，而不是最前面\n   - 示例正确顺序：12:00-13:00 午餐 -> 13:00-18:00 活动 -> 18:00-22:00 活动 -> 22:00-03:00 睡觉\n\n## 强制约束（必须严格遵循）\n- 你必须严格遵循穿搭风格：【{outfit_style}】（不得替换/混用其他风格）\n- 你必须只输出 JSON 对象本体（不要 Markdown/代码块/解释）\n- JSON 必须包含字段 \\\"outfit_style\\\"，且其值必须严格等于 \\\"{outfit_style}\\\"\n- 字段 \\\"outfit\\\" 的第一行必须以 \\\"风格：{outfit_style}\\\" 开头\n\n## 约束\n- schedule 和 outfit 必须简洁，不要写多余解释\n- outfit 控制在5行以内\n- schedule 每个活动一行，总共不超过15行\n- 不要添加额外的说明文字\n\n## Tasks\n1. outfit: 今日穿搭描述。必须完整覆盖所有层次，不得省略任何一层：\n   a-1) 内衣（文胸/背心）—— 必须单独列出，写明款式或颜色\n   a-2) 内裤 —— 必须单独列出，写明款式或颜色\n   **禁止**将内衣和内裤合并为一条（如「内衣套装」），必须各自单独一行\n   b) 上装（打底/内搭 + 外套/外层）\n   c) 下装（裤子/裙子等）\n   d) 袜子\n   e) 鞋子\n   f) 配饰（如有）\n   从里到外、从上到下逐层描述，5行以内\n   **禁止**使用「内搭省略」「贴身衣物略」等省略话术，必须写出具体内容\n2. schedule: 规划今日日程，包含睡眠时段，每个活动必须标记忙碌状态，每行一个活动，总共不超过15行。**跨天睡眠放最后！**\n\n## Output Format\n请严格返回 JSON：\n{{\n  \\\"outfit_style\\\": \\\"{outfit_style}\\\",\n  \\\"outfit\\\": \\\"...\\\",\n  \\\"schedule\\\": \\\"...\\\"\n}}"
       }
     }
   }

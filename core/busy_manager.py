@@ -4,7 +4,13 @@ from datetime import datetime, date, timedelta
 from typing import Optional
 from astrbot.api import logger
 
-from .data import ScheduleData, BusyPeriod, ScheduleDataManager
+from .data import (
+    ScheduleData,
+    ScheduleDataManager,
+    BusyPeriod,
+    get_schedule_owner_date,
+    parse_schedule_time,
+)
 
 
 class BusyPeriodManager:
@@ -17,6 +23,8 @@ class BusyPeriodManager:
         # State tracking
         self._is_busy: bool = False
         self._current_busy_period: Optional[BusyPeriod] = None
+        self._current_busy_owner_date: Optional[date] = None
+        self._current_busy_schedule_time: Optional[tuple[int, int]] = None
         self._busy_start_time: Optional[datetime] = None
         self._wakeup_time: Optional[datetime] = None  # When AI was woken up by keyword
         self._last_user_message_time: Optional[datetime] = None
@@ -55,7 +63,7 @@ class BusyPeriodManager:
 
     def _can_enter_busy(self, now: datetime) -> bool:
         """Check if AI can enter busy state (chat protection)."""
-        protect_minutes = self.config.get("chat_protect_minutes", 10)
+        protect_minutes = self._config_value("chat_protect_minutes", 10)
 
         if self._last_user_message_time:
             inactive_minutes = (now - self._last_user_message_time).total_seconds() / 60
@@ -68,48 +76,50 @@ class BusyPeriodManager:
         if not self._wakeup_time:
             return False
 
-        cooldown_minutes = self.config.get("wake_cooldown_minutes", 15)
+        cooldown_minutes = self._config_value("wake_cooldown_minutes", 15)
         elapsed = (now - self._wakeup_time).total_seconds() / 60
         return elapsed < cooldown_minutes
 
+    def _config_value(self, key: str, default=None):
+        """Read flat or grouped config values consistently with the plugin."""
+        for group_name in ["基础设置", "忙碌时段"]:
+            group = self.config.get(group_name, {})
+            if isinstance(group, dict) and key in group:
+                return group[key]
+        return self.config.get(key, default)
+
     def _parse_schedule_time(self) -> tuple[int, int]:
-        """Return (hour, minute) for the configured schedule_time."""
-        try:
-            h, m = map(int, self.config.get("schedule_time", "07:00").split(":"))
-            return h, m
-        except Exception:
-            return 7, 0
+        """Return the validated schedule boundary."""
+        return parse_schedule_time(self._config_value("schedule_time", "07:00"))
 
     def _get_schedule_owner_date(self, now: datetime) -> date:
-        """Return the schedule-cycle date that owns the given moment.
+        """Return the schedule-cycle date that owns the given moment."""
+        return get_schedule_owner_date(now, self._parse_schedule_time())
 
-        A schedule's validity period runs from schedule_time on its own date to
-        schedule_time on the next date.  This means moments between midnight and
-        schedule_time still belong to the previous calendar day's schedule.
-        """
-        schedule_time_str = self.config.get("schedule_time", "07:00")
-        try:
-            h, m = map(int, schedule_time_str.split(":"))
-        except Exception:
-            h, m = 7, 0
-        cutoff = now.replace(hour=h, minute=m, second=0, microsecond=0)
-        return now.date() if now >= cutoff else (now - timedelta(days=1)).date()
-
-    def get_current_busy_period(self, now: datetime) -> Optional[BusyPeriod]:
-        """Get the busy period that contains the current time.
-
-        Uses schedule_time as the cycle boundary instead of calendar midnight,
-        so a single schedule is consulted regardless of whether now has crossed
-        midnight within the same cycle.
-        """
+    def _get_active_schedule(
+        self, now: datetime
+    ) -> Optional[tuple[date, ScheduleData]]:
+        """Resolve the active completed schedule without rebasing old periods."""
         owner_date = self._get_schedule_owner_date(now)
-        sh, sm = self._parse_schedule_time()
         data = self.data_mgr.get(owner_date)
-        if not data or not data.busy_periods:
+        if data and data.status == "completed":
+            return owner_date, data
+        return self.data_mgr.get_latest_completed(owner_date)
+
+    def get_current_busy_period(
+        self, now: datetime
+    ) -> Optional[tuple[date, BusyPeriod]]:
+        """Get the busy period and its real schedule owner date."""
+        active = self._get_active_schedule(now)
+        schedule_time = self._parse_schedule_time()
+        if not active:
             return None
+        owner_date, data = active
         for period in data.busy_periods:
-            if period.is_busy and period.contains(now, owner_date=owner_date, schedule_time=(sh, sm)):
-                return period
+            if period.is_busy and period.contains(
+                now, owner_date=owner_date, schedule_time=schedule_time
+            ):
+                return owner_date, period
         return None
 
     def get_next_busy_period(self, now: datetime) -> Optional[BusyPeriod]:
@@ -139,36 +149,44 @@ class BusyPeriodManager:
         """Check current time and update busy state accordingly."""
         now = datetime.now()
         in_cooldown = self._is_in_wakeup_cooldown(now)
-        sh, sm = self._parse_schedule_time()
+        current = self.get_current_busy_period(now)
 
-        # Check if should be busy
-        current_period = self.get_current_busy_period(now)
-
-        if current_period and not self._is_busy:
-            # Should enter busy — but respect cooldown and chat protection
+        if current and not self._is_busy:
+            owner_date, current_period = current
             if not in_cooldown and self._can_enter_busy(now):
-                await self._enter_busy(current_period)
-        elif not current_period and self._is_busy:
-            # Should exit busy — always allow exit regardless of cooldown
-            if self._current_busy_period and self._current_busy_period.contains(
-                now, owner_date=self._get_schedule_owner_date(now), schedule_time=(sh, sm)
-            ):
-                logger.debug(
-                    f"[BusySchedule] Still in manual period "
-                    f"{self._current_busy_period.start_time}-{self._current_busy_period.end_time}, "
-                    f"not exiting"
-                )
-                return  # Still within manual busy period, do not exit
+                await self._enter_busy(current_period, owner_date)
+        elif not current and self._is_busy:
+            if self._current_busy_period and self._current_busy_owner_date:
+                if self._current_busy_period.contains(
+                    now,
+                    owner_date=self._current_busy_owner_date,
+                    schedule_time=(
+                        self._current_busy_schedule_time
+                        or self._parse_schedule_time()
+                    ),
+                ):
+                    logger.debug(
+                        f"[BusySchedule] Still in manual period "
+                        f"{self._current_busy_period.start_time}-{self._current_busy_period.end_time}, "
+                        f"not exiting"
+                    )
+                    return
             logger.info(
                 f"[BusySchedule] No active period found (current_period=None, "
                 f"manual={self._current_busy_period is not None}), forcing exit busy"
             )
             await self._exit_busy()
 
-    async def _enter_busy(self, period: BusyPeriod):
-        """Enter busy state."""
+    async def _enter_busy(
+        self, period: BusyPeriod, owner_date: Optional[date] = None
+    ):
+        """Enter busy state and preserve the period's timeline owner."""
         self._is_busy = True
         self._current_busy_period = period
+        self._current_busy_owner_date = owner_date or self._get_schedule_owner_date(
+            datetime.now()
+        )
+        self._current_busy_schedule_time = self._parse_schedule_time()
         self._busy_start_time = datetime.now()
         logger.info(f"[BusySchedule] Entering busy state: {period.activity}")
 
@@ -183,6 +201,8 @@ class BusyPeriodManager:
         self._is_busy = False
         exiting_period = self._current_busy_period
         self._current_busy_period = None
+        self._current_busy_owner_date = None
+        self._current_busy_schedule_time = None
         self._busy_start_time = None
 
         if self._on_exit_busy and exiting_period:

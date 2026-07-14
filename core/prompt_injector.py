@@ -1,6 +1,6 @@
 """Prompt injector module - handles system prompt injection for different states."""
 
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional
 
 from astrbot.api import logger
@@ -16,7 +16,7 @@ class PromptInjector:
 
     def _cfg(self, key: str, default=None):
         """Get config value with nested group fallback."""
-        for group_name in ["基础设置", "忙碌时段", "关键词设置", "消息合并", "智能判断", "日程生成"]:
+        for group_name in ["基础设置", "忙碌时段", "关键词设置", "消息合并", "日程生成"]:
             group = self.config.get(group_name, {})
             if isinstance(group, dict) and key in group:
                 val = group[key]
@@ -74,6 +74,8 @@ class PromptInjector:
     def build_schedule_injection(
         self,
         data: ScheduleData,
+        owner_date: date,
+        schedule_time: tuple[int, int],
         current_time: Optional[datetime] = None,
     ) -> str:
         """Build semi-static schedule injection (current activity + next activity + start time).
@@ -88,17 +90,22 @@ class PromptInjector:
         now = current_time or datetime.now()
 
         # Find current activity
-        current_activity = self._find_current_activity(data, now)
+        current_activity = self._find_current_activity(
+            data, owner_date, schedule_time, now
+        )
 
         # Find next upcoming activity (busy or free)
         next_activity = None
         next_start = None
-        if data.busy_periods:
-            for period in sorted(data.busy_periods, key=lambda p: p.start_time):
-                if period.start_datetime > now:
-                    next_activity = period.activity
-                    next_start = period.start_time
-                    break
+        candidates = []
+        for period in data.busy_periods:
+            start, _ = period.to_absolute_datetimes(owner_date, *schedule_time)
+            if start > now:
+                candidates.append((start, period))
+        if candidates:
+            _, next_period = min(candidates, key=lambda item: item[0])
+            next_activity = next_period.activity
+            next_start = next_period.start_time
 
         parts = [
             "<character_schedule>",
@@ -132,27 +139,19 @@ class PromptInjector:
         return "\n".join(injection_parts)
 
     def _find_current_activity(
-        self, data: ScheduleData, current_time: datetime
+        self,
+        data: ScheduleData,
+        owner_date: date,
+        schedule_time: tuple[int, int],
+        current_time: datetime,
     ) -> Optional[str]:
-        """Find the current activity from schedule based on time."""
+        """Find the current activity on the schedule's absolute timeline."""
         if not data.busy_periods:
-            # Try to parse from schedule text
-            return self._parse_activity_from_text(data.schedule, current_time)
-
-        current_hour = current_time.hour
-        current_minute = current_time.minute
-        current_total_minutes = current_hour * 60 + current_minute
+            return None
 
         for period in data.busy_periods:
-            start_parts = period.start_time.split(":")
-            end_parts = period.end_time.split(":")
-
-            start_minutes = int(start_parts[0]) * 60 + int(start_parts[1])
-            end_minutes = int(end_parts[0]) * 60 + int(end_parts[1])
-
-            if start_minutes <= current_total_minutes < end_minutes:
+            if period.contains(current_time, owner_date, schedule_time):
                 return period.activity
-
         return None
 
     def _parse_activity_from_text(

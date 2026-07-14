@@ -163,11 +163,12 @@ class ScheduleGenerator:
         self.data_mgr = data_mgr
         self._generating = False
         self._generation_future: Optional[asyncio.Future] = None
+        self._generation_target: Optional[date] = None
 
     def _cfg(self, key: str, default=None):
         """Get config value with schema default fallback."""
         # Nested groups take priority — user-edited values live here
-        for group_name in ["基础设置", "忙碌时段", "关键词设置", "消息合并", "智能判断", "日程生成"]:
+        for group_name in ["基础设置", "忙碌时段", "关键词设置", "消息合并", "日程生成"]:
             group = self.config.get(group_name, {})
             if isinstance(group, dict) and key in group:
                 val = group[key]
@@ -192,45 +193,6 @@ class ScheduleGenerator:
             if provider:
                 return provider
         return self.context.get_using_provider()
-
-    def _get_judge_provider(self):
-        """Get LLM provider for smart judgment."""
-        provider_id = self._cfg("llm_provider_judge", "")
-        if provider_id:
-            provider = self.context.get_provider_by_id(provider_id)
-            if provider:
-                return provider
-        return self.context.get_using_provider()
-
-    async def _get_judge_persona(self, umo: Optional[str] = None) -> str:
-        """Get persona system_prompt for smart judgment.
-
-        Priority: judge_persona_id config > current conversation persona > empty.
-        """
-        try:
-            persona_id = self._cfg("judge_persona_id", "")
-
-            if not persona_id and umo:
-                try:
-                    conv_mgr = self.context.conversation_manager
-                    if conv_mgr:
-                        cid = await conv_mgr.get_curr_conversation_id(umo)
-                        if cid:
-                            conv = await conv_mgr.get_conversation(umo, cid)
-                            if conv and getattr(conv, "persona_id", None):
-                                persona_id = conv.persona_id
-                except Exception:
-                    pass
-
-            if persona_id:
-                persona_mgr = self.context.persona_manager
-                if persona_mgr:
-                    for persona in persona_mgr.personas:
-                        if persona.persona_id == persona_id and persona.system_prompt:
-                            return persona.system_prompt
-        except Exception as e:
-            logger.warning(f"[BusySchedule] Failed to resolve judge persona: {e}")
-        return ""
 
     async def _get_persona_desc(self, umo: Optional[str] = None) -> str:
         """Get bot persona description for schedule generation.
@@ -314,53 +276,35 @@ class ScheduleGenerator:
         logger.info(f"[BusySchedule] Yesterday's last activity: {last_line}")
         return last_line
 
-    async def _get_recent_chats(self, umo: Optional[str] = None, count: int = 0) -> str:
-        """Get recent chat messages for reference via conversation_manager."""
-        count = count or self._cfg("reference_recent_count", 10)
-        if not umo or not count:
+    async def _get_recent_chats(self, umo: Optional[str] = None, rounds: Optional[int] = None) -> str:
+        """Get recent conversation rounds for schedule generation."""
+        if rounds is None:
+            rounds = int(self._cfg("reference_recent_count", 10))
+        if not umo or rounds <= 0:
             return "无近期对话"
 
-        try:
-            conv_mgr = self.context.conversation_manager
-            if not conv_mgr:
-                return "无近期对话"
-
-            cid = await conv_mgr.get_curr_conversation_id(umo)
-            if not cid:
-                return "无近期对话记录"
-
-            conv = await conv_mgr.get_conversation(umo, cid)
-            if not conv or not getattr(conv, "history", None):
-                return "无近期对话记录"
-
-            history = json.loads(conv.history)
-            recent = history[-count:] if count > 0 else history
-
-            formatted = []
-            for msg in recent:
-                role = msg.get("role", "unknown")
-                content = msg.get("content", "")
-                if not content:
-                    continue
-                # Truncate very long messages
-                if len(content) > 200:
-                    content = content[:200] + "..."
-                if role == "user":
-                    formatted.append(f"用户: {content}")
-                elif role == "assistant":
-                    formatted.append(f"我: {content}")
-
-            return "\n".join(formatted) if formatted else "无近期对话记录"
-        except Exception as e:
+        contexts = await self._get_conversation_contexts(umo, rounds)
+        if not contexts:
             return "无近期对话记录"
 
-    async def _get_conversation_contexts(self, umo: str, rounds: int) -> list:
-        """Fetch the last N rounds of conversation history as context dicts.
+        formatted = []
+        for msg in contexts:
+            content = str(msg.get("content", "")).strip()
+            if not content:
+                continue
+            if len(content) > 200:
+                content = content[:200] + "..."
+            speaker = "用户" if msg.get("role") == "user" else "我"
+            formatted.append(f"{speaker}: {content}")
 
-        Returns a list of {"role": "user"/"assistant", "content": "..."} dicts,
-        suitable for passing to provider.text_chat(contexts=...).
-        Each round = 1 user message + 1 assistant message.
-        """
+        logger.info(
+            f"[BusySchedule] Recent chats selected: rounds={rounds}, "
+            f"messages={len(contexts)}, chars={sum(len(item) for item in formatted)}"
+        )
+        return "\n".join(formatted) if formatted else "无近期对话记录"
+
+    async def _get_conversation_contexts(self, umo: str, rounds: int) -> list[dict]:
+        """Fetch the most recent N user-led conversation rounds."""
         if rounds <= 0:
             return []
         try:
@@ -374,12 +318,16 @@ class ScheduleGenerator:
             if not conversation or not conversation.history:
                 return []
 
-            history = json.loads(conversation.history) if isinstance(conversation.history, str) else conversation.history
+            history = (
+                json.loads(conversation.history)
+                if isinstance(conversation.history, str)
+                else conversation.history
+            )
             if not isinstance(history, list):
                 return []
 
-            # Collect messages in reverse, then take last N rounds
-            msgs = []
+            messages = []
+            user_rounds = 0
             for msg in reversed(history):
                 if not isinstance(msg, dict):
                     continue
@@ -389,79 +337,137 @@ class ScheduleGenerator:
                 content = msg.get("content", "")
                 if isinstance(content, list):
                     content = " ".join(
-                        p.get("text", "") for p in content
-                        if isinstance(p, dict) and p.get("type") == "text"
+                        part.get("text", "")
+                        for part in content
+                        if isinstance(part, dict) and part.get("type") == "text"
                     )
+                content = str(content).strip()
                 if not content:
                     continue
-                msgs.append({"role": role, "content": str(content)})
-                if len(msgs) >= rounds * 2:
-                    break
+                messages.append({"role": role, "content": content})
+                if role == "user":
+                    user_rounds += 1
+                    if user_rounds >= rounds:
+                        break
 
-            msgs.reverse()
-            return msgs
+            messages.reverse()
+            return messages
         except Exception as e:
             logger.warning(f"[BusySchedule] Failed to get conversation contexts: {e}")
             return []
 
+    @staticmethod
+    def _format_retrieval_query(contexts: list[dict], max_chars: int) -> str:
+        """Format contexts while preserving the start of every selected message."""
+        lines = []
+        for msg in contexts:
+            content = str(msg.get("content", "")).strip()
+            if not content:
+                continue
+            speaker = "用户" if msg.get("role") == "user" else "我"
+            lines.append(f"{speaker}: {content}")
+
+        query = "\n".join(lines)
+        if max_chars <= 0 or len(query) <= max_chars:
+            return query
+
+        separator_chars = len(lines) - 1
+        content_budget = max_chars - separator_chars
+        if content_budget <= 0:
+            return query[:max_chars]
+
+        per_line, remainder = divmod(content_budget, len(lines))
+        truncated = [
+            line[: per_line + (index < remainder)]
+            for index, line in enumerate(lines)
+        ]
+        return "\n".join(truncated)
+
+    @staticmethod
+    def _text_from_content_part(part) -> str:
+        """Extract text from an AstrBot content part or compatible object."""
+        if isinstance(part, str):
+            return part
+        if isinstance(part, dict):
+            return str(part.get("text") or part.get("content") or "")
+        return str(getattr(part, "text", "") or getattr(part, "content", ""))
+
+    def _collect_rag_results(self, event, req) -> list[str]:
+        """Collect explicit background retrieval results with legacy fallbacks."""
+        explicit = event.get_extra("background_retrieval_results") or []
+        results = [str(item).strip() for item in explicit if str(item).strip()]
+        if results:
+            return list(dict.fromkeys(results))
+
+        for part in getattr(req, "extra_user_content_parts", []) or []:
+            text = self._text_from_content_part(part).strip()
+            if text:
+                results.append(text)
+
+        for context in getattr(req, "contexts", []) or []:
+            text = self._text_from_content_part(context).strip()
+            if text and ("RAG" in text or "记忆" in text or "知识库" in text):
+                results.append(text)
+
+        system_prompt = (getattr(req, "system_prompt", "") or "").strip()
+        if system_prompt and "BUSY_SCHEDULE_" not in system_prompt:
+            results.append(system_prompt)
+
+        return list(dict.fromkeys(results))
+
     async def _get_rag_context(self, umo: Optional[str] = None) -> str:
-        """Query knowledge base and memory plugins via OnLLMRequestEvent hook.
-
-        Uses the last N rounds of conversation as the retrieval query so the
-        daily schedule can reflect dynamic memories and knowledge rather than
-        only fixed persona/history information.
-
-        Returns the injected system_prompt text (truncated), or "" when the
-        pipeline API is unavailable, the feature is disabled, or any error occurs.
-        """
-        if not HAS_PIPELINE:
-            return ""
-        if not self._cfg("enable_rag_for_schedule", True):
-            return ""
-        if not umo:
+        """Query memory and knowledge plugins with a pure recent-chat query."""
+        if not HAS_PIPELINE or not self._cfg("enable_rag_for_schedule", True) or not umo:
             return ""
 
         try:
-            rounds = int(self._cfg("rag_query_rounds", 5) or 5)
-            query_max = int(self._cfg("rag_query_max_chars", 500) or 500)
-            result_max = int(self._cfg("rag_result_max_chars", 800) or 800)
+            rounds = int(self._cfg("rag_query_rounds", 5))
+            query_max = max(0, int(self._cfg("rag_query_max_chars", 500)))
+            result_max = max(0, int(self._cfg("rag_result_max_chars", 800)))
+            if rounds <= 0:
+                return ""
 
             contexts = await self._get_conversation_contexts(umo, rounds)
             if not contexts:
                 return ""
 
-            # Build a compact query from recent conversation turns
-            lines = []
-            for msg in contexts:
-                role = msg.get("role", "")
-                content = str(msg.get("content", "")).strip()
-                if not content:
-                    continue
-                speaker = "用户" if role == "user" else "我"
-                lines.append(f"{speaker}: {content}")
-            query = "\n".join(lines)
-            if len(query) > query_max:
-                query = query[-query_max:]
+            query = self._format_retrieval_query(contexts, query_max)
+            if not query:
+                return ""
 
+            logger.info(
+                f"[BusySchedule] RAG query prepared: rounds={rounds}, "
+                f"messages={len(contexts)}, chars={len(query)}"
+            )
             session = MessageSession.from_str(umo)
             cron_event = CronMessageEvent(
                 context=self.context,
                 session=session,
                 message=query,
+                extras={
+                    "background_retrieval": True,
+                    "retrieval_query": query,
+                    "background_retrieval_results": [],
+                },
             )
             req = ProviderRequest()
             req.prompt = query
             req.system_prompt = ""
 
-            # Trigger knowledge base / memory plugins
             await call_event_hook(cron_event, EventType.OnLLMRequestEvent, req)
 
-            injected = (req.system_prompt or "").strip()
-            if not injected:
+            results = self._collect_rag_results(cron_event, req)
+            if not results:
+                logger.info("[BusySchedule] RAG hooks returned no usable context")
                 return ""
-            if len(injected) > result_max:
+
+            injected = "\n\n".join(results)
+            if result_max > 0 and len(injected) > result_max:
                 injected = injected[:result_max]
-            logger.debug(f"[BusySchedule] RAG context injected ({len(injected)} chars) for schedule generation")
+            logger.info(
+                f"[BusySchedule] RAG context collected: sources={len(results)}, "
+                f"chars={len(injected)}"
+            )
             return injected
 
         except Exception as e:
@@ -571,34 +577,25 @@ class ScheduleGenerator:
     async def generate_schedule_or_wait(
         self, target_date: date, umo: Optional[str] = None, extra: Optional[str] = None
     ) -> ScheduleData:
-        """Generate schedule, or wait if one is already in progress."""
-        if self._generating and self._generation_future:
-            logger.info("[BusySchedule] Waiting for in-progress generation...")
-            try:
-                result = await asyncio.wait_for(self._generation_future, timeout=120)
-                return result
-            except asyncio.TimeoutError:
-                logger.warning("[BusySchedule] Wait for generation timed out, retrying")
-            except Exception:
-                pass
+        """Generate a schedule while sharing an in-flight target transaction."""
         return await self.generate_schedule(target_date, umo, extra)
 
     async def generate_schedule(
         self, target_date: date, umo: Optional[str] = None, extra: Optional[str] = None
     ) -> ScheduleData:
         """Generate schedule for a specific date."""
-        if self._generating:
-            logger.warning("[BusySchedule] Schedule generation already in progress")
-            raise RuntimeError("Schedule generation already in progress")
+        if self._generating and self._generation_future:
+            if self._generation_target != target_date:
+                raise RuntimeError(
+                    f"Schedule generation already in progress for {self._generation_target}"
+                )
+            logger.info("[BusySchedule] Waiting for in-progress generation...")
+            return await asyncio.shield(self._generation_future)
 
         self._generating = True
-        self._generation_future = asyncio.get_event_loop().create_future()
-        data = None
+        self._generation_target = target_date
+        self._generation_future = asyncio.get_running_loop().create_future()
         try:
-            data = self.data_mgr.get_or_create(target_date)
-            data.status = "generating"
-            self.data_mgr.set(target_date, data)
-
             prompt = await self._build_prompt(target_date, extra, umo)
             provider = self._get_provider()
 
@@ -635,13 +632,16 @@ class ScheduleGenerator:
             if not result or not result.get("schedule"):
                 raise RuntimeError(f"Failed to get valid schedule after {self._MAX_RETRIES} attempts")
 
-            # Update data
-            data.outfit_style = result.get("outfit_style", "")
-            data.outfit = result.get("outfit", "")
-            data.hairstyle = result.get("hairstyle", "")
-            data.schedule = result.get("schedule", "")
+            # Commit only after the complete result has passed validation.
+            data = ScheduleData(
+                date=target_date.strftime("%Y-%m-%d"),
+                outfit_style=result.get("outfit_style", ""),
+                outfit=result.get("outfit", ""),
+                hairstyle=result.get("hairstyle", ""),
+                schedule=result.get("schedule", ""),
+                status="completed",
+            )
             data.busy_periods = self._parse_busy_periods_from_schedule(data.schedule)
-            data.status = "completed"
             self.data_mgr.set(target_date, data)
 
             logger.info(f"[BusySchedule] Schedule generated with {len(data.busy_periods)} busy periods")
@@ -653,164 +653,12 @@ class ScheduleGenerator:
 
         except Exception as e:
             logger.error(f"[BusySchedule] Schedule generation failed: {e}")
-            if data:
-                data.status = "failed"
-                self.data_mgr.set(target_date, data)
             if self._generation_future and not self._generation_future.done():
                 self._generation_future.set_exception(e)
+                self._generation_future.exception()
             raise
         finally:
             self._generating = False
+            self._generation_target = None
             self._generation_future = None
 
-    async def adjust_schedule(
-        self, target_date: date, recent_chats: str, current_time: datetime
-    ) -> Optional[list[BusyPeriod]]:
-        """Dynamically adjust busy periods based on chat context."""
-        if not self._cfg("enable_dynamic_adjust", False):
-            return None
-
-        data = self.data_mgr.get(target_date)
-        if not data or data.status != "completed":
-            return None
-
-        provider = self._get_provider()
-        if not provider:
-            return None
-
-        adjust_prompt = self._cfg("adjust_prompt", "")
-        prompt = adjust_prompt.replace("{today_schedule}", data.schedule)
-        prompt = prompt.replace("{recent_chats}", recent_chats)
-        prompt = prompt.replace("{current_time}", current_time.strftime("%H:%M"))
-
-        sid = f"busy_schedule_adjust_{target_date.strftime('%Y%m%d')}"
-        try:
-            content = await self._call_llm(prompt, provider, sid)
-            result = _extract_json_obj(content)
-
-            if not result or not result.get("adjust", False):
-                return None
-
-            new_periods = []
-            for period in result.get("new_periods", []):
-                new_periods.append(BusyPeriod(
-                    start_time=period["start"],
-                    end_time=period["end"],
-                    activity=period["activity"],
-                    is_busy=True,
-                ))
-
-            if new_periods:
-                self.data_mgr.update_busy_periods(target_date, new_periods)
-                logger.info(f"[BusySchedule] Schedule adjusted with {len(new_periods)} new periods")
-                return new_periods
-
-        except Exception as e:
-            logger.error(f"[BusySchedule] Schedule adjustment failed: {e}")
-
-        return None
-
-    async def judge_and_adjust_schedule(
-        self, target_date: date, user_message: str, umo: Optional[str] = None
-    ) -> Optional[dict]:
-        """Use LLM to judge if user wants to adjust schedule."""
-        if not self._cfg("enable_smart_judge", False):
-            logger.warning("[BusySchedule] judge_and_adjust_schedule: enable_smart_judge is False")
-            return None
-
-        data = self.data_mgr.get(target_date)
-        if not data or data.status != "completed":
-            logger.warning(f"[BusySchedule] judge_and_adjust_schedule: no data or status={data.status if data else 'None'}")
-            return None
-
-        provider = self._get_judge_provider()
-        if not provider:
-            logger.warning("[BusySchedule] judge_and_adjust_schedule: no LLM provider available")
-            return None
-
-        now = datetime.now()
-
-        # Get conversation context for better judgment
-        context_str = ""
-        if umo:
-            history_rounds = self._cfg("judge_history_rounds", 3)
-            if history_rounds > 0:
-                contexts = await self._get_conversation_contexts(umo, history_rounds)
-                if contexts:
-                    context_lines = []
-                    for ctx in contexts:
-                        role = "用户" if ctx["role"] == "user" else "AI"
-                        content = ctx["content"][:150]  # Truncate long messages
-                        context_lines.append(f"{role}: {content}")
-                    context_str = "\n".join(context_lines)
-                    logger.info(f"[BusySchedule] Judge context: {len(contexts)} messages, preview={context_str[:300]}")
-                else:
-                    logger.warning("[BusySchedule] Judge context: conversation contexts returned empty")
-
-        # Build judge prompt
-        judge_prompt = self._cfg("judge_prompt", "")
-        prompt = judge_prompt.replace("{today_schedule}", data.schedule)
-        prompt = prompt.replace("{current_time}", now.strftime("%H:%M"))
-        prompt = prompt.replace("{user_message}", user_message)
-        prompt = prompt.replace("{conversation_context}", context_str or "无对话上下文")
-
-        sid = f"busy_schedule_judge_{target_date.strftime('%Y%m%d')}_{uuid.uuid4().hex[:6]}"
-        try:
-            judge_persona = await self._get_judge_persona(umo)
-            logger.info(f"[BusySchedule] Calling LLM for judge, sid={sid}, prompt_len={len(prompt)}, persona={'yes' if judge_persona else 'no'}")
-            content = await self._call_llm(prompt, provider, sid, system_prompt=judge_persona)
-            logger.info(f"[BusySchedule] LLM response len={len(content) if content else 0}, preview={content[:200] if content else 'EMPTY'}")
-            result = _extract_json_obj(content)
-
-            if not result:
-                logger.warning(f"[BusySchedule] Failed to extract JSON from LLM response")
-                return None
-
-            if not result.get("should_adjust", False):
-                return {"adjusted": False, "reason": result.get("reason", "")}
-
-            adjustments = result.get("adjustments", [])
-            if not adjustments:
-                return {"adjusted": False, "reason": result.get("reason", "")}
-
-            # Apply adjustments
-            new_schedule = data.schedule
-            new_busy_periods = list(data.busy_periods)
-
-            for adj in adjustments:
-                original_activity = adj.get("original_activity", "")
-                original_time = adj.get("original_time", "")
-                new_activity = adj.get("new_activity", original_activity)
-                new_time = adj.get("new_time", original_time)
-                is_busy = adj.get("is_busy", False)
-
-                if original_activity and original_time:
-                    old_pattern = f"{original_time}\\s+.*?{re.escape(original_activity)}"
-                    new_text = f"{new_time} {new_activity} {'【忙碌】' if is_busy else '【可回消息】'}"
-                    new_schedule = re.sub(old_pattern, new_text, new_schedule)
-
-                for i, period in enumerate(new_busy_periods):
-                    if period.activity == original_activity:
-                        new_busy_periods[i] = BusyPeriod(
-                            start_time=new_time.split("-")[0] if "-" in new_time else period.start_time,
-                            end_time=new_time.split("-")[1] if "-" in new_time else period.end_time,
-                            activity=new_activity,
-                            is_busy=is_busy,
-                        )
-
-            data.schedule = new_schedule
-            data.busy_periods = new_busy_periods
-            data.last_updated = now.isoformat()
-            self.data_mgr.set(target_date, data)
-
-            logger.info(f"[BusySchedule] Schedule adjusted by smart judge: {adjustments}")
-
-            return {
-                "adjusted": True,
-                "reason": result.get("reason", ""),
-                "adjustments": adjustments,
-            }
-
-        except Exception as e:
-            logger.error(f"[BusySchedule] Smart judge failed: {e}")
-            return None

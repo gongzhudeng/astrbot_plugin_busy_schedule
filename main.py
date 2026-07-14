@@ -15,7 +15,13 @@ from astrbot.core.message.components import Plain
 from astrbot.core.provider.entities import ProviderRequest
 from astrbot.core.star.star_tools import StarTools
 
-from .core.data import ScheduleDataManager, ScheduleData, BusyPeriod
+from .core.data import (
+    ScheduleDataManager,
+    ScheduleData,
+    BusyPeriod,
+    get_schedule_owner_date,
+    parse_schedule_time,
+)
 from .core.generator import ScheduleGenerator, _SCHEMA_DEFAULTS
 from .core.busy_manager import BusyPeriodManager
 from .core.message_interceptor import MessageInterceptor
@@ -52,6 +58,10 @@ class BusySchedulePlugin(Star):
         self._state_check_task: Optional[asyncio.Task] = None
         self._schedule_gen_task: Optional[asyncio.Task] = None
         self._daily_refresh_task: Optional[asyncio.Task] = None
+
+        self._last_refresh_owner_date: Optional[date] = None
+        self._refresh_retry_owner_date: Optional[date] = None
+        self._refresh_retry_after: Optional[datetime] = None
 
         # Peek timers: per-user tasks for random in-busy message delivery
         self._peek_timers: dict[str, asyncio.Task] = {}
@@ -153,39 +163,70 @@ class BusySchedulePlugin(Star):
             logger.error(f"[BusySchedule] Async schedule generation failed: {e}")
 
     async def _ensure_today_schedule(self):
-        """Ensure today's schedule exists."""
-        today = date.today()
-        data = self.data_mgr.get(today)
+        """Ensure the current schedule cycle has completed data."""
+        owner_date = self._get_effective_date()
+        data = self.data_mgr.get(owner_date)
 
-        if not data or data.status != "completed":
-            logger.info("[BusySchedule] Generating today's schedule...")
+        if data and data.status == "completed":
+            self._last_refresh_owner_date = owner_date
+        else:
+            logger.info(f"[BusySchedule] Generating schedule cycle {owner_date}...")
             try:
-                await self.generator.generate_schedule(today)
+                await self.generator.generate_schedule_or_wait(
+                    owner_date, umo=self._schedule_target_umo
+                )
+                self._last_refresh_owner_date = owner_date
+                self._refresh_retry_owner_date = None
+                self._refresh_retry_after = None
             except Exception as e:
+                self._refresh_retry_owner_date = owner_date
+                self._refresh_retry_after = datetime.now() + timedelta(minutes=5)
                 logger.error(f"[BusySchedule] Failed to generate schedule: {e}")
 
-        self._sync_schedule_to_context(today)
+        self._sync_schedule_to_context()
 
-    def _sync_schedule_to_context(self, today: date):
-        """Sync today's schedule data to context for downstream plugins."""
+    def _get_active_schedule(
+        self, now: Optional[datetime] = None
+    ) -> Optional[tuple[date, ScheduleData]]:
+        """Return active data together with the date that owns its periods."""
+        current = now or datetime.now()
+        owner_date = get_schedule_owner_date(
+            current, parse_schedule_time(self._get_config("schedule_time", "07:00"))
+        )
+        data = self.data_mgr.get(owner_date)
+        if data and data.status == "completed":
+            return owner_date, data
+        return self.data_mgr.get_latest_completed(owner_date)
+
+    def _sync_schedule_to_context(self):
+        """Sync active schedule data to context for downstream plugins."""
         custom_prompt = self._get_config("custom_prompt", "")
         self.context._busy_schedule_custom_prompt = custom_prompt or ""
-        data = self.data_mgr.get(today)
-        if data and data.status == "completed":
+        now = datetime.now()
+        active = self._get_active_schedule(now)
+        if active:
+            owner_date, data = active
+            schedule_time = parse_schedule_time(
+                self._get_config("schedule_time", "07:00")
+            )
             self.context._busy_schedule_today_schedule = data.schedule
             self.context._busy_schedule_outfit = data.outfit or ""
-            now = datetime.now()
-            current = self.injector._find_current_activity(data, now)
+            current = self.injector._find_current_activity(
+                data, owner_date, schedule_time, now
+            )
             self.context._busy_schedule_current_activity = current or ""
-            next_act = ""
-            next_start = ""
-            if data.busy_periods:
-                for period in sorted(data.busy_periods, key=lambda p: p.start_time):
-                    if period.start_datetime > now:
-                        next_act = period.activity
-                        next_start = period.start_time
-                        break
-            self.context._busy_schedule_next_activity = f"{next_act}（{next_start}开始）" if next_act else ""
+            candidates = []
+            for period in data.busy_periods:
+                start, _ = period.to_absolute_datetimes(owner_date, *schedule_time)
+                if start > now:
+                    candidates.append((start, period))
+            if candidates:
+                start, period = min(candidates, key=lambda item: item[0])
+                self.context._busy_schedule_next_activity = (
+                    f"{period.activity}（{start.strftime('%H:%M')}开始）"
+                )
+            else:
+                self.context._busy_schedule_next_activity = ""
         else:
             self.context._busy_schedule_today_schedule = ""
             self.context._busy_schedule_outfit = ""
@@ -198,42 +239,52 @@ class BusySchedulePlugin(Star):
         Delegates to BusyPeriodManager._get_schedule_owner_date() so the same
         schedule_time boundary is used everywhere in the plugin.
         """
-        return self.busy_mgr._get_schedule_owner_date(datetime.now())
+        return get_schedule_owner_date(
+            datetime.now(),
+            parse_schedule_time(self._get_config("schedule_time", "07:00")),
+        )
 
     async def _daily_refresh_loop(self):
-        """Background loop that waits until schedule_time each day, then refreshes."""
+        """Refresh once whenever the configured schedule cycle changes."""
         while True:
             try:
-                schedule_time_str = self._get_config("schedule_time", "07:00")
-                hour, minute = 0, 0
-                try:
-                    parts = schedule_time_str.split(":")
-                    hour = int(parts[0])
-                    minute = int(parts[1])
-                except Exception:
-                    logger.warning(f"[BusySchedule] Invalid schedule_time: {schedule_time_str}, defaulting to 07:00")
-                    hour, minute = 7, 0
-
+                await asyncio.sleep(30)
                 now = datetime.now()
-                target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                owner_date = self._get_effective_date()
+                if owner_date == self._last_refresh_owner_date:
+                    continue
+                if (
+                    owner_date == self._refresh_retry_owner_date
+                    and self._refresh_retry_after
+                    and now < self._refresh_retry_after
+                ):
+                    continue
 
-                if target <= now:
-                    target += timedelta(days=1)
+                data = self.data_mgr.get(owner_date)
+                if data and data.status == "completed":
+                    self._last_refresh_owner_date = owner_date
+                    self._refresh_retry_owner_date = None
+                    self._refresh_retry_after = None
+                    self._sync_schedule_to_context()
+                    continue
 
-                wait_seconds = (target - now).total_seconds()
-                logger.info(f"[BusySchedule] Next schedule refresh at {target.strftime('%Y-%m-%d %H:%M')}, waiting {wait_seconds:.0f}s")
-                await asyncio.sleep(wait_seconds)
-
-                # Time to refresh
-                logger.info(f"[BusySchedule] Daily refresh triggered at {datetime.now().strftime('%H:%M')}")
-                today = date.today()
+                logger.info(f"[BusySchedule] Refreshing schedule cycle {owner_date}")
                 try:
-                    await self.generator.generate_schedule(today, umo=self._schedule_target_umo)
-                    logger.info(f"[BusySchedule] Daily schedule refreshed for {today}")
+                    await self.generator.generate_schedule_or_wait(
+                        owner_date, umo=self._schedule_target_umo
+                    )
+                    self._last_refresh_owner_date = owner_date
+                    self._refresh_retry_owner_date = None
+                    self._refresh_retry_after = None
+                    logger.info(
+                        f"[BusySchedule] Schedule cycle {owner_date} refreshed"
+                    )
                 except Exception as e:
+                    self._refresh_retry_owner_date = owner_date
+                    self._refresh_retry_after = now + timedelta(minutes=5)
                     logger.error(f"[BusySchedule] Daily refresh failed: {e}")
 
-                self._sync_schedule_to_context(today)
+                self._sync_schedule_to_context()
 
             except asyncio.CancelledError:
                 break
@@ -256,7 +307,7 @@ class BusySchedulePlugin(Star):
             finally:
                 # Always sync the flag so downstream plugins never see a stale value
                 self.context._busy_schedule_is_busy = self.busy_mgr.is_busy
-                self._sync_schedule_to_context(self._get_effective_date())
+                self._sync_schedule_to_context()
                 if self.busy_mgr.is_busy:
                     logger.info(
                         f"[BusySchedule] State sync: is_busy=True, "
@@ -551,7 +602,7 @@ class BusySchedulePlugin(Star):
     def _get_config(self, key: str, default=None):
         """Get config value with schema default fallback."""
         # Nested groups take priority — user-edited values live here
-        for group_name in ["基础设置", "忙碌时段", "关键词设置", "消息合并", "智能判断", "日程生成"]:
+        for group_name in ["基础设置", "忙碌时段", "关键词设置", "消息合并", "日程生成"]:
             group = self.config.get(group_name, {})
             if isinstance(group, dict) and key in group:
                 val = group[key]
@@ -685,17 +736,20 @@ class BusySchedulePlugin(Star):
             self._schedule_target_umo = umo
             self._save_state()
 
-        today = self._get_effective_date()
-        data = self.data_mgr.get(today)
-
-        if not data or data.status != "completed":
-            return
-
         now = datetime.now()
+        active = self._get_active_schedule(now)
+        if not active:
+            return
+        owner_date, data = active
+        schedule_time = parse_schedule_time(
+            self._get_config("schedule_time", "07:00")
+        )
 
         # Part 1 + 2: static (outfit+schedule) + semi-static (current/next activity)
         static_injection = self.injector.build_static_injection(data)
-        schedule_injection = self.injector.build_schedule_injection(data, now)
+        schedule_injection = self.injector.build_schedule_injection(
+            data, owner_date, schedule_time, now
+        )
         custom_injection = self.injector.build_custom_injection()
 
         cacheable_injection = static_injection
@@ -755,21 +809,28 @@ class BusySchedulePlugin(Star):
     @filter.command("忙碌日程", alias={"busy show", "busy schedule"})
     async def cmd_show_schedule(self, event: AstrMessageEvent):
         """查看今日的日程和忙碌时段"""
-        today = self._get_effective_date()
-        today_str = today.strftime("%Y-%m-%d")
-        data = self.data_mgr.get(today)
+        owner_date = self._get_effective_date()
+        active = self._get_active_schedule()
+        data = active[1] if active else None
 
-        if not data or data.status != "completed":
-            yield event.plain_result("今日日程尚未生成，正在生成...")
+        if not data or active[0] != owner_date:
+            yield event.plain_result("当前周期日程尚未生成，正在生成...")
             try:
-                data = await self.generator.generate_schedule_or_wait(today, umo=event.unified_msg_origin)
+                data = await self.generator.generate_schedule_or_wait(
+                    owner_date, umo=event.unified_msg_origin
+                )
             except Exception as e:
-                yield event.plain_result(f"日程生成失败：{e}")
-                return
+                if not data:
+                    yield event.plain_result(f"日程生成失败：{e}")
+                    return
+                yield event.plain_result(
+                    f"当前周期生成失败，继续显示上一份可用日程：{e}"
+                )
+        display_date = date.fromisoformat(data.date)
 
         # Build response
         response_parts = [
-            f"📅 {today_str}",
+            f"📅 {display_date.strftime('%Y-%m-%d')}",
             "",
             f"👗 今日穿搭：{data.outfit}" + (f"\n发型：{data.hairstyle}" if data.hairstyle else ""),
             "",
@@ -790,7 +851,7 @@ class BusySchedulePlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def cmd_renew_schedule(self, event: AstrMessageEvent, extra: str = ""):
         """重写今日日程（可附加补充要求）"""
-        today = date.today()
+        today = self._get_effective_date()
 
         if extra:
             yield event.plain_result(f"正在根据补充要求重写今日日程：{extra}")
@@ -806,15 +867,23 @@ class BusySchedulePlugin(Star):
                 f"📝 日程安排：\n{data.schedule}"
             )
 
-            self._sync_schedule_to_context(today)
+            self._sync_schedule_to_context()
 
             # Refresh busy state so current_busy_period matches new schedule
             if self.busy_mgr.is_busy:
                 now = datetime.now()
-                new_period = self.busy_mgr.get_current_busy_period(now)
-                if new_period:
+                current = self.busy_mgr.get_current_busy_period(now)
+                if current:
+                    owner_date, new_period = current
                     self.busy_mgr._current_busy_period = new_period
-                    logger.info(f"[BusySchedule] Refreshed busy period after rewrite: {new_period.activity}")
+                    self.busy_mgr._current_busy_owner_date = owner_date
+                    self.busy_mgr._current_busy_schedule_time = (
+                        self.busy_mgr._parse_schedule_time()
+                    )
+                    logger.info(
+                        f"[BusySchedule] Refreshed busy period after rewrite: "
+                        f"{new_period.activity}"
+                    )
                 else:
                     # Current time is no longer in any busy period
                     await self.busy_mgr._exit_busy()
@@ -827,8 +896,6 @@ class BusySchedulePlugin(Star):
     async def cmd_busy_status(self, event: AstrMessageEvent):
         """查看当前忙碌状态"""
         now = datetime.now()
-        today = self._get_effective_date()
-        data = self.data_mgr.get(today)
 
         response_parts = ["📊 忙碌状态信息", ""]
 
@@ -838,8 +905,15 @@ class BusySchedulePlugin(Star):
             response_parts.append(f"💤 当前状态：忙碌中（{activity}）")
             # Show remaining time in minutes
             current_period = self.busy_mgr._current_busy_period
-            if current_period:
-                end_dt = current_period.end_datetime
+            owner_date = self.busy_mgr._current_busy_owner_date
+            schedule_time = (
+                self.busy_mgr._current_busy_schedule_time
+                or self.busy_mgr._parse_schedule_time()
+            )
+            if current_period and owner_date:
+                _, end_dt = current_period.to_absolute_datetimes(
+                    owner_date, *schedule_time
+                )
                 remaining_secs = (end_dt - now).total_seconds()
                 if remaining_secs > 0:
                     remaining_mins = int(remaining_secs / 60)
@@ -885,7 +959,6 @@ class BusySchedulePlugin(Star):
 • 设置忙碌 / busy set - 手动进入忙碌状态
 • 解除忙碌 / busy clear - 手动解除忙碌状态
 • 忙碌时长 / busy duration - 设置忙碌时长后自动解除
-• 立刻判断 / busy judge - 立刻触发智能判断（检查是否需要调整日程）
 • 忙碌帮助 / busy help - 显示此帮助
 
 💡 功能说明：
@@ -901,58 +974,6 @@ class BusySchedulePlugin(Star):
         yield event.plain_result(help_text.strip())
 
     # ==================== Test Commands ====================
-
-    @filter.command("立刻判断", alias={"busy judge"})
-    async def cmd_judge_now(self, event: AstrMessageEvent, extra: str = ""):
-        """立刻触发智能判断（检查是否需要调整日程）"""
-        if not self._get_config("enable_smart_judge", False):
-            yield event.plain_result("智能判断功能未启用，请在配置中开启 enable_smart_judge")
-            return
-
-        today = self._get_effective_date()
-        data = self.data_mgr.get(today)
-
-        if not data or data.status != "completed":
-            yield event.plain_result("今日日程尚未生成，请先执行「忙碌日程」生成日程")
-            return
-
-        user_id = event.unified_msg_origin
-        user_message = extra if extra else "用户请求立刻判断日程是否需要调整"
-
-        yield event.plain_result("正在进行智能判断...")
-
-        try:
-            result = await self.generator.judge_and_adjust_schedule(today, user_message, umo=user_id)
-        except Exception as e:
-            logger.error(f"[BusySchedule] cmd_judge_now exception: {e}")
-            yield event.plain_result(f"判断异常：{e}")
-            return
-
-        if not result:
-            yield event.plain_result("判断失败（返回空），请查看控制台日志中 [BusySchedule] 相关警告")
-            return
-
-        if not result.get("adjusted"):
-            reason = result.get("reason", "无需调整")
-            yield event.plain_result(f"判断结果：{reason}")
-            return
-
-        # Show adjustments
-        adjustments = result.get("adjustments", [])
-        reason = result.get("reason", "")
-        adj_desc = []
-        for adj in adjustments:
-            original = adj.get("original_activity", "")
-            new = adj.get("new_activity", original)
-            original_time = adj.get("original_time", "")
-            new_time = adj.get("new_time", original_time)
-            if original != new or original_time != new_time:
-                adj_desc.append(f"{original_time} {original} -> {new_time} {new}")
-
-        if adj_desc:
-            yield event.plain_result(f"✅ 日程已调整：\n" + "\n".join(adj_desc) + f"\n原因：{reason}")
-        else:
-            yield event.plain_result(f"判断结果：{reason}")
 
     @filter.command("设置忙碌", alias={"busy set"})
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -1021,14 +1042,15 @@ class BusySchedulePlugin(Star):
     @filter.command("忙碌预览", alias={"busy preview", "忙碌注入"})
     async def cmd_preview_injection(self, event: AstrMessageEvent):
         """展示当前注入到 LLM 的提示词内容"""
-        today = self._get_effective_date()
-        data = self.data_mgr.get(today)
-
-        if not data or data.status != "completed":
-            yield event.plain_result("今日日程尚未生成，请先执行「忙碌日程」生成日程")
-            return
-
         now = datetime.now()
+        active = self._get_active_schedule(now)
+        if not active:
+            yield event.plain_result("当前没有可用的已完成日程")
+            return
+        owner_date, data = active
+        schedule_time = parse_schedule_time(
+            self._get_config("schedule_time", "07:00")
+        )
 
         # Part 0: custom user-defined injection
         custom_text = self.injector.build_custom_injection()
@@ -1037,7 +1059,9 @@ class BusySchedulePlugin(Star):
         static_text = self.injector.build_static_injection(data)
 
         # Part 2: semi-static (current + next activity)
-        schedule_text = self.injector.build_schedule_injection(data, now)
+        schedule_text = self.injector.build_schedule_injection(
+            data, owner_date, schedule_time, now
+        )
 
         # Part 3: busy flag (only when busy)
         busy_text = ""

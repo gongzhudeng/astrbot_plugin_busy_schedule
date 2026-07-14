@@ -9,6 +9,37 @@ from typing import Optional
 from astrbot.api import logger
 
 
+DEFAULT_SCHEDULE_TIME = (7, 0)
+_WARNED_INVALID_SCHEDULE_TIMES: set[str] = set()
+
+
+def parse_schedule_time(value: object) -> tuple[int, int]:
+    """Parse a validated HH:MM schedule boundary."""
+    try:
+        hour_text, minute_text = str(value).strip().split(":", 1)
+        hour, minute = int(hour_text), int(minute_text)
+        if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+            raise ValueError
+        return hour, minute
+    except (TypeError, ValueError):
+        invalid_value = repr(value)
+        if invalid_value not in _WARNED_INVALID_SCHEDULE_TIMES:
+            _WARNED_INVALID_SCHEDULE_TIMES.add(invalid_value)
+            logger.warning(
+                f"[BusySchedule] Invalid schedule_time {invalid_value}; using 07:00"
+            )
+        return DEFAULT_SCHEDULE_TIME
+
+
+def get_schedule_owner_date(
+    now: datetime, schedule_time: tuple[int, int]
+) -> date:
+    """Return the schedule cycle that owns a concrete moment."""
+    hour, minute = schedule_time
+    boundary = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    return now.date() if now >= boundary else now.date() - timedelta(days=1)
+
+
 @dataclass
 class BusyPeriod:
     """Represents a busy period in the schedule."""
@@ -17,18 +48,6 @@ class BusyPeriod:
     end_time: str  # HH:MM format
     activity: str
     is_busy: bool = True
-
-    @property
-    def start_datetime(self) -> datetime:
-        """Get start time as datetime (today)."""
-        today = date.today()
-        return datetime.strptime(f"{today} {self.start_time}", "%Y-%m-%d %H:%M")
-
-    @property
-    def end_datetime(self) -> datetime:
-        """Get end time as datetime (today)."""
-        today = date.today()
-        return datetime.strptime(f"{today} {self.end_time}", "%Y-%m-%d %H:%M")
 
     def to_absolute_datetimes(
         self, owner_date: date, schedule_h: int, schedule_m: int
@@ -134,6 +153,22 @@ class ScheduleDataManager:
         """Get schedule data for a specific date."""
         date_str = target_date.strftime("%Y-%m-%d")
         return self._data.get(date_str)
+
+    def get_latest_completed(
+        self, target_date: date
+    ) -> Optional[tuple[date, ScheduleData]]:
+        """Return the newest completed schedule on or before target_date."""
+        candidates = []
+        for date_str, data in self._data.items():
+            if data.status != "completed":
+                continue
+            try:
+                owner_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if owner_date <= target_date:
+                candidates.append((owner_date, data))
+        return max(candidates, key=lambda item: item[0]) if candidates else None
 
     def set(self, target_date: date, data: ScheduleData):
         """Set schedule data for a specific date."""
