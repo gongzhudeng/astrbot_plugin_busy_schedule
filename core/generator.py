@@ -157,10 +157,15 @@ def _extract_completion_text(resp: object) -> str:
     return ""
 
 
+class DeterministicScheduleError(RuntimeError):
+    """Raised when an LLM response still violates the schedule protocol."""
+
+
 class ScheduleGenerator:
     """Generates daily schedule with busy period markers."""
 
-    _MAX_RETRIES = 3
+    _LLM_CALL_ATTEMPTS = 3
+    _FORMAT_REPAIR_ATTEMPTS = 1
 
     def __init__(self, context: Context, config: AstrBotConfig, data_mgr: ScheduleDataManager):
         self.context = context
@@ -523,16 +528,44 @@ class ScheduleGenerator:
 
         return prompt
 
-    def _parse_busy_periods_from_schedule(self, schedule_text: str) -> list[BusyPeriod]:
-        """Parse ordinary ranges and one optional open-ended sleep entry."""
-        periods = []
-        line_pattern = re.compile(
-            r"^(\d{1,2}:\d{2})(?:\s*[-~到至]\s*(\d{1,2}:\d{2}))?\s+(.+)$"
+    @staticmethod
+    def _normalize_schedule_text(schedule_text: str) -> str:
+        """Remove only known legacy explanatory lines from generated schedules."""
+        legacy_note_pattern = re.compile(
+            r"^[（(]?未标注(?:的)?时(?:间)?段(?:默认|默认为)?(?:小怡)?(?:在)?"
+            r"(?:玩手机|赖床|无所事事|宿舍无所事事)"
+            r"(?:\s*[/／或、]\s*(?:玩手机|赖床|无所事事|宿舍无所事事))*"
+            r"[。.]?[）)]?$"
         )
+        normalized_lines = []
+        removed_lines = []
         for raw_line in schedule_text.splitlines():
             line = raw_line.strip()
             if not line:
                 continue
+            if legacy_note_pattern.fullmatch(line):
+                removed_lines.append(line)
+                continue
+            normalized_lines.append(line)
+
+        if removed_lines:
+            logger.info(
+                "[BusySchedule] Removed known legacy schedule note: "
+                + " | ".join(removed_lines)
+            )
+        return "\n".join(normalized_lines)
+
+    def _parse_busy_periods_from_schedule(self, schedule_text: str) -> list[BusyPeriod]:
+        """Parse ranged activities and one final open-ended sleep entry."""
+        schedule_text = self._normalize_schedule_text(schedule_text)
+        lines = [line.strip() for line in schedule_text.splitlines() if line.strip()]
+        line_pattern = re.compile(
+            r"^(\d{1,2}:\d{2})(?:\s*[-~到至]\s*(\d{1,2}:\d{2}))?\s+(.+)$"
+        )
+        sleep_pattern = re.compile(r"睡觉|入睡|就寝|睡眠|午睡|小睡")
+        periods = []
+
+        for index, line in enumerate(lines):
             match = line_pattern.match(line)
             if not match:
                 raise ValueError(f"无法解析日程行：{line}")
@@ -546,9 +579,22 @@ class ScheduleGenerator:
                 if marker_match
                 else activity_text
             )
-            is_sleep = end_time is None
-            if is_sleep and marker == "可回消息":
-                raise ValueError(f"睡眠活动必须标记为忙碌：{line}")
+            is_last = index == len(lines) - 1
+            has_sleep_semantics = bool(sleep_pattern.search(activity))
+
+            if end_time is None:
+                if not has_sleep_semantics:
+                    raise ValueError(
+                        f"普通活动缺少结束时间：{line}；"
+                        "普通活动必须使用 HH:MM-HH:MM，只有最后一条睡觉可以省略结束时间"
+                    )
+                if not is_last:
+                    raise ValueError(f"开放睡眠只能放在日程最后一项：{line}")
+                if marker != "忙碌":
+                    raise ValueError(f"开放睡眠必须标记为【忙碌】：{line}")
+                is_sleep = True
+            else:
+                is_sleep = False
 
             is_busy = marker != "可回消息"
             if marker is None and not is_sleep:
@@ -578,8 +624,6 @@ class ScheduleGenerator:
             raise ValueError("日程必须包含至少一条普通活动和最后一条睡觉活动")
         if not periods[-1].is_open_sleep:
             raise ValueError("日程最后一项必须是没有结束时间的睡眠活动")
-        if any(period.is_open_sleep for period in periods[:-1]):
-            raise ValueError("只有日程最后一项可以省略结束时间")
         return periods
 
     @staticmethod
@@ -615,22 +659,27 @@ class ScheduleGenerator:
             pass
 
     async def _call_llm(self, prompt: str, provider, session_id: str, system_prompt: str = "") -> str:
-        """Call LLM and return completion text. Retries on empty response."""
-        for attempt in range(self._MAX_RETRIES):
+        """Call LLM and retry only transport failures or empty responses."""
+        for attempt in range(self._LLM_CALL_ATTEMPTS):
             try:
                 resp = await provider.text_chat(prompt=prompt, session_id=session_id, system_prompt=system_prompt or None)
                 text = _extract_completion_text(resp)
                 if text:
                     return text
-                logger.warning(f"[BusySchedule] Empty LLM response (attempt {attempt + 1}/{self._MAX_RETRIES})")
+                logger.warning(
+                    f"[BusySchedule] Empty LLM response "
+                    f"(attempt {attempt + 1}/{self._LLM_CALL_ATTEMPTS})"
+                )
             except Exception as e:
-                logger.warning(f"[BusySchedule] LLM call failed (attempt {attempt + 1}): {e}")
+                logger.warning(
+                    f"[BusySchedule] LLM call failed "
+                    f"(attempt {attempt + 1}/{self._LLM_CALL_ATTEMPTS}): {e}"
+                )
             finally:
                 await self._cleanup_session(session_id)
-                # Use a new session_id for retry
                 session_id = f"busy_schedule_{uuid.uuid4().hex[:8]}"
 
-        raise RuntimeError("LLM returned empty response after all retries")
+        raise RuntimeError("LLM returned empty response after all call attempts")
 
     async def generate_schedule_or_wait(
         self, target_date: date, umo: Optional[str] = None, extra: Optional[str] = None
@@ -662,18 +711,21 @@ class ScheduleGenerator:
 
             logger.info(f"[BusySchedule] Generating schedule for {target_date}")
 
-            # Call LLM with retry and JSON extraction
             sid = f"busy_schedule_gen_{target_date.strftime('%Y%m%d')}_0"
             content = await self._call_llm(prompt, provider, sid)
 
             result = _extract_json_obj(content)
+            periods = []
             validation_error = ""
 
-            for attempt in range(1, self._MAX_RETRIES + 1):
-                if result and result.get("schedule"):
+            for repair_attempt in range(self._FORMAT_REPAIR_ATTEMPTS + 1):
+                if result and isinstance(result.get("schedule"), str):
                     try:
-                        periods = self._parse_busy_periods_from_schedule(
+                        normalized_schedule = self._normalize_schedule_text(
                             result["schedule"]
+                        )
+                        periods = self._parse_busy_periods_from_schedule(
+                            normalized_schedule
                         )
                         self._validate_period_order(
                             periods,
@@ -682,6 +734,7 @@ class ScheduleGenerator:
                                 self._cfg("schedule_time", "07:00")
                             ),
                         )
+                        result["schedule"] = normalized_schedule
                         validation_error = ""
                         break
                     except (TypeError, ValueError) as exc:
@@ -690,39 +743,45 @@ class ScheduleGenerator:
                 reason = (
                     "未能解析出 JSON 对象"
                     if not result
-                    else validation_error or "schedule 字段为空"
+                    else validation_error or "schedule 字段为空或类型错误"
+                )
+                if repair_attempt >= self._FORMAT_REPAIR_ATTEMPTS:
+                    break
+
+                logger.warning(
+                    f"[BusySchedule] Repairing invalid schedule format "
+                    f"({repair_attempt + 1}/{self._FORMAT_REPAIR_ATTEMPTS}): {reason}"
                 )
                 repair_prompt = (
-                    f"你之前的输出未通过校验，需要重写。\n"
+                    "你之前的 JSON 未通过日程协议校验，请修复后重写。\n"
                     f"校验原因：{reason}\n\n"
-                    f"请只输出 JSON 对象本体，不要 Markdown，不要解释。\n"
-                    f"输出 JSON 必须包含字段：outfit_style、outfit、schedule。\n"
-                    f"schedule 必须至少有一条普通活动，最后一项必须为 "
-                    f"HH:MM 睡觉 【忙碌】，睡觉不写结束时间。\n\n"
-                    f"你之前的输出（供参考）：\n{content[:500]}\n\n"
-                    f"原始任务：\n{prompt}"
+                    "只输出 JSON 对象本体，不要 Markdown 或解释。\n"
+                    "保留原有明确计划、穿搭和活动内容，只修复格式。\n"
+                    "JSON 必须包含 outfit_style、outfit、schedule；hairstyle 可选。\n"
+                    "schedule 的每个非空行只能是以下两种格式之一：\n"
+                    "1. 普通活动：HH:MM-HH:MM 活动描述 【忙碌/可回消息】；"
+                    "必须同时保留开始和结束时间\n"
+                    "2. 最后一行睡觉：HH:MM 睡觉 【忙碌】；"
+                    "只有这一行可以省略结束时间\n"
+                    "如果普通活动缺少结束时间，必须为它补上合理的结束时间，"
+                    "不要通过修改【忙碌/可回消息】来规避错误。\n"
+                    "保留原有活动内容和明确计划，只调整不符合协议的格式。\n"
+                    "删除所有说明、标题、注释，包括任何“未标注时段”说明行。\n\n"
+                    f"待修复输出：\n{content[:4000]}"
                 )
 
-                sid = f"busy_schedule_gen_{target_date.strftime('%Y%m%d')}_{attempt}"
+                sid = (
+                    f"busy_schedule_gen_{target_date.strftime('%Y%m%d')}"
+                    f"_repair_{repair_attempt + 1}"
+                )
                 content = await self._call_llm(repair_prompt, provider, sid)
                 result = _extract_json_obj(content)
 
-            if result and result.get("schedule"):
-                try:
-                    periods = self._parse_busy_periods_from_schedule(result["schedule"])
-                    self._validate_period_order(
-                        periods,
-                        target_date,
-                        parse_schedule_time(self._cfg("schedule_time", "07:00")),
-                    )
-                    validation_error = ""
-                except (TypeError, ValueError) as exc:
-                    validation_error = str(exc)
-
             if not result or not result.get("schedule") or validation_error:
                 reason = validation_error or "缺少有效 schedule"
-                raise RuntimeError(
-                    f"Failed to get valid schedule after {self._MAX_RETRIES} attempts: {reason}"
+                raise DeterministicScheduleError(
+                    "Schedule format remained invalid after "
+                    f"{self._FORMAT_REPAIR_ATTEMPTS} repair attempt(s): {reason}"
                 )
 
             # Commit only after the complete result has passed validation.

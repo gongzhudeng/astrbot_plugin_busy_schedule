@@ -25,7 +25,11 @@ from .core.data import (
     parse_schedule_time,
     resolve_schedule_periods,
 )
-from .core.generator import ScheduleGenerator, _SCHEMA_DEFAULTS
+from .core.generator import (
+    DeterministicScheduleError,
+    ScheduleGenerator,
+    _SCHEMA_DEFAULTS,
+)
 from .core.busy_manager import BusyPeriodManager
 from .core.message_interceptor import MessageInterceptor
 from .core.prompt_injector import PromptInjector
@@ -168,6 +172,16 @@ class BusySchedulePlugin(Star):
 
         logger.info("[BusySchedule] Plugin terminated")
 
+    def _disable_cycle_retries(self, owner_date: date, error: Exception) -> None:
+        """Mark a deterministic protocol failure as handled for this cycle."""
+        self._last_refresh_owner_date = owner_date
+        self._refresh_retry_owner_date = None
+        self._refresh_retry_after = None
+        logger.error(
+            f"[BusySchedule] Schedule protocol failed for {owner_date}; "
+            f"automatic retries disabled for this cycle: {error}"
+        )
+
     async def _ensure_today_schedule_async(self):
         """Async wrapper for schedule generation with error handling."""
         try:
@@ -193,6 +207,8 @@ class BusySchedulePlugin(Star):
                 self._last_refresh_owner_date = owner_date
                 self._refresh_retry_owner_date = None
                 self._refresh_retry_after = None
+            except DeterministicScheduleError as e:
+                self._disable_cycle_retries(owner_date, e)
             except Exception as e:
                 self._refresh_retry_owner_date = owner_date
                 self._refresh_retry_after = datetime.now() + timedelta(minutes=5)
@@ -316,6 +332,8 @@ class BusySchedulePlugin(Star):
                     logger.info(
                         f"[BusySchedule] Schedule cycle {owner_date} refreshed"
                     )
+                except DeterministicScheduleError as e:
+                    self._disable_cycle_retries(owner_date, e)
                 except Exception as e:
                     self._refresh_retry_owner_date = owner_date
                     self._refresh_retry_after = now + timedelta(minutes=5)
