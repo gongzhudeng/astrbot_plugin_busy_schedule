@@ -929,61 +929,6 @@ class BusySchedulePlugin(Star):
             req.func_tool.remove_tool("edit_current_schedule")
         return enabled
 
-    async def _build_schedule_edit_injection(
-        self,
-        event: AstrMessageEvent,
-        active: ActiveSchedule,
-        timeline: list[ResolvedPeriod],
-        now: datetime,
-    ) -> str:
-        """Render optional schedule-edit policy without performing retrieval."""
-        if not self._get_config("schedule_edit_enabled", True):
-            return ""
-        template = self._get_config("schedule_edit_prompt", "")
-        if not template:
-            return ""
-
-        current = self.injector._find_current_activity(timeline, now) or "自由时间"
-        future = [item for item in timeline if item.start > now]
-        next_activity = "无"
-        if future:
-            resolved = min(future, key=lambda item: item.start)
-            next_activity = (
-                f"{resolved.period.activity}（{resolved.start.strftime('%H:%M')}开始）"
-            )
-
-        values = {
-            "current_datetime": now.strftime("%Y-%m-%d %H:%M"),
-            "schedule_owner_date": active.owner_date.isoformat(),
-            "current_schedule": active.data.schedule or "未安排",
-            "current_outfit": active.data.outfit or "未设置",
-            "current_activity": current,
-            "next_activity": next_activity,
-            "schedule_time": self._get_config("schedule_time", "07:00"),
-        }
-        umo = event.unified_msg_origin
-        if "{persona_desc}" in template:
-            values["persona_desc"] = await self.generator._get_persona_desc(umo)
-        if "{history_schedules}" in template:
-            days = int(self._get_config("reference_history_days", 3))
-            values["history_schedules"] = self.generator._get_history_schedules(
-                active.owner_date, days
-            )
-        if "{recent_chats}" in template:
-            values["recent_chats"] = await self.generator._get_recent_chats(umo)
-
-        rendered = template
-        for key, value in values.items():
-            rendered = rendered.replace(f"{{{key}}}", str(value))
-
-        unresolved = sorted(set(re.findall(r"\{([a-zA-Z_]\w*)\}", rendered)))
-        if unresolved:
-            logger.warning(
-                "[BusySchedule] Unresolved schedule_edit_prompt placeholders: "
-                + ", ".join(unresolved)
-            )
-        return f"<schedule_edit_policy>\n{rendered}\n</schedule_edit_policy>"
-
     # ==================== Event Handlers ====================
 
     @filter.event_message_type(EventMessageType.ALL, priority=10)
@@ -1110,7 +1055,7 @@ class BusySchedulePlugin(Star):
         2. 当前与下一活动只在日程推进时变化。
         3. 忙碌状态仅在忙碌期间动态附加。
         """
-        schedule_edit_enabled = self._configure_schedule_edit_tool(req)
+        self._configure_schedule_edit_tool(req)
         if not self._get_config("enabled", True):
             return
 
@@ -1131,19 +1076,12 @@ class BusySchedulePlugin(Star):
         static_injection = self.injector.build_static_injection(data)
         schedule_injection = self.injector.build_schedule_injection(data, timeline, now)
         custom_injection = self.injector.build_custom_injection()
-        edit_injection = ""
-        if schedule_edit_enabled:
-            edit_injection = await self._build_schedule_edit_injection(
-                event, active, timeline, now
-            )
 
         cacheable_injection = static_injection
         if custom_injection:
             cacheable_injection += f"\n\n{custom_injection}"
         if schedule_injection:
             cacheable_injection += f"\n\n{schedule_injection}"
-        if edit_injection:
-            cacheable_injection += f"\n\n{edit_injection}"
 
         # Part 3: busy flag (dynamic, only when busy)
         busy_injection = ""

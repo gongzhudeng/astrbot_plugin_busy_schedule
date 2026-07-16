@@ -410,19 +410,9 @@
       },
       "schedule_edit_enabled": {
         "description": "启用当前日程编辑工具",
-        "hint": "关闭后不向 AI 提供 edit_current_schedule 工具，也不注入日程调整规则；日程生成和忙碌管理不受影响。",
+        "hint": "关闭后不向 AI 提供 edit_current_schedule 工具；日程生成和忙碌管理不受影响。",
         "type": "bool",
         "default": true
-      },
-      "schedule_edit_prompt": {
-        "description": "日程调整规则",
-        "hint": "注入正常对话，指导 AI 使用 edit_current_schedule 工具。支持占位符：{current_datetime}、{schedule_owner_date}、{current_schedule}、{current_outfit}、{current_activity}、{next_activity}、{schedule_time}、{persona_desc}、{history_schedules}、{recent_chats}。不额外查询知识库或记忆。",
-        "type": "text",
-        "obvious_hint": true,
-        "editor_mode": true,
-        "editor_language": "markdown",
-        "editor_theme": "vs-dark",
-        "default": "你可以根据完整对话和自身意愿，使用 edit_current_schedule 工具调整当前周期尚未发生的日程。不要把用户的每句话机械视为命令；只有你确实答应或决定调整时才调用。优先利用日程空档；必要时可移动、缩短或删除未来次要活动。删除吃饭、洗澡、睡觉或双方已约定的重要活动前，先自然询问用户。过去活动不可修改；当前活动只能调整结束时间。外出需要换装时，加入未来的换衣服活动，并同时更新当前穿搭。工具返回冲突时不要伪称修改成功。"
       },
       "prompt_template": {
         "description": "日程生成提示词模板",
