@@ -22,6 +22,7 @@ from .core.data import (
     ScheduleData,
     BusyPeriod,
     get_schedule_owner_date,
+    parse_clock_time,
     parse_schedule_time,
     resolve_schedule_periods,
 )
@@ -131,6 +132,11 @@ class BusySchedulePlugin(Star):
                 await self._deliver_queued_messages(umo, fallback_period, "external")
 
         self.context._busy_schedule_wake_and_flush = _wake_and_flush
+        self.context._busy_schedule_get_timeline = self._export_timeline
+        logger.info(
+            "[BusySchedule] Structured timeline interface registered "
+            f"(owner_date={self._get_effective_date().isoformat()})"
+        )
 
         # Start background tasks
         self._state_check_task = asyncio.create_task(self._state_check_loop())
@@ -169,6 +175,9 @@ class BusySchedulePlugin(Star):
         if self._busy_poll_task and not self._busy_poll_task.done():
             self._busy_poll_task.cancel()
         self._busy_poll_task = None
+
+        if getattr(self.context, "_busy_schedule_get_timeline", None) == self._export_timeline:
+            delattr(self.context, "_busy_schedule_get_timeline")
 
         logger.info("[BusySchedule] Plugin terminated")
 
@@ -257,6 +266,75 @@ class BusySchedulePlugin(Star):
                 periods = [item for item in periods if item.period.is_open_sleep]
             resolved.extend(periods)
         return sorted(resolved, key=lambda item: item.start)
+
+    def _export_timeline(self, owner_date: Optional[date] = None) -> list[dict]:
+        """Return a framework-neutral schedule timeline for downstream plugins."""
+        target_date = owner_date or self._get_effective_date()
+        active = self.data_mgr.get_active(target_date)
+        if not active:
+            return []
+
+        resolved_by_period = {
+            id(item.period): item for item in self._get_resolved_timeline(target_date)
+        }
+        schedule_time = parse_schedule_time(
+            self._get_config("schedule_time", "07:00")
+        )
+        timeline = []
+        sleep_keywords = ("睡觉", "睡眠", "就寝", "入睡", "午睡", "小睡", "休眠")
+        periods = active.data.busy_periods
+        for index, period in enumerate(periods):
+            resolved = resolved_by_period.get(id(period))
+            start = resolved.start if resolved else None
+            end = resolved.end if resolved else None
+            valid = True
+            error = ""
+            if start is None:
+                if period.is_open_sleep:
+                    hour, minute = parse_clock_time(period.start_time)
+                    start_date = (
+                        active.owner_date + timedelta(days=1)
+                        if (hour, minute) < schedule_time
+                        else active.owner_date
+                    )
+                    start = datetime.combine(start_date, datetime.min.time()).replace(
+                        hour=hour, minute=minute
+                    )
+                else:
+                    try:
+                        start, _ = period.to_absolute_datetimes(
+                            active.owner_date,
+                            *schedule_time,
+                            resolved_end=end,
+                        )
+                    except ValueError as exc:
+                        valid = False
+                        error = str(exc)
+            inferred_open_sleep = (
+                period.is_open_sleep
+                and index == len(periods) - 1
+                and any(keyword in period.activity for keyword in sleep_keywords)
+            )
+            if period.end_time is None and not inferred_open_sleep:
+                valid = False
+                end = None
+                error = "ordinary activity is missing end_time"
+            elif inferred_open_sleep and resolved is None:
+                end = None
+                error = "sleep end is unavailable until the next schedule exists"
+
+            timeline.append(
+                {
+                    "owner_date": active.owner_date.isoformat(),
+                    "activity": period.activity,
+                    "period_type": period.period_type,
+                    "start": start,
+                    "end": end,
+                    "valid": valid,
+                    "error": error,
+                }
+            )
+        return timeline
 
     def _sync_schedule_to_context(self):
         """Sync active schedule data to context for downstream plugins."""

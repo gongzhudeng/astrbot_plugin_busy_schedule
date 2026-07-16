@@ -13,6 +13,10 @@ from pathlib import Path
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.star import Context
 
+from .history_content import (
+    extract_history_text,
+    find_datetime_reminder,
+)
 from .data import (
     BusyPeriod,
     ScheduleData,
@@ -293,17 +297,25 @@ class ScheduleGenerator:
         if not umo or rounds <= 0:
             return "无近期对话"
 
-        contexts = await self._get_conversation_contexts(umo, rounds)
+        contexts = await self._get_conversation_contexts(
+            umo,
+            rounds,
+            include_datetime=True,
+        )
         if not contexts:
             return "无近期对话记录"
 
         formatted = []
         for msg in contexts:
-            content = str(msg.get("content", "")).strip()
+            raw_content = msg.get("content", "")
+            content = extract_history_text(raw_content, exclude_datetime=True)
             if not content:
                 continue
             if len(content) > 200:
                 content = content[:200] + "..."
+            reminder = find_datetime_reminder(raw_content)
+            if reminder:
+                content = f"{content} {reminder}"
             speaker = "用户" if msg.get("role") == "user" else "我"
             formatted.append(f"{speaker}: {content}")
 
@@ -313,8 +325,14 @@ class ScheduleGenerator:
         )
         return "\n".join(formatted) if formatted else "无近期对话记录"
 
-    async def _get_conversation_contexts(self, umo: str, rounds: int) -> list[dict]:
-        """Fetch the most recent N user-led conversation rounds."""
+    async def _get_conversation_contexts(
+        self,
+        umo: str,
+        rounds: int,
+        *,
+        include_datetime: bool = False,
+    ) -> list[dict]:
+        """Fetch recent rounds projected for model context or semantic retrieval."""
         if rounds <= 0:
             return []
         try:
@@ -344,15 +362,16 @@ class ScheduleGenerator:
                 role = msg.get("role", "")
                 if role not in ("user", "assistant"):
                     continue
-                content = msg.get("content", "")
-                if isinstance(content, list):
-                    content = " ".join(
-                        part.get("text", "")
-                        for part in content
-                        if isinstance(part, dict) and part.get("type") == "text"
+                raw_content = msg.get("content", "")
+                content = (
+                    raw_content
+                    if include_datetime
+                    else extract_history_text(
+                        raw_content,
+                        exclude_datetime=True,
                     )
-                content = str(content).strip()
-                if not content:
+                )
+                if not extract_history_text(content):
                     continue
                 messages.append({"role": role, "content": content})
                 if role == "user":
