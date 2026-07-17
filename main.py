@@ -38,6 +38,7 @@ from .core.schedule_editor import (
     ScheduleEditError,
     ScheduleEditor,
 )
+from .core.weather import WeatherService
 
 
 @register(
@@ -66,6 +67,7 @@ class BusySchedulePlugin(Star):
         self.interceptor: Optional[MessageInterceptor] = None
         self.injector: Optional[PromptInjector] = None
         self.schedule_editor: Optional[ScheduleEditor] = None
+        self.weather_service: Optional[WeatherService] = None
         self._schedule_edit_lock = asyncio.Lock()
 
         # Background tasks
@@ -101,7 +103,15 @@ class BusySchedulePlugin(Star):
         self._state_file = self.data_dir / "plugin_state.json"
         self._load_state()
         self.data_mgr = ScheduleDataManager(self.schedule_data_file)
-        self.generator = ScheduleGenerator(self.context, self.config, self.data_mgr)
+        self.weather_service = WeatherService(
+            self._get_config, self.data_dir / "weather_cache.json"
+        )
+        self.generator = ScheduleGenerator(
+            self.context,
+            self.config,
+            self.data_mgr,
+            weather_service=self.weather_service,
+        )
         self.busy_mgr = BusyPeriodManager(self.config, self.data_mgr)
         self.interceptor = MessageInterceptor(self.config)
         self.injector = PromptInjector(self.config)
@@ -901,6 +911,7 @@ class BusySchedulePlugin(Star):
             "关键词设置",
             "消息合并",
             "日程生成",
+            "天气服务",
         ]:
             group = self.config.get(group_name, {})
             if isinstance(group, dict) and key in group:
@@ -1152,6 +1163,8 @@ class BusySchedulePlugin(Star):
         """编辑当前日程周期尚未结束的活动。
 
         只有在结合完整对话、自身意愿和当前日程，确实决定调整今天安排后才使用。
+        用户明确提出调整，或双方已形成因天气变化、降雨时段、温度变化等原因调整
+        安排的意图，属于合理触发条件；不能仅因日程中存在天气描述就擅自调整。
         过去活动不可修改；当前普通活动只能修改 end_time；未来普通活动可以新增、
         更新或删除。穿搭变化使用 set_outfit，通常还应新增未来的换衣服活动。
         删除重要活动可能需要询问用户时，先使用 mode=check 检查；不要向用户展示
@@ -1266,6 +1279,61 @@ class BusySchedulePlugin(Star):
 
     # ==================== Commands ====================
 
+    @filter.command("天气测试", alias={"天气查询", "busy weather"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def cmd_test_weather(self, event: AstrMessageEvent):
+        """强制查询天气并展示日程生成 Prompt 中的天气文本。"""
+        if not self.weather_service:
+            yield event.plain_result("天气服务尚未初始化，请重新加载插件后再试。")
+            return
+
+        owner_date = self._get_effective_date()
+        schedule_time = parse_schedule_time(self._get_config("schedule_time", "07:00"))
+        providers = self._get_config("weather_providers", ["qweather", "open_meteo"])
+        provider_text = (
+            " → ".join(str(item) for item in providers)
+            if isinstance(providers, list)
+            else str(providers)
+        )
+
+        yield event.plain_result(
+            "正在强制查询天气（跳过缓存）...\n"
+            f"位置：{self._get_config('weather_city', '')} "
+            f"{self._get_config('weather_admin', '')} "
+            f"{self._get_config('weather_country_code', '')}\n"
+            f"供应商顺序：{provider_text}"
+        )
+
+        snapshot, errors = await self.weather_service.query_forecast(
+            owner_date,
+            schedule_time,
+            force_refresh=True,
+        )
+        if not snapshot:
+            details = "\n".join(f"- {item}" for item in errors)
+            yield event.plain_result(
+                "天气查询失败，日程生成仍会按无天气模式继续。\n"
+                f"周期：{owner_date.isoformat()} "
+                f"{schedule_time[0]:02d}:{schedule_time[1]:02d} 起 24 小时\n"
+                f"诊断：\n{details or '- 未返回具体错误'}"
+            )
+            return
+
+        fallback_note = ""
+        if errors:
+            fallback_note = "\n前序供应商失败并已回退：\n" + "\n".join(
+                f"- {item}" for item in errors
+            )
+        yield event.plain_result(
+            "天气查询成功。\n"
+            f"实际供应商：{snapshot.provider}\n"
+            f"周期：{snapshot.cycle_start} → {snapshot.cycle_end}\n"
+            f"缓存：已刷新 {self.weather_service.cache_file.name}"
+            f"{fallback_note}\n\n"
+            "以下内容就是日程模板中 {weather_forecast} 的实际值：\n\n"
+            f"{snapshot.format_for_prompt()}"
+        )
+
     @filter.command("忙碌日程", alias={"busy show", "busy schedule"})
     async def cmd_show_schedule(self, event: AstrMessageEvent):
         """查看今日的日程和忙碌时段"""
@@ -1287,10 +1355,23 @@ class BusySchedulePlugin(Star):
                     f"当前周期生成失败，继续显示上一份可用日程：{e}"
                 )
         display_date = date.fromisoformat(data.date)
+        is_current_cycle = display_date == owner_date
+        weather_line = (
+            f"🌦️ 天气：{data.weather.format_summary()}"
+            if is_current_cycle and data.weather
+            else "🌦️ 天气：暂不可用"
+        )
+        source_line = (
+            ""
+            if is_current_cycle
+            else f"⚠️ 当前显示 {display_date.isoformat()} 的备用日程，天气不映射到当前周期"
+        )
 
         # Build response
         response_parts = [
             f"📅 {display_date.strftime('%Y-%m-%d')}",
+            *([source_line] if source_line else []),
+            weather_line,
             "",
             f"👗 今日穿搭：{data.outfit}"
             + (f"\n发型：{data.hairstyle}" if data.hairstyle else ""),
@@ -1324,8 +1405,10 @@ class BusySchedulePlugin(Star):
                 today, umo=event.unified_msg_origin, extra=extra if extra else None
             )
             hairstyle_line = f"\n发型：{data.hairstyle}" if data.hairstyle else ""
+            weather_line = data.weather.format_summary() if data.weather else "暂不可用"
             yield event.plain_result(
                 f"📅 {today.strftime('%Y-%m-%d')}\n"
+                f"🌦️ 天气：{weather_line}\n"
                 f"👗 今日穿搭：{data.outfit}{hairstyle_line}\n"
                 f"📝 日程安排：\n{data.schedule}"
             )

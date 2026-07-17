@@ -1,13 +1,14 @@
 """Schedule data management module."""
 
 import json
-from dataclasses import dataclass, field, asdict
-from datetime import datetime, date, timedelta
+from dataclasses import asdict, dataclass, field
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
 from astrbot.api import logger
 
+from .weather import WeatherSnapshot
 
 DEFAULT_SCHEDULE_TIME = (7, 0)
 _WARNED_INVALID_SCHEDULE_TIMES: set[str] = set()
@@ -31,9 +32,7 @@ def parse_schedule_time(value: object) -> tuple[int, int]:
         return DEFAULT_SCHEDULE_TIME
 
 
-def get_schedule_owner_date(
-    now: datetime, schedule_time: tuple[int, int]
-) -> date:
+def get_schedule_owner_date(now: datetime, schedule_time: tuple[int, int]) -> date:
     """Return the schedule cycle that owns a concrete moment."""
     hour, minute = schedule_time
     boundary = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
@@ -189,9 +188,12 @@ class ScheduleData:
     date: str  # YYYY-MM-DD format
     outfit_style: str = ""
     outfit: str = ""
-    hairstyle: str = ""  # optional, e.g. "双马尾"; empty means use reference image default
+    hairstyle: str = (
+        ""  # optional, e.g. "双马尾"; empty means use reference image default
+    )
     schedule: str = ""
     busy_periods: list[BusyPeriod] = field(default_factory=list)
+    weather: Optional[WeatherSnapshot] = None
     status: str = "pending"  # pending, generating, completed, failed
     last_updated: Optional[str] = None
 
@@ -205,6 +207,12 @@ class ScheduleData:
         """Create from dictionary while accepting legacy closed sleep entries."""
         payload = dict(data)
         busy_periods_data = payload.pop("busy_periods", [])
+        weather_data = payload.pop("weather", None)
+        weather = (
+            WeatherSnapshot.from_dict(weather_data)
+            if isinstance(weather_data, dict)
+            else None
+        )
         busy_periods = []
         legacy_sleep_keywords = ("睡觉", "睡眠", "就寝", "入睡", "休眠")
         for item in busy_periods_data:
@@ -219,7 +227,7 @@ class ScheduleData:
                     else "activity"
                 )
             busy_periods.append(BusyPeriod(**period))
-        return cls(**payload, busy_periods=busy_periods)
+        return cls(**payload, busy_periods=busy_periods, weather=weather)
 
 
 class ScheduleDataManager:
@@ -239,7 +247,9 @@ class ScheduleDataManager:
                 raw_data = json.load(f)
             for date_str, item in raw_data.items():
                 self._data[date_str] = ScheduleData.from_dict(item)
-            logger.info(f"[BusySchedule] Loaded {len(self._data)} schedule data entries")
+            logger.info(
+                f"[BusySchedule] Loaded {len(self._data)} schedule data entries"
+            )
         except Exception as e:
             logger.error(f"[BusySchedule] Failed to load schedule data: {e}")
 

@@ -5,30 +5,30 @@ import json
 import random
 import re
 import uuid
-from datetime import datetime, date, timedelta
-from typing import Optional
-
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Optional
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.star import Context
 
-from .history_content import (
-    extract_history_text,
-    find_datetime_reminder,
-)
 from .data import (
     BusyPeriod,
     ScheduleData,
     ScheduleDataManager,
     parse_schedule_time,
 )
+from .history_content import (
+    extract_history_text,
+    find_datetime_reminder,
+)
+from .weather import WeatherService, WeatherSnapshot
 
 try:
     from astrbot.core.cron.events import CronMessageEvent
-    from astrbot.core.provider.entities import ProviderRequest
-    from astrbot.core.platform.message_session import MessageSession
     from astrbot.core.pipeline.context import call_event_hook
+    from astrbot.core.platform.message_session import MessageSession
+    from astrbot.core.provider.entities import ProviderRequest
     from astrbot.core.star.star_handler import EventType
 
     HAS_PIPELINE = True
@@ -171,10 +171,17 @@ class ScheduleGenerator:
     _LLM_CALL_ATTEMPTS = 3
     _FORMAT_REPAIR_ATTEMPTS = 1
 
-    def __init__(self, context: Context, config: AstrBotConfig, data_mgr: ScheduleDataManager):
+    def __init__(
+        self,
+        context: Context,
+        config: AstrBotConfig,
+        data_mgr: ScheduleDataManager,
+        weather_service: Optional[WeatherService] = None,
+    ):
         self.context = context
         self.config = config
         self.data_mgr = data_mgr
+        self.weather_service = weather_service
         self._generating = False
         self._generation_future: Optional[asyncio.Future] = None
         self._generation_target: Optional[date] = None
@@ -182,7 +189,14 @@ class ScheduleGenerator:
     def _cfg(self, key: str, default=None):
         """Get config value with schema default fallback."""
         # Nested groups take priority — user-edited values live here
-        for group_name in ["基础设置", "忙碌时段", "关键词设置", "消息合并", "日程生成"]:
+        for group_name in [
+            "基础设置",
+            "忙碌时段",
+            "关键词设置",
+            "消息合并",
+            "日程生成",
+            "天气服务",
+        ]:
             group = self.config.get(group_name, {})
             if isinstance(group, dict) and key in group:
                 val = group[key]
@@ -236,7 +250,11 @@ class ScheduleGenerator:
                 if persona_mgr:
                     for persona in persona_mgr.personas:
                         if persona.persona_id == persona_id:
-                            return persona.system_prompt[:500] if persona.system_prompt else ""
+                            return (
+                                persona.system_prompt[:500]
+                                if persona.system_prompt
+                                else ""
+                            )
 
             # 3. System default persona via persona_manager
             try:
@@ -250,7 +268,7 @@ class ScheduleGenerator:
 
             # 4. Fallback
             return "一个活泼可爱的AI助手"
-        except Exception as e:
+        except Exception:
             return "一个活泼可爱的AI助手"
 
     def _get_history_schedules(self, target_date: date, days: int = 3) -> str:
@@ -265,9 +283,13 @@ class ScheduleGenerator:
             outfit = data.outfit[:40] if data.outfit else ""
             schedule = data.schedule[:60]
             if style:
-                history.append(f"[{past_date.strftime('%Y-%m-%d')}] 风格：{style} 穿搭：{outfit} 日程：{schedule}")
+                history.append(
+                    f"[{past_date.strftime('%Y-%m-%d')}] 风格：{style} 穿搭：{outfit} 日程：{schedule}"
+                )
             else:
-                history.append(f"[{past_date.strftime('%Y-%m-%d')}] 穿搭：{outfit} 日程：{schedule}")
+                history.append(
+                    f"[{past_date.strftime('%Y-%m-%d')}] 穿搭：{outfit} 日程：{schedule}"
+                )
         return "\n".join(history) if history else "无历史日程"
 
     def _get_yesterday_last_activity(self, target_date: date) -> str:
@@ -282,7 +304,9 @@ class ScheduleGenerator:
         if not data or not data.schedule:
             return ""
 
-        lines = [line.strip() for line in data.schedule.strip().split("\n") if line.strip()]
+        lines = [
+            line.strip() for line in data.schedule.strip().split("\n") if line.strip()
+        ]
         if not lines:
             return ""
 
@@ -290,7 +314,9 @@ class ScheduleGenerator:
         logger.info(f"[BusySchedule] Yesterday's last activity: {last_line}")
         return last_line
 
-    async def _get_recent_chats(self, umo: Optional[str] = None, rounds: Optional[int] = None) -> str:
+    async def _get_recent_chats(
+        self, umo: Optional[str] = None, rounds: Optional[int] = None
+    ) -> str:
         """Get recent conversation rounds for schedule generation."""
         if rounds is None:
             rounds = int(self._cfg("reference_recent_count", 10))
@@ -407,8 +433,7 @@ class ScheduleGenerator:
 
         per_line, remainder = divmod(content_budget, len(lines))
         truncated = [
-            line[: per_line + (index < remainder)]
-            for index, line in enumerate(lines)
+            line[: per_line + (index < remainder)] for index, line in enumerate(lines)
         ]
         return "\n".join(truncated)
 
@@ -446,7 +471,11 @@ class ScheduleGenerator:
 
     async def _get_rag_context(self, umo: Optional[str] = None) -> str:
         """Query memory and knowledge plugins with a pure recent-chat query."""
-        if not HAS_PIPELINE or not self._cfg("enable_rag_for_schedule", True) or not umo:
+        if (
+            not HAS_PIPELINE
+            or not self._cfg("enable_rag_for_schedule", True)
+            or not umo
+        ):
             return ""
 
         try:
@@ -503,7 +532,13 @@ class ScheduleGenerator:
             logger.warning(f"[BusySchedule] _get_rag_context failed: {e}")
             return ""
 
-    async def _build_prompt(self, target_date: date, extra: Optional[str] = None, umo: Optional[str] = None) -> str:
+    async def _build_prompt(
+        self,
+        target_date: date,
+        extra: Optional[str] = None,
+        umo: Optional[str] = None,
+        weather: Optional[WeatherSnapshot] = None,
+    ) -> str:
         """Build the prompt for schedule generation.
 
         Uses str.format() with double-brace escaping for JSON output format.
@@ -526,17 +561,26 @@ class ScheduleGenerator:
             "daily_theme": random.choice(daily_themes) if daily_themes else "随性日",
             "mood_color": random.choice(mood_colors) if mood_colors else "随性",
             "outfit_style": random.choice(outfit_styles) if outfit_styles else "休闲风",
-            "schedule_type": random.choice(schedule_types) if schedule_types else "随性漫游型",
+            "schedule_type": random.choice(schedule_types)
+            if schedule_types
+            else "随性漫游型",
             "history_schedules": self._get_history_schedules(target_date),
             "last_yesterday_activity": self._get_yesterday_last_activity(target_date),
             "recent_chats": await self._get_recent_chats(umo),
             "rag_context": await self._get_rag_context(umo),
+            "weather_forecast": (
+                weather.format_for_prompt()
+                if weather
+                else "天气预报暂不可用。请按其他上下文正常规划，不要虚构具体天气。"
+            ),
         }
 
         try:
             prompt = template.format(**ctx)
         except KeyError as e:
-            logger.warning(f"[BusySchedule] prompt_template has unknown placeholder: {e}")
+            logger.warning(
+                f"[BusySchedule] prompt_template has unknown placeholder: {e}"
+            )
             # Fallback: fill what we can
             prompt = template
             for k, v in ctx.items():
@@ -677,11 +721,17 @@ class ScheduleGenerator:
         except Exception:
             pass
 
-    async def _call_llm(self, prompt: str, provider, session_id: str, system_prompt: str = "") -> str:
+    async def _call_llm(
+        self, prompt: str, provider, session_id: str, system_prompt: str = ""
+    ) -> str:
         """Call LLM and retry only transport failures or empty responses."""
         for attempt in range(self._LLM_CALL_ATTEMPTS):
             try:
-                resp = await provider.text_chat(prompt=prompt, session_id=session_id, system_prompt=system_prompt or None)
+                resp = await provider.text_chat(
+                    prompt=prompt,
+                    session_id=session_id,
+                    system_prompt=system_prompt or None,
+                )
                 text = _extract_completion_text(resp)
                 if text:
                     return text
@@ -722,7 +772,19 @@ class ScheduleGenerator:
         self._generation_target = target_date
         self._generation_future = asyncio.get_running_loop().create_future()
         try:
-            prompt = await self._build_prompt(target_date, extra, umo)
+            schedule_time = parse_schedule_time(self._cfg("schedule_time", "07:00"))
+            weather = None
+            weather_service = getattr(self, "weather_service", None)
+            if weather_service:
+                try:
+                    weather = await weather_service.get_forecast(
+                        target_date, schedule_time
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"[BusySchedule] Weather unavailable for generation: {exc}"
+                    )
+            prompt = await self._build_prompt(target_date, extra, umo, weather=weather)
             provider = self._get_provider()
 
             if not provider:
@@ -749,9 +811,7 @@ class ScheduleGenerator:
                         self._validate_period_order(
                             periods,
                             target_date,
-                            parse_schedule_time(
-                                self._cfg("schedule_time", "07:00")
-                            ),
+                            schedule_time,
                         )
                         result["schedule"] = normalized_schedule
                         validation_error = ""
@@ -810,12 +870,15 @@ class ScheduleGenerator:
                 outfit=result.get("outfit", ""),
                 hairstyle=result.get("hairstyle", ""),
                 schedule=result.get("schedule", ""),
+                weather=weather,
                 status="completed",
             )
             data.busy_periods = periods
             self.data_mgr.set(target_date, data)
 
-            logger.info(f"[BusySchedule] Schedule generated with {len(data.busy_periods)} busy periods")
+            logger.info(
+                f"[BusySchedule] Schedule generated with {len(data.busy_periods)} busy periods"
+            )
 
             if not self._generation_future.done():
                 self._generation_future.set_result(data)
@@ -832,4 +895,3 @@ class ScheduleGenerator:
             self._generating = False
             self._generation_target = None
             self._generation_future = None
-
