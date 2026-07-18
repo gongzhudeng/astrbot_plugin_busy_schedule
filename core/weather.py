@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 
 import httpx
 
@@ -49,15 +50,15 @@ class WeatherHour:
     """Normalized hourly forecast."""
 
     time: str
-    temperature_c: Optional[float]
+    temperature_c: float | None
     condition: str
     precipitation_mm: float = 0.0
-    precipitation_probability: Optional[int] = None
+    precipitation_probability: int | None = None
     wind_direction: str = ""
-    wind_speed_kmh: Optional[float] = None
+    wind_speed_kmh: float | None = None
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "WeatherHour":
+    def from_dict(cls, data: dict[str, Any]) -> WeatherHour:
         return cls(**data)
 
 
@@ -82,7 +83,7 @@ class WeatherSnapshot:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "WeatherSnapshot":
+    def from_dict(cls, data: dict[str, Any]) -> WeatherSnapshot:
         payload = dict(data)
         payload["hours"] = [
             item if isinstance(item, WeatherHour) else WeatherHour.from_dict(item)
@@ -110,33 +111,31 @@ class WeatherSnapshot:
         )
 
     def format_for_prompt(self) -> str:
+        """Format a compact forecast without losing dry/wet transitions."""
+        cycle_start = datetime.fromisoformat(self.cycle_start)
         lines = [
             f"地点：{self.display_location}（时区 {self.timezone}）",
-            f"周期最高/最低温：{self.temperature_max_c:g}℃ / {self.temperature_min_c:g}℃",
+            f"周期温度：{self.temperature_min_c:g}~{self.temperature_max_c:g}℃",
+            "天气时段：",
         ]
-        if self.summary:
-            lines.append(f"概况：{self.summary}")
-        lines.append("逐小时预报：")
-        for hour in self.hours:
-            moment = datetime.fromisoformat(hour.time)
-            probability = (
-                "未知"
-                if hour.precipitation_probability is None
-                else f"{hour.precipitation_probability}%"
-            )
-            wind = ""
-            if hour.wind_direction or hour.wind_speed_kmh is not None:
-                wind = f"，风 {hour.wind_direction or '-'}"
-                if hour.wind_speed_kmh is not None:
-                    wind += f" {hour.wind_speed_kmh:g}km/h"
-            temperature = (
-                "未知" if hour.temperature_c is None else f"{hour.temperature_c:g}℃"
-            )
+        for segment in _weather_segments(self.hours):
+            start = datetime.fromisoformat(segment[0].time)
+            end = datetime.fromisoformat(segment[-1].time) + timedelta(hours=1)
+            temperatures = [
+                hour.temperature_c for hour in segment if hour.temperature_c is not None
+            ]
+            temperature = _temperature_range(temperatures)
+            label = _segment_weather_label(segment)
+            risk = "，降雨风险高" if _weather_state(segment[0])[2] else ""
             lines.append(
-                f"- {moment.strftime('%m-%d %H:%M')} {hour.condition}，"
-                f"{temperature}，降水概率 {probability}，"
-                f"降水 {hour.precipitation_mm:g}mm{wind}"
+                f"- {_format_time_range(start, end, cycle_start.date())} "
+                f"{label}，{temperature}{risk}"
             )
+
+        risks = _format_weather_risks(self.hours, cycle_start.date())
+        if risks:
+            lines.append("出行风险：")
+            lines.extend(f"- {risk}" for risk in risks)
         return "\n".join(lines)
 
     def format_summary(self) -> str:
@@ -212,7 +211,7 @@ class WeatherService:
 
     def get_cached(
         self, owner_date: date, schedule_time: tuple[int, int]
-    ) -> Optional[WeatherSnapshot]:
+    ) -> WeatherSnapshot | None:
         location_key = self._location_key()
         cycle_start, cycle_end = self._cycle_bounds(owner_date, schedule_time)
         return next(
@@ -226,7 +225,7 @@ class WeatherService:
 
     async def get_forecast(
         self, owner_date: date, schedule_time: tuple[int, int]
-    ) -> Optional[WeatherSnapshot]:
+    ) -> WeatherSnapshot | None:
         """Return a cached or freshly fetched forecast for schedule generation."""
         snapshot, _ = await self.query_forecast(
             owner_date, schedule_time, force_refresh=False
@@ -239,7 +238,7 @@ class WeatherService:
         schedule_time: tuple[int, int],
         *,
         force_refresh: bool,
-    ) -> tuple[Optional[WeatherSnapshot], tuple[str, ...]]:
+    ) -> tuple[WeatherSnapshot | None, tuple[str, ...]]:
         """Fetch a forecast and return sanitized provider diagnostics."""
         if not bool(self._cfg("weather_enabled", False)):
             return None, ("天气服务未启用（weather_enabled=false）",)
@@ -493,8 +492,8 @@ class WeatherService:
         cycle_start: datetime,
         cycle_end: datetime,
         hours: list[WeatherHour],
-        daily_min: Optional[float] = None,
-        daily_max: Optional[float] = None,
+        daily_min: float | None = None,
+        daily_max: float | None = None,
     ) -> WeatherSnapshot:
         hours = _complete_cycle_hours(hours, cycle_start, cycle_end)
         actual_hours = [hour for hour in hours if hour.temperature_c is not None]
@@ -555,7 +554,7 @@ def _complete_cycle_hours(
     return completed
 
 
-def _first_daily_value(payload: dict[str, Any], key: str) -> Optional[float]:
+def _first_daily_value(payload: dict[str, Any], key: str) -> float | None:
     values = payload.get(key, [])
     return _optional_float(values[0]) if values else None
 
@@ -567,18 +566,18 @@ def _number_at(payload: dict[str, Any], key: str, index: int) -> float:
     return float(values[index])
 
 
-def _optional_int_at(payload: dict[str, Any], key: str, index: int) -> Optional[int]:
+def _optional_int_at(payload: dict[str, Any], key: str, index: int) -> int | None:
     values = payload.get(key, [])
     return _optional_int(values[index]) if index < len(values) else None
 
 
-def _optional_int(value: Any) -> Optional[int]:
+def _optional_int(value: Any) -> int | None:
     if value in (None, ""):
         return None
     return int(float(value))
 
 
-def _optional_float(value: Any) -> Optional[float]:
+def _optional_float(value: Any) -> float | None:
     if value in (None, ""):
         return None
     return float(value)
@@ -603,11 +602,146 @@ def _require_qweather_ok(payload: dict[str, Any]) -> None:
         raise ValueError(f"QWeather returned code {payload.get('code', 'unknown')}")
 
 
+def _weather_state(hour: WeatherHour) -> tuple[str, str, bool]:
+    """Project one hour into a truthful prompt-level weather state."""
+    condition = hour.condition.strip() or "未知天气"
+    high_rain_risk = (
+        hour.precipitation_mm <= 0 and (hour.precipitation_probability or 0) >= 50
+    )
+    if condition == "预报暂缺" or hour.temperature_c is None:
+        return "missing", "预报暂缺", False
+    if "雷" in condition:
+        return "thunderstorm", condition, False
+    if "冰雹" in condition:
+        return "hail", condition, False
+    if "冻雨" in condition or "冻毛毛雨" in condition:
+        return "freezing_rain", condition, False
+    if "雪" in condition:
+        return "snow", condition, False
+    if "雨" in condition or hour.precipitation_mm > 0:
+        if any(token in condition for token in ("大雨", "强阵雨", "暴雨")):
+            return "heavy_rain", condition, False
+        if any(token in condition for token in ("中雨", "中阵雨")):
+            return "moderate_rain", condition, False
+        return "light_rain", condition, False
+    if "雾" in condition:
+        return "fog", condition, high_rain_risk
+    return "dry", condition, high_rain_risk
+
+
+def _weather_segments(hours: list[WeatherHour]) -> list[list[WeatherHour]]:
+    """Merge adjacent hours by semantic state without crossing dry/wet boundaries."""
+    segments: list[list[WeatherHour]] = []
+    for hour in hours:
+        state, _, risk = _weather_state(hour)
+        previous_key = None
+        if segments:
+            previous_state, _, previous_risk = _weather_state(segments[-1][-1])
+            previous_key = (previous_state, previous_risk)
+        if previous_key != (state, risk):
+            segments.append([hour])
+        else:
+            segments[-1].append(hour)
+    return segments
+
+
+def _segment_weather_label(segment: list[WeatherHour]) -> str:
+    labels = list(dict.fromkeys(_weather_state(hour)[1] for hour in segment))
+    return "转".join(labels)
+
+
+def _temperature_range(temperatures: list[float]) -> str:
+    if not temperatures:
+        return "温度未知"
+    low, high = min(temperatures), max(temperatures)
+    if low == high:
+        return f"约{low:g}℃"
+    return f"{low:g}~{high:g}℃"
+
+
+def _format_time_range(start: datetime, end: datetime, base_date: date) -> str:
+    start_text = start.strftime("%H:%M")
+    end_text = end.strftime("%H:%M")
+    if start.date() != base_date:
+        start_text = start.strftime("%m-%d %H:%M")
+    if end.date() not in (start.date(), base_date):
+        end_text = end.strftime("%m-%d %H:%M")
+    return f"{start_text}-{end_text}"
+
+
+def _matching_ranges(
+    hours: list[WeatherHour],
+    predicate: Callable[[WeatherHour], bool],
+) -> list[list[WeatherHour]]:
+    groups: list[list[WeatherHour]] = []
+    for hour in hours:
+        if not predicate(hour):
+            continue
+        moment = datetime.fromisoformat(hour.time)
+        if groups:
+            previous = datetime.fromisoformat(groups[-1][-1].time)
+            if moment - previous == timedelta(hours=1):
+                groups[-1].append(hour)
+                continue
+        groups.append([hour])
+    return groups
+
+
+def _risk_ranges(
+    hours: list[WeatherHour],
+    predicate: Callable[[WeatherHour], bool],
+    base_date: date,
+) -> str:
+    ranges = []
+    for group in _matching_ranges(hours, predicate):
+        start = datetime.fromisoformat(group[0].time)
+        end = datetime.fromisoformat(group[-1].time) + timedelta(hours=1)
+        ranges.append(_format_time_range(start, end, base_date))
+    return "、".join(ranges)
+
+
+def _format_weather_risks(hours: list[WeatherHour], base_date: date) -> list[str]:
+    """Keep impactful raw signals while hiding routine hourly measurements."""
+    risks = []
+    rules: tuple[tuple[str, Callable[[WeatherHour], bool]], ...] = (
+        (
+            "雷暴/冰雹/冻雨风险",
+            lambda hour: any(
+                token in hour.condition for token in ("雷", "冰雹", "冻雨", "冻毛毛雨")
+            ),
+        ),
+        (
+            "强降水风险",
+            lambda hour: (
+                hour.precipitation_mm >= 10
+                or any(token in hour.condition for token in ("暴雨", "大雨", "强阵雨"))
+            ),
+        ),
+        (
+            "强风风险",
+            lambda hour: (hour.wind_speed_kmh or 0) >= 39,
+        ),
+        (
+            "高温风险",
+            lambda hour: hour.temperature_c is not None and hour.temperature_c >= 35,
+        ),
+        (
+            "低温/结冰风险",
+            lambda hour: hour.temperature_c is not None and hour.temperature_c <= 0,
+        ),
+    )
+    for label, predicate in rules:
+        ranges = _risk_ranges(hours, predicate, base_date)
+        if ranges:
+            risks.append(f"{ranges} {label}")
+    return risks
+
+
 def _precipitation_summary(hours: list[WeatherHour]) -> str:
     wet = [
         hour
         for hour in hours
-        if hour.precipitation_mm > 0 or (hour.precipitation_probability or 0) >= 50
+        if hour.precipitation_mm > 0 or "雨" in hour.condition or "雪" in hour.condition
     ]
     if not wet:
         return "无明显降水时段"
