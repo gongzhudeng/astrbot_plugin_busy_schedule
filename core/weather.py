@@ -660,12 +660,13 @@ def _temperature_range(temperatures: list[float]) -> str:
 
 
 def _format_time_range(start: datetime, end: datetime, base_date: date) -> str:
+    if start.date() != end.date():
+        return f"{start.strftime('%m-%d %H:%M')}-{end.strftime('%m-%d %H:%M')}"
+
     start_text = start.strftime("%H:%M")
     end_text = end.strftime("%H:%M")
     if start.date() != base_date:
         start_text = start.strftime("%m-%d %H:%M")
-    if end.date() not in (start.date(), base_date):
-        end_text = end.strftime("%m-%d %H:%M")
     return f"{start_text}-{end_text}"
 
 
