@@ -7,7 +7,6 @@ import re
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Optional
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.star import Context
@@ -36,11 +35,27 @@ except ImportError:
     HAS_PIPELINE = False
 
 
+# Allowed classification tags and their canonical order.
+# These tags sit between the activity description and the status marker.
+_CLASSIFICATION_TAGS: tuple[str, ...] = ("外出", "用餐", "主动分享")
+_TAG_ORDER: dict[str, int] = {tag: i for i, tag in enumerate(_CLASSIFICATION_TAGS)}
+
+# Canonical sleep tag instruction injected into repair prompts.
+_DSL_TAG_PROTOCOL = (
+    "活动分类标签规则（必须遵循）：\n"
+    "- 分类标签放在状态标记【忙碌/可回消息】之前，固定顺序：【外出】→【用餐】→【主动分享】\n"
+    "- 【外出】：活动期间人在住所之外\n"
+    "- 【用餐】：实际进食正餐或加餐，不区分外卖/自炊/堂食\n"
+    "- 【主动分享】：既非外出也非用餐但适合主动联系Mando；不与【外出】【用餐】叠加\n"
+    "- 同一标签不重复；首个起床活动必须含「小怡醒来」；睡眠活动必须含「睡觉」\n"
+)
+
+
 def _load_schema_defaults() -> dict:
     """Load default values from _conf_schema.json."""
     schema_path = Path(__file__).parent.parent / "_conf_schema.json"
     try:
-        with open(schema_path, "r", encoding="utf-8") as f:
+        with open(schema_path, encoding="utf-8") as f:
             schema = json.load(f)
         defaults = {}
         for group_name, group in schema.items():
@@ -104,7 +119,7 @@ def get_weekday_cn(date_obj: date) -> str:
     return weekdays[date_obj.weekday()]
 
 
-def _extract_json_obj(text: str) -> Optional[dict]:
+def _extract_json_obj(text: str) -> dict | None:
     """Extract JSON object from text using robust bracket matching.
 
     Handles markdown code blocks, nested objects, and string escaping.
@@ -176,15 +191,15 @@ class ScheduleGenerator:
         context: Context,
         config: AstrBotConfig,
         data_mgr: ScheduleDataManager,
-        weather_service: Optional[WeatherService] = None,
+        weather_service: WeatherService | None = None,
     ):
         self.context = context
         self.config = config
         self.data_mgr = data_mgr
         self.weather_service = weather_service
         self._generating = False
-        self._generation_future: Optional[asyncio.Future] = None
-        self._generation_target: Optional[date] = None
+        self._generation_future: asyncio.Future | None = None
+        self._generation_target: date | None = None
 
     def _cfg(self, key: str, default=None):
         """Get config value with schema default fallback."""
@@ -222,7 +237,7 @@ class ScheduleGenerator:
                 return provider
         return self.context.get_using_provider()
 
-    async def _get_persona_desc(self, umo: Optional[str] = None) -> str:
+    async def _get_persona_desc(self, umo: str | None = None) -> str:
         """Get bot persona description for schedule generation.
 
         Priority: explicit config persona > current conversation persona > system default > fallback.
@@ -315,7 +330,7 @@ class ScheduleGenerator:
         return last_line
 
     async def _get_recent_chats(
-        self, umo: Optional[str] = None, rounds: Optional[int] = None
+        self, umo: str | None = None, rounds: int | None = None
     ) -> str:
         """Get recent conversation rounds for schedule generation."""
         if rounds is None:
@@ -469,7 +484,7 @@ class ScheduleGenerator:
 
         return list(dict.fromkeys(results))
 
-    async def _get_rag_context(self, umo: Optional[str] = None) -> str:
+    async def _get_rag_context(self, umo: str | None = None) -> str:
         """Query memory and knowledge plugins with a pure recent-chat query."""
         if (
             not HAS_PIPELINE
@@ -535,9 +550,9 @@ class ScheduleGenerator:
     async def _build_prompt(
         self,
         target_date: date,
-        extra: Optional[str] = None,
-        umo: Optional[str] = None,
-        weather: Optional[WeatherSnapshot] = None,
+        extra: str | None = None,
+        umo: str | None = None,
+        weather: WeatherSnapshot | None = None,
     ) -> str:
         """Build the prompt for schedule generation.
 
@@ -618,6 +633,28 @@ class ScheduleGenerator:
             )
         return "\n".join(normalized_lines)
 
+    @staticmethod
+    def _validate_classification_tags(activity: str) -> None:
+        """Validate DSL classification tags embedded in an activity string.
+
+        Tags must come from the allowed set, appear in canonical order, and
+        not repeat.  【主动分享】 is mutually exclusive with 【外出】/【用餐】.
+        """
+        found = re.findall(r"【([^】]+)】", activity)
+        class_tags = [t for t in found if t in _TAG_ORDER]
+        unknown = [t for t in found if t not in _TAG_ORDER]
+        if unknown:
+            raise ValueError(
+                f"活动包含未知分类标签：{'、'.join(f'【{t}】' for t in unknown)}；"
+                f"允许的分类标签：{'、'.join(f'【{t}】' for t in _CLASSIFICATION_TAGS)}"
+            )
+        if len(class_tags) != len(set(class_tags)):
+            raise ValueError(f"活动存在重复分类标签：{activity}")
+        if class_tags != sorted(class_tags, key=lambda t: _TAG_ORDER[t]):
+            raise ValueError(f"分类标签顺序错误（应为 外出→用餐→主动分享）：{activity}")
+        if "主动分享" in class_tags and ("外出" in class_tags or "用餐" in class_tags):
+            raise ValueError(f"【主动分享】不能与【外出】或【用餐】叠加：{activity}")
+
     def _parse_busy_periods_from_schedule(self, schedule_text: str) -> list[BusyPeriod]:
         """Parse ranged activities and one final open-ended sleep entry."""
         schedule_text = self._normalize_schedule_text(schedule_text)
@@ -626,6 +663,8 @@ class ScheduleGenerator:
             r"^(\d{1,2}:\d{2})(?:\s*[-~到至]\s*(\d{1,2}:\d{2}))?\s+(.+)$"
         )
         sleep_pattern = re.compile(r"睡觉|入睡|就寝|睡眠|午睡|小睡")
+        # Wake keywords: first ordinary activity must use 醒来 if it's a wake-up
+        wake_keywords = re.compile(r"起床|醒来|睡醒|赖床|床上")
         periods = []
 
         for index, line in enumerate(lines):
@@ -637,6 +676,7 @@ class ScheduleGenerator:
             activity_text = match.group(3).strip()
             marker_match = re.search(r"\s*【(忙碌|可回消息)】$", activity_text)
             marker = marker_match.group(1) if marker_match else None
+            # activity retains classification tags (e.g. 【外出】) for Spark matching
             activity = (
                 activity_text[: marker_match.start()].strip()
                 if marker_match
@@ -659,6 +699,29 @@ class ScheduleGenerator:
             else:
                 is_sleep = False
 
+            # Validate classification tags (strip them to get pure description for
+            # sleep/wake keyword checks, but keep them in activity for Spark)
+            activity_desc = re.sub(
+                r"【(?:" + "|".join(_CLASSIFICATION_TAGS) + r")】", "", activity
+            ).strip()
+            if not is_sleep:
+                self._validate_classification_tags(activity)
+
+            # Open sleep: must use 睡觉 (not only 就寝/入睡) for stable Spark matching
+            if is_sleep and "睡觉" not in activity_desc:
+                raise ValueError(
+                    f"开放睡眠活动描述必须包含「睡觉」（当前：{activity_desc}）；"
+                    "统一使用「小怡睡觉」"
+                )
+
+            # First ordinary activity: if it's a wake-up, must contain 醒来
+            if index == 0 and not is_sleep and wake_keywords.search(activity_desc):
+                if "醒来" not in activity_desc:
+                    raise ValueError(
+                        f"首个起床活动必须包含「醒来」（当前：{activity_desc}）；"
+                        "统一使用「小怡醒来」"
+                    )
+
             is_busy = marker != "可回消息"
             if marker is None and not is_sleep:
                 non_busy_keywords = [
@@ -671,7 +734,7 @@ class ScheduleGenerator:
                     "看剧",
                     "玩",
                 ]
-                is_busy = not any(kw in activity for kw in non_busy_keywords)
+                is_busy = not any(kw in activity_desc for kw in non_busy_keywords)
 
             periods.append(
                 BusyPeriod(
@@ -751,13 +814,13 @@ class ScheduleGenerator:
         raise RuntimeError("LLM returned empty response after all call attempts")
 
     async def generate_schedule_or_wait(
-        self, target_date: date, umo: Optional[str] = None, extra: Optional[str] = None
+        self, target_date: date, umo: str | None = None, extra: str | None = None
     ) -> ScheduleData:
         """Generate a schedule while sharing an in-flight target transaction."""
         return await self.generate_schedule(target_date, umo, extra)
 
     async def generate_schedule(
-        self, target_date: date, umo: Optional[str] = None, extra: Optional[str] = None
+        self, target_date: date, umo: str | None = None, extra: str | None = None
     ) -> ScheduleData:
         """Generate schedule for a specific date."""
         if self._generating and self._generation_future:
@@ -838,13 +901,14 @@ class ScheduleGenerator:
                     "保留原有明确计划、穿搭和活动内容，只修复格式。\n"
                     "JSON 必须包含 outfit_style、outfit、schedule；hairstyle 可选。\n"
                     "schedule 的每个非空行只能是以下两种格式之一：\n"
-                    "1. 普通活动：HH:MM-HH:MM 活动描述 【忙碌/可回消息】；"
+                    "1. 普通活动：HH:MM-HH:MM 活动描述【分类标签…】【忙碌/可回消息】；"
                     "必须同时保留开始和结束时间\n"
-                    "2. 最后一行睡觉：HH:MM 睡觉 【忙碌】；"
+                    "2. 最后一行睡觉：HH:MM 小怡睡觉【忙碌】；"
                     "只有这一行可以省略结束时间\n"
                     "如果普通活动缺少结束时间，必须为它补上合理的结束时间，"
                     "不要通过修改【忙碌/可回消息】来规避错误。\n"
-                    "保留原有活动内容和明确计划，只调整不符合协议的格式。\n"
+                    + _DSL_TAG_PROTOCOL
+                    + "保留原有活动内容和明确计划，保留原有分类标签，只调整不符合协议的格式。\n"
                     "删除所有说明、标题、注释，包括任何“未标注时段”说明行。\n\n"
                     f"待修复输出：\n{content[:4000]}"
                 )

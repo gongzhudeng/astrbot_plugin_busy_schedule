@@ -63,8 +63,6 @@ class BusyPeriodManager:
         """Update the time of last user message."""
         self._last_user_message_time = datetime.now()
 
-
-
     def _can_enter_busy(self, now: datetime) -> bool:
         """Check if AI can enter busy state (chat protection)."""
         protect_minutes = self._config_value("chat_protect_minutes", 10)
@@ -120,9 +118,7 @@ class BusyPeriodManager:
             )
             return []
 
-    def get_current_busy_period(
-        self, now: datetime
-    ) -> Optional[ResolvedPeriod]:
+    def get_current_busy_period(self, now: datetime) -> Optional[ResolvedPeriod]:
         """Return the current busy period on the absolute timeline."""
         owner_date = self._get_schedule_owner_date(now)
         for cycle_date in (owner_date - timedelta(days=1), owner_date):
@@ -154,17 +150,13 @@ class BusyPeriodManager:
                 await self._enter_busy(current)
         elif current and self._is_busy:
             active_range = self._current_resolved_period
-            if (
-                not self._is_manual_period
-                and active_range != current
-            ):
+            if not self._is_manual_period and active_range != current:
                 self._current_busy_period = current.period
                 self._current_resolved_period = current
                 self._current_busy_owner_date = current.owner_date
                 self._current_busy_schedule_time = self._parse_schedule_time()
                 logger.info(
-                    f"[BusySchedule] Busy activity changed: "
-                    f"{current.period.activity}"
+                    f"[BusySchedule] Busy activity changed: {current.period.activity}"
                 )
         elif not current and self._is_busy:
             if (
@@ -198,9 +190,7 @@ class BusyPeriodManager:
                 start, end = raw_period.to_absolute_datetimes(
                     effective_owner, *self._parse_schedule_time()
                 )
-                resolved = ResolvedPeriod(
-                    effective_owner, raw_period, start, end
-                )
+                resolved = ResolvedPeriod(effective_owner, raw_period, start, end)
             except (TypeError, ValueError):
                 resolved = None
         self._is_busy = True
@@ -208,9 +198,7 @@ class BusyPeriodManager:
         self._current_resolved_period = resolved
         self._is_manual_period = not isinstance(period, ResolvedPeriod)
         self._current_busy_owner_date = (
-            resolved.owner_date
-            if resolved
-            else effective_owner
+            resolved.owner_date if resolved else effective_owner
         )
         self._current_busy_schedule_time = self._parse_schedule_time()
         self._busy_start_time = datetime.now()
@@ -222,7 +210,9 @@ class BusyPeriodManager:
     async def _exit_busy(self):
         """Exit busy state."""
         if self._current_busy_period:
-            logger.info(f"[BusySchedule] Exiting busy state: {self._current_busy_period.activity}")
+            logger.info(
+                f"[BusySchedule] Exiting busy state: {self._current_busy_period.activity}"
+            )
 
         self._is_busy = False
         exiting_period = self._current_busy_period
