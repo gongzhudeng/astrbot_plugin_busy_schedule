@@ -949,15 +949,8 @@ class BusySchedulePlugin(Star):
             return False
         timeline = self._get_resolved_timeline(active.owner_date)
         current = next((item for item in timeline if item.contains(now)), None)
-        if not current:
-            logger.warning(
-                "[BusySchedule] Media record ignored: current time is outside "
-                f"the resolved timeline (umo={umo}, now={now.isoformat()}, "
-                f"owner_date={active.owner_date.isoformat()})"
-            )
-            return False
         operation_id = operation_id or f"{umo}:{now.timestamp()}"
-        activity_key = f"{current.start.isoformat()}:{current.period.activity}"
+        activity_key = self._media_activity_key(active, current)
         committed = self.media_execution.record_success(
             active.owner_date, activity_key, operation_id, valid_types
         )
