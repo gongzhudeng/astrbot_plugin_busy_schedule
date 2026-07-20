@@ -230,6 +230,86 @@ class ScheduleData:
         return cls(**payload, busy_periods=busy_periods, weather=weather)
 
 
+@dataclass
+class MediaExecutionRecord:
+    """Idempotent successful media-send counters for one schedule cycle."""
+
+    owner_date: str = ""
+    activity_key: str = ""
+    current_counts: dict[str, int] = field(
+        default_factory=lambda: {"image": 0, "voice": 0}
+    )
+    cycle_counts: dict[str, int] = field(
+        default_factory=lambda: {"image": 0, "voice": 0}
+    )
+    committed_operation_ids: set[str] = field(default_factory=set)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "MediaExecutionRecord":
+        return cls(
+            owner_date=str(data.get("owner_date", "")),
+            activity_key=str(data.get("activity_key", "")),
+            current_counts={
+                "image": int(data.get("current_counts", {}).get("image", 0)),
+                "voice": int(data.get("current_counts", {}).get("voice", 0)),
+            },
+            cycle_counts={
+                "image": int(data.get("cycle_counts", {}).get("image", 0)),
+                "voice": int(data.get("cycle_counts", {}).get("voice", 0)),
+            },
+            committed_operation_ids=set(data.get("committed_operation_ids", [])),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "owner_date": self.owner_date,
+            "activity_key": self.activity_key,
+            "current_counts": dict(self.current_counts),
+            "cycle_counts": dict(self.cycle_counts),
+            "committed_operation_ids": sorted(self.committed_operation_ids),
+        }
+
+
+class MediaExecutionStore:
+    """Keep successful image/voice sends isolated by cycle and activity."""
+
+    def __init__(self, record: MediaExecutionRecord | None = None):
+        self.record = record or MediaExecutionRecord()
+
+    def sync(self, owner_date: date, activity_key: str) -> None:
+        owner = owner_date.isoformat()
+        if self.record.owner_date != owner:
+            self.record = MediaExecutionRecord(
+                owner_date=owner, activity_key=activity_key
+            )
+        elif self.record.activity_key != activity_key:
+            self.record.activity_key = activity_key
+            self.record.current_counts = {"image": 0, "voice": 0}
+            self.record.committed_operation_ids.clear()
+
+    def record_success(
+        self,
+        owner_date: date,
+        activity_key: str,
+        operation_id: str,
+        media_types: set[str],
+    ) -> bool:
+        self.sync(owner_date, activity_key)
+        if operation_id in self.record.committed_operation_ids:
+            return False
+        valid_types = media_types & {"image", "voice"}
+        if not valid_types:
+            return False
+        self.record.committed_operation_ids.add(operation_id)
+        for media_type in valid_types:
+            self.record.current_counts[media_type] += 1
+            self.record.cycle_counts[media_type] += 1
+        return True
+
+    def to_dict(self) -> dict:
+        return self.record.to_dict()
+
+
 class ScheduleDataManager:
     """Manages schedule data persistence."""
 

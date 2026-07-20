@@ -79,41 +79,78 @@ class PromptInjector:
     ) -> str:
         """Build dynamic injection for busy state (busy flag only).
 
-        Activity info is already in build_schedule_injection, so this only
-        carries the busy flag and changes per request while in busy mode.
+        Activity details live in their own independently managed prompt block.
         """
         return f"<character_busy>\n## 当前处于忙碌状态，正在{busy_period.activity}\n</character_busy>"
 
-    def build_schedule_injection(
+    def _get_activity_state(
+        self,
+        resolved_periods: list[ResolvedPeriod],
+        current_time: datetime | None = None,
+    ) -> tuple[ResolvedPeriod | None, ResolvedPeriod | None]:
+        """Resolve current and next periods from the absolute timeline."""
+        now = current_time or datetime.now()
+        current_period = next(
+            (item for item in resolved_periods if item.contains(now)), None
+        )
+        candidates = [item for item in resolved_periods if item.start > now]
+        next_period = (
+            min(candidates, key=lambda item: item.start) if candidates else None
+        )
+        return current_period, next_period
+
+    def build_activity_injection(
         self,
         data: ScheduleData,
         resolved_periods: list[ResolvedPeriod],
         current_time: datetime | None = None,
     ) -> str:
-        """Build current and next activity injection from one resolved timeline."""
+        """Build the dynamic current/next activity block only."""
         if not data or data.status != "completed":
             return ""
 
-        now = current_time or datetime.now()
-        current_activity = self._find_current_activity(resolved_periods, now)
-        candidates = [item for item in resolved_periods if item.start > now]
-        next_period = (
-            min(candidates, key=lambda item: item.start) if candidates else None
+        current_period, next_period = self._get_activity_state(
+            resolved_periods, current_time
         )
-
-        parts = [
-            "<character_schedule>",
-            f"## 当前活动：{current_activity}"
-            if current_activity
-            else "## 当前活动：自由时间",
-        ]
+        current_activity = current_period.period.activity if current_period else None
+        parts = ["<character_activity>"]
         if next_period:
             parts.append(
-                f"## 下一个活动：{next_period.period.activity}"
+                f"## 下一个活动（尚未开始）：{next_period.period.activity}"
                 f"（{next_period.start.strftime('%H:%M')}开始）"
             )
-        parts.append("</character_schedule>")
+        else:
+            parts.append("## 下一个活动（暂无）")
+        parts.append(
+            f"## 当前活动（正在进行）：{current_activity}"
+            if current_activity
+            else "## 当前活动（自由时间）：暂无已安排活动"
+        )
+        parts.append("</character_activity>")
         return "\n".join(parts)
+
+    def build_execution_injection(self, execution_record: dict | None = None) -> str:
+        """Build the dynamic media execution record block only."""
+        if not execution_record:
+            return ""
+
+        current_counts = execution_record.get("current_counts", {})
+        cycle_counts = execution_record.get("cycle_counts", {})
+        parts = ["<character_execution>"]
+        if self._cfg("current_activity_execution_record_enabled", True):
+            parts.append(
+                "## 当前活动执行记录："
+                f"拍照 {current_counts.get('image', 0)} 次，"
+                f"语音 {current_counts.get('voice', 0)} 次"
+            )
+        if self._cfg("cycle_media_execution_stats_enabled", False):
+            parts.append(
+                "## 本周期累计执行记录："
+                f"拍照 {cycle_counts.get('image', 0)} 次，"
+                f"语音 {cycle_counts.get('voice', 0)} 次"
+            )
+        parts.append("</character_execution>")
+        return "\n".join(parts) if len(parts) > 2 else ""
 
     def build_busy_exit_injection(
         self,

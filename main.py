@@ -21,6 +21,8 @@ from .core.data import (
     ActiveSchedule,
     BusyPeriod,
     ResolvedPeriod,
+    MediaExecutionRecord,
+    MediaExecutionStore,
     ScheduleDataManager,
     get_schedule_owner_date,
     parse_clock_time,
@@ -39,6 +41,25 @@ from .core.schedule_editor import (
     ScheduleEditor,
 )
 from .core.weather import WeatherService
+
+
+def _replace_prompt_block(
+    prompt: str,
+    marker: str,
+    end_marker: str,
+    content: str,
+) -> str:
+    """Replace, append, or remove one independently managed prompt block."""
+    if not content:
+        pattern = f"\\n*{re.escape(marker)}.*?{re.escape(end_marker)}\\n*"
+        return re.sub(pattern, "", prompt, flags=re.DOTALL)
+
+    block = f"{marker}\n{content}\n{end_marker}"
+    if marker not in prompt:
+        return f"{prompt}\n\n{block}"
+
+    pattern = f"{re.escape(marker)}.*?{re.escape(end_marker)}"
+    return re.sub(pattern, block, prompt, flags=re.DOTALL)
 
 
 @register(
@@ -94,6 +115,8 @@ class BusySchedulePlugin(Star):
         # Target umo for daily schedule generation (persisted across restarts)
         self._schedule_target_umo: Optional[str] = None
         self._state_file: Optional[Path] = None
+        self.media_execution = MediaExecutionStore()
+        self._media_operation_counter = 0
 
     async def initialize(self):
         """Initialize plugin and all modules."""
@@ -150,6 +173,7 @@ class BusySchedulePlugin(Star):
 
         self.context._busy_schedule_wake_and_flush = _wake_and_flush
         self.context._busy_schedule_get_timeline = self._export_timeline
+        self.context._busy_schedule_record_media_success = self.record_media_success
         logger.info(
             "[BusySchedule] Structured timeline interface registered "
             f"(owner_date={self._get_effective_date().isoformat()})"
@@ -364,14 +388,13 @@ class BusySchedulePlugin(Star):
             self.context._busy_schedule_today_schedule = data.schedule
             self.context._busy_schedule_outfit = data.outfit or ""
             current = self.injector._find_current_activity(timeline, now)
-            self.context._busy_schedule_current_activity = current or ""
+            self.context._busy_schedule_current_activity = (
+                f"{current}（正在进行）" if current else ""
+            )
             candidates = [item for item in timeline if item.start > now]
             if candidates:
                 resolved = min(candidates, key=lambda item: item.start)
-                self.context._busy_schedule_next_activity = (
-                    f"{resolved.period.activity}"
-                    f"（{resolved.start.strftime('%H:%M')}开始）"
-                )
+                self.context._busy_schedule_next_activity = f"{resolved.period.activity}（尚未开始，{resolved.start.strftime('%H:%M')}开始）"
             else:
                 self.context._busy_schedule_next_activity = ""
         else:
@@ -870,15 +893,71 @@ class BusySchedulePlugin(Star):
                     return True
         return False
 
+    def record_media_success(
+        self,
+        umo: str,
+        media_types: set[str],
+        operation_id: str | None = None,
+    ) -> bool:
+        """Commit one successful media operation for the current activity."""
+        now = datetime.now()
+        valid_types = media_types & {"image", "voice"}
+        if not valid_types:
+            logger.warning(
+                "[BusySchedule] Media record ignored: no valid media types "
+                f"(umo={umo}, media_types={media_types})"
+            )
+            return False
+
+        active = self._get_active_schedule(now)
+        if not active:
+            logger.warning(
+                "[BusySchedule] Media record ignored: no active completed schedule "
+                f"(umo={umo}, now={now.isoformat()})"
+            )
+            return False
+        timeline = self._get_resolved_timeline(active.owner_date)
+        current = next((item for item in timeline if item.contains(now)), None)
+        if not current:
+            logger.warning(
+                "[BusySchedule] Media record ignored: current time is outside "
+                f"the resolved timeline (umo={umo}, now={now.isoformat()}, "
+                f"owner_date={active.owner_date.isoformat()})"
+            )
+            return False
+        operation_id = operation_id or f"{umo}:{now.timestamp()}"
+        activity_key = f"{current.start.isoformat()}:{current.period.activity}"
+        committed = self.media_execution.record_success(
+            active.owner_date, activity_key, operation_id, valid_types
+        )
+        if committed:
+            self._save_state()
+            logger.info(
+                "[BusySchedule] Media record committed: "
+                f"owner_date={active.owner_date.isoformat()}, "
+                f"activity={activity_key}, types={sorted(valid_types)}, "
+                f"current_counts={self.media_execution.record.current_counts}, "
+                f"cycle_counts={self.media_execution.record.cycle_counts}"
+            )
+        else:
+            logger.debug(
+                "[BusySchedule] Media record ignored as duplicate: "
+                f"operation_id={operation_id}"
+            )
+        return committed
+
     def _load_state(self):
-        """Load persisted plugin state (e.g. schedule_target_umo)."""
+        """Load persisted schedule target and media execution state."""
         if not self._state_file or not self._state_file.exists():
             return
         try:
-            import json
-
             data = json.loads(self._state_file.read_text(encoding="utf-8"))
             self._schedule_target_umo = data.get("schedule_target_umo") or None
+            media_record = data.get("media_execution")
+            if isinstance(media_record, dict):
+                self.media_execution = MediaExecutionStore(
+                    MediaExecutionRecord.from_dict(media_record)
+                )
             if self._schedule_target_umo:
                 logger.info(
                     f"[BusySchedule] Loaded schedule_target_umo: {self._schedule_target_umo}"
@@ -887,13 +966,14 @@ class BusySchedulePlugin(Star):
             logger.warning(f"[BusySchedule] Failed to load plugin state: {e}")
 
     def _save_state(self):
-        """Persist plugin state to disk."""
+        """Persist schedule target and media execution state."""
         if not self._state_file:
             return
         try:
-            import json
-
-            data = {"schedule_target_umo": self._schedule_target_umo or ""}
+            data = {
+                "schedule_target_umo": self._schedule_target_umo or "",
+                "media_execution": self.media_execution.to_dict(),
+            }
             self._state_file.write_text(
                 json.dumps(data, ensure_ascii=False), encoding="utf-8"
             )
@@ -947,6 +1027,9 @@ class BusySchedulePlugin(Star):
         """处理收到的消息，并根据当前忙碌状态决定放行、排队或唤醒。"""
         if not self._get_config("enabled", True):
             return
+
+        # Media-producing plugins use this callback after their platform send succeeds.
+        event._busy_schedule_record_media_success = self.record_media_success
 
         # Skip events already processed by busy_schedule merge
         if event.get_extra("busy_schedule_merged", False):
@@ -1082,17 +1165,20 @@ class BusySchedulePlugin(Star):
             return
         data = active.data
         timeline = self._get_resolved_timeline(active.owner_date)
+        current_period = next((item for item in timeline if item.contains(now)), None)
+        if current_period:
+            activity_key = (
+                f"{current_period.start.isoformat()}:{current_period.period.activity}"
+            )
+            self.media_execution.sync(active.owner_date, activity_key)
 
-        # Part 1 + 2: static (outfit+schedule) + semi-static (current/next activity)
+        # Part 1 + 2: static, activity state, and execution records have separate lifetimes.
         static_injection = self.injector.build_static_injection(data)
-        schedule_injection = self.injector.build_schedule_injection(data, timeline, now)
+        activity_injection = self.injector.build_activity_injection(data, timeline, now)
+        execution_injection = self.injector.build_execution_injection(
+            self.media_execution.to_dict()
+        )
         custom_injection = self.injector.build_custom_injection()
-
-        cacheable_injection = static_injection
-        if custom_injection:
-            cacheable_injection += f"\n\n{custom_injection}"
-        if schedule_injection:
-            cacheable_injection += f"\n\n{schedule_injection}"
 
         # Part 3: busy flag (dynamic, only when busy)
         busy_injection = ""
@@ -1107,42 +1193,36 @@ class BusySchedulePlugin(Star):
         # Inject into system_prompt
         current_prompt = req.system_prompt or ""
 
-        # Markers
         cache_marker = "<!-- BUSY_SCHEDULE_CACHE -->"
         cache_end_marker = "<!-- /BUSY_SCHEDULE_CACHE -->"
+        custom_marker = "<!-- BUSY_SCHEDULE_CUSTOM -->"
+        custom_end_marker = "<!-- /BUSY_SCHEDULE_CUSTOM -->"
+        activity_marker = "<!-- BUSY_SCHEDULE_ACTIVITY -->"
+        activity_end_marker = "<!-- /BUSY_SCHEDULE_ACTIVITY -->"
+        execution_marker = "<!-- BUSY_SCHEDULE_EXECUTION -->"
+        execution_end_marker = "<!-- /BUSY_SCHEDULE_EXECUTION -->"
         busy_marker = "<!-- BUSY_SCHEDULE_BUSY -->"
         busy_end_marker = "<!-- /BUSY_SCHEDULE_BUSY -->"
 
-        # Part 1+2: insert after persona prompt (cache-friendly block)
-        if cache_marker in current_prompt:
-            pattern = f"{re.escape(cache_marker)}.*?{re.escape(cache_end_marker)}"
-            new_cache = f"{cache_marker}\n{cacheable_injection}\n{cache_end_marker}"
-            current_prompt = re.sub(pattern, new_cache, current_prompt, flags=re.DOTALL)
-        else:
-            # No persona end marker - append at end (persona is at the beginning)
-            # This ensures: persona → static → dynamic (at end)
-            logger.info("[BusySchedule] Appending cache block at end (after persona)")
-            current_prompt = f"{current_prompt}\n\n{cache_marker}\n{cacheable_injection}\n{cache_end_marker}"
-
-        # Part 3: busy flag (append at end, only when busy)
-        if busy_injection:
-            if busy_marker in current_prompt:
-                pattern = f"{re.escape(busy_marker)}.*?{re.escape(busy_end_marker)}"
-                new_busy = f"{busy_marker}\n{busy_injection}\n{busy_end_marker}"
-                current_prompt = re.sub(
-                    pattern, new_busy, current_prompt, flags=re.DOTALL
-                )
-            else:
-                current_prompt += (
-                    f"\n\n{busy_marker}\n{busy_injection}\n{busy_end_marker}"
-                )
-        else:
-            # Remove busy marker if no longer busy
-            if busy_marker in current_prompt:
-                pattern = (
-                    f"\n*\\s*{re.escape(busy_marker)}.*?{re.escape(busy_end_marker)}\n*"
-                )
-                current_prompt = re.sub(pattern, "", current_prompt, flags=re.DOTALL)
+        # Each block has its own cache lifetime.
+        current_prompt = _replace_prompt_block(
+            current_prompt, cache_marker, cache_end_marker, static_injection
+        )
+        current_prompt = _replace_prompt_block(
+            current_prompt, custom_marker, custom_end_marker, custom_injection
+        )
+        current_prompt = _replace_prompt_block(
+            current_prompt, activity_marker, activity_end_marker, activity_injection
+        )
+        current_prompt = _replace_prompt_block(
+            current_prompt,
+            execution_marker,
+            execution_end_marker,
+            execution_injection,
+        )
+        current_prompt = _replace_prompt_block(
+            current_prompt, busy_marker, busy_end_marker, busy_injection
+        )
 
         req.system_prompt = current_prompt
 
@@ -1606,8 +1686,11 @@ class BusySchedulePlugin(Star):
         # Part 1: static (outfit + schedule)
         static_text = self.injector.build_static_injection(data)
 
-        # Part 2: semi-static (current + next activity)
-        schedule_text = self.injector.build_schedule_injection(data, timeline, now)
+        # Part 2: activity and execution blocks have separate cache lifetimes.
+        activity_text = self.injector.build_activity_injection(data, timeline, now)
+        execution_text = self.injector.build_execution_injection(
+            self.media_execution.to_dict()
+        )
 
         # Part 3: busy flag (only when busy)
         busy_text = ""
@@ -1624,7 +1707,7 @@ class BusySchedulePlugin(Star):
             "=" * 30,
             "",
             "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-            "【缓存块 · 穿搭+日程+活动状态】",
+            "【缓存块 · 穿搭+天气+完整日程】",
             "📍 注入位置：system_prompt 中，人设之后",
             "━━━━━━━━━━━━━━━━━━━━━━━━━━",
             static_text if static_text else "（无内容 - 日程未生成）",
@@ -1645,7 +1728,19 @@ class BusySchedulePlugin(Star):
         parts.extend(
             [
                 "",
-                schedule_text if schedule_text else "（无活动状态）",
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                "【活动状态块】",
+                "📍 注入位置：system_prompt 中，自定义注入词之后",
+                "🔄 更新频率：当前活动或下一个活动切换时",
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                activity_text if activity_text else "（无活动状态）",
+                "",
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                "【执行记录块】",
+                "📍 注入位置：system_prompt 中，活动状态之后",
+                "🔄 更新频率：图片或语音实际发送成功时",
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                execution_text if execution_text else "（未启用执行记录）",
             ]
         )
 

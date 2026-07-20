@@ -39,6 +39,18 @@
         "hint": "这段内容会注入到 system_prompt 中插件日程信息的前面。可用于控制语言风格、行为习惯等。留空则不注入。",
         "type": "text",
         "default": ""
+      },
+      "current_activity_execution_record_enabled": {
+        "description": "启用当前活动拍照/语音执行记录",
+        "hint": "仅记录最终成功发送的拍照和语音；切换活动后自动清空当前活动记录。",
+        "type": "bool",
+        "default": true
+      },
+      "cycle_media_execution_stats_enabled": {
+        "description": "启用本周期拍照/语音累计统计",
+        "hint": "仅记录最终成功发送的拍照和语音；切换日程周期后自动清空。",
+        "type": "bool",
+        "default": false
       }
     }
   },
