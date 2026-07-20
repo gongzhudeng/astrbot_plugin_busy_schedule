@@ -376,6 +376,33 @@ class BusySchedulePlugin(Star):
             )
         return timeline
 
+    @staticmethod
+    def _media_activity_key(
+        active: ActiveSchedule, current_period: ResolvedPeriod | None
+    ) -> str:
+        """Return a stable execution scope for the current activity or free time."""
+        if current_period:
+            return (
+                f"{current_period.start.isoformat()}:{current_period.period.activity}"
+            )
+        return f"{active.owner_date.isoformat()}:free_time"
+
+    def _sync_media_execution(
+        self,
+        active: ActiveSchedule,
+        current_period: ResolvedPeriod | None,
+    ) -> None:
+        activity_key = self._media_activity_key(active, current_period)
+        previous_key = self.media_execution.record.activity_key
+        self.media_execution.sync(active.owner_date, activity_key)
+        if previous_key != activity_key:
+            self._save_state()
+            logger.info(
+                "[BusySchedule] Media execution scope changed: "
+                f"{previous_key or '(empty)'} -> {activity_key}; "
+                f"current_counts={self.media_execution.record.current_counts}"
+            )
+
     def _sync_schedule_to_context(self):
         """Sync active schedule data to context for downstream plugins."""
         custom_prompt = self._get_config("custom_prompt", "")
@@ -387,6 +414,10 @@ class BusySchedulePlugin(Star):
             timeline = self._get_resolved_timeline(active.owner_date)
             self.context._busy_schedule_today_schedule = data.schedule
             self.context._busy_schedule_outfit = data.outfit or ""
+            current_period = next(
+                (item for item in timeline if item.contains(now)), None
+            )
+            self._sync_media_execution(active, current_period)
             current = self.injector._find_current_activity(timeline, now)
             self.context._busy_schedule_current_activity = (
                 f"{current}（正在进行）" if current else ""
@@ -1166,11 +1197,7 @@ class BusySchedulePlugin(Star):
         data = active.data
         timeline = self._get_resolved_timeline(active.owner_date)
         current_period = next((item for item in timeline if item.contains(now)), None)
-        if current_period:
-            activity_key = (
-                f"{current_period.start.isoformat()}:{current_period.period.activity}"
-            )
-            self.media_execution.sync(active.owner_date, activity_key)
+        self._sync_media_execution(active, current_period)
 
         # Part 1 + 2: static, activity state, and execution records have separate lifetimes.
         static_injection = self.injector.build_static_injection(data)
@@ -1679,6 +1706,8 @@ class BusySchedulePlugin(Star):
             return
         data = active.data
         timeline = self._get_resolved_timeline(active.owner_date)
+        current_period = next((item for item in timeline if item.contains(now)), None)
+        self._sync_media_execution(active, current_period)
 
         # Part 0: custom user-defined injection
         custom_text = self.injector.build_custom_injection()
