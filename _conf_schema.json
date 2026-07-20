@@ -34,6 +34,16 @@
         "_special": "select_provider",
         "default": ""
       },
+      "llm_fallback_providers_schedule": {
+        "description": "日程生成回退模型列表",
+        "hint": "主模型连续调用失败或返回空内容时，按列表顺序逐个切换。可添加任意数量并上下调整顺序。",
+        "type": "list",
+        "items": {
+          "type": "string"
+        },
+        "_special": "select_providers",
+        "default": []
+      },
       "custom_prompt": {
         "description": "自定义注入提示词",
         "hint": "这段内容会注入到 system_prompt 中插件日程信息的前面。可用于控制语言风格、行为习惯等。留空则不注入。",

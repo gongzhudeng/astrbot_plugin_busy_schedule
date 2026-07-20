@@ -58,7 +58,7 @@ def _load_schema_defaults() -> dict:
         with open(schema_path, encoding="utf-8") as f:
             schema = json.load(f)
         defaults = {}
-        for group_name, group in schema.items():
+        for _group_name, group in schema.items():
             if not isinstance(group, dict):
                 continue
             items = group.get("items", {})
@@ -228,14 +228,61 @@ class ScheduleGenerator:
             return schema_default
         return default
 
-    def _get_provider(self):
-        """Get LLM provider for schedule generation."""
-        provider_id = self._cfg("llm_provider_schedule", "")
-        if provider_id:
-            provider = self.context.get_provider_by_id(provider_id)
-            if provider:
-                return provider
-        return self.context.get_using_provider()
+    @staticmethod
+    def _provider_id(provider: object) -> str:
+        config = getattr(provider, "provider_config", None)
+        if isinstance(config, dict) and config.get("id"):
+            return str(config["id"])
+        try:
+            return str(provider.meta().id)
+        except Exception:
+            return type(provider).__name__
+
+    def _get_providers(self) -> list[object]:
+        """Build the ordered provider chain for schedule generation."""
+        providers: list[object] = []
+        seen_ids: set[str] = set()
+
+        primary_id = str(self._cfg("llm_provider_schedule", "") or "").strip()
+        primary = (
+            self.context.get_provider_by_id(primary_id)
+            if primary_id
+            else self.context.get_using_provider()
+        )
+        if primary is None and primary_id:
+            logger.warning(
+                f"[BusySchedule] Schedule provider not found, using current provider: {primary_id}"
+            )
+            primary = self.context.get_using_provider()
+        if primary is not None:
+            resolved_id = self._provider_id(primary)
+            providers.append(primary)
+            seen_ids.add(resolved_id)
+
+        fallback_ids = self._cfg("llm_fallback_providers_schedule", [])
+        if not isinstance(fallback_ids, list):
+            logger.warning(
+                "[BusySchedule] Schedule fallback provider setting is not a list"
+            )
+            fallback_ids = []
+
+        for raw_id in fallback_ids:
+            fallback_id = str(raw_id or "").strip()
+            if not fallback_id or fallback_id in seen_ids:
+                continue
+            provider = self.context.get_provider_by_id(fallback_id)
+            if provider is None:
+                logger.warning(
+                    f"[BusySchedule] Schedule fallback provider not found, skipped: {fallback_id}"
+                )
+                continue
+            resolved_id = self._provider_id(provider)
+            if resolved_id in seen_ids:
+                continue
+            providers.append(provider)
+            seen_ids.add(resolved_id)
+
+        return providers
 
     async def _get_persona_desc(self, umo: str | None = None) -> str:
         """Get bot persona description for schedule generation.
@@ -785,33 +832,49 @@ class ScheduleGenerator:
             pass
 
     async def _call_llm(
-        self, prompt: str, provider, session_id: str, system_prompt: str = ""
-    ) -> str:
-        """Call LLM and retry only transport failures or empty responses."""
-        for attempt in range(self._LLM_CALL_ATTEMPTS):
-            try:
-                resp = await provider.text_chat(
-                    prompt=prompt,
-                    session_id=session_id,
-                    system_prompt=system_prompt or None,
-                )
-                text = _extract_completion_text(resp)
-                if text:
-                    return text
-                logger.warning(
-                    f"[BusySchedule] Empty LLM response "
-                    f"(attempt {attempt + 1}/{self._LLM_CALL_ATTEMPTS})"
-                )
-            except Exception as e:
-                logger.warning(
-                    f"[BusySchedule] LLM call failed "
-                    f"(attempt {attempt + 1}/{self._LLM_CALL_ATTEMPTS}): {e}"
-                )
-            finally:
-                await self._cleanup_session(session_id)
-                session_id = f"busy_schedule_{uuid.uuid4().hex[:8]}"
+        self,
+        prompt: str,
+        providers: list[object],
+        session_id: str,
+        system_prompt: str = "",
+    ) -> tuple[str, object]:
+        """Call each provider in order, retrying before switching."""
+        if not providers:
+            raise RuntimeError("No LLM provider available")
 
-        raise RuntimeError("LLM returned empty response after all call attempts")
+        last_error = "all providers returned empty responses"
+        for provider_index, provider in enumerate(providers):
+            provider_id = self._provider_id(provider)
+            if provider_index > 0:
+                logger.warning(
+                    f"[BusySchedule] Switching to schedule fallback provider: {provider_id}"
+                )
+            for attempt in range(self._LLM_CALL_ATTEMPTS):
+                try:
+                    resp = await provider.text_chat(
+                        prompt=prompt,
+                        session_id=session_id,
+                        system_prompt=system_prompt or None,
+                    )
+                    text = _extract_completion_text(resp)
+                    if text:
+                        return text, provider
+                    last_error = f"provider {provider_id} returned an empty response"
+                    logger.warning(
+                        f"[BusySchedule] Empty LLM response from {provider_id} "
+                        f"(attempt {attempt + 1}/{self._LLM_CALL_ATTEMPTS})"
+                    )
+                except Exception as exc:
+                    last_error = f"provider {provider_id} failed: {exc}"
+                    logger.warning(
+                        f"[BusySchedule] LLM call failed on {provider_id} "
+                        f"(attempt {attempt + 1}/{self._LLM_CALL_ATTEMPTS}): {exc}"
+                    )
+                finally:
+                    await self._cleanup_session(session_id)
+                    session_id = f"busy_schedule_{uuid.uuid4().hex[:8]}"
+
+        raise RuntimeError(f"All schedule LLM providers failed: {last_error}")
 
     async def generate_schedule_or_wait(
         self, target_date: date, umo: str | None = None, extra: str | None = None
@@ -848,15 +911,15 @@ class ScheduleGenerator:
                         f"[BusySchedule] Weather unavailable for generation: {exc}"
                     )
             prompt = await self._build_prompt(target_date, extra, umo, weather=weather)
-            provider = self._get_provider()
+            providers = self._get_providers()
 
-            if not provider:
+            if not providers:
                 raise RuntimeError("No LLM provider available")
 
             logger.info(f"[BusySchedule] Generating schedule for {target_date}")
 
             sid = f"busy_schedule_gen_{target_date.strftime('%Y%m%d')}_0"
-            content = await self._call_llm(prompt, provider, sid)
+            content, active_provider = await self._call_llm(prompt, providers, sid)
 
             result = _extract_json_obj(content)
             periods = []
@@ -917,7 +980,10 @@ class ScheduleGenerator:
                     f"busy_schedule_gen_{target_date.strftime('%Y%m%d')}"
                     f"_repair_{repair_attempt + 1}"
                 )
-                content = await self._call_llm(repair_prompt, provider, sid)
+                repair_providers = providers[providers.index(active_provider) :]
+                content, active_provider = await self._call_llm(
+                    repair_prompt, repair_providers, sid
+                )
                 result = _extract_json_obj(content)
 
             if not result or not result.get("schedule") or validation_error:
