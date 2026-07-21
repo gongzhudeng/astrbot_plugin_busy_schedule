@@ -12,11 +12,16 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.event.filter import EventMessageType
 from astrbot.api.star import Context, Star, register
+from astrbot.core.cron.events import CronMessageEvent
 from astrbot.core.message.components import Plain
 from astrbot.core.provider.entities import ProviderRequest
 from astrbot.core.star.star_tools import StarTools
 
 from .core.busy_manager import BusyPeriodManager
+from .core.chat_protection import (
+    is_natural_spark_proactive,
+    is_usable_assistant_response,
+)
 from .core.data import (
     ActiveSchedule,
     BusyPeriod,
@@ -34,6 +39,7 @@ from .core.generator import (
     DeterministicScheduleError,
     ScheduleGenerator,
 )
+from .core.message_input import is_slash_prefixed_message
 from .core.message_interceptor import MessageInterceptor
 from .core.prompt_injector import PromptInjector
 from .core.schedule_editor import (
@@ -41,6 +47,18 @@ from .core.schedule_editor import (
     ScheduleEditor,
 )
 from .core.weather import WeatherService
+
+
+def _is_slash_prefixed_input(event: AstrMessageEvent) -> bool:
+    """Return whether the first non-empty source text starts with a slash."""
+    marker = "_slash_prefixed_input"
+    cached = event.get_extra(marker, None)
+    if isinstance(cached, bool):
+        return cached
+
+    is_slash = is_slash_prefixed_message(event.get_messages())
+    event.set_extra(marker, is_slash)
+    return is_slash
 
 
 def _replace_prompt_block(
@@ -659,7 +677,6 @@ class BusySchedulePlugin(Star):
                 if not current_period:
                     return False
                 period = current_period
-                self.busy_mgr.update_last_message_time()
                 self._suppress_exit_delivery = True
                 try:
                     await self.busy_mgr.wake_up(reason)
@@ -1066,16 +1083,8 @@ class BusySchedulePlugin(Star):
         if not message_text:
             return
 
-        # Detect slash commands via raw message chain (AstrBot may strip "/" from message_str)
-        is_slash_command = False
-        if hasattr(event.message_obj, "message") and event.message_obj.message:
-            for seg in event.message_obj.message:
-                if hasattr(seg, "text") and seg.text.strip().startswith("/"):
-                    is_slash_command = True
-                    break
-
         # Slash commands are not real chat - skip interception and chat protection
-        if is_slash_command or message_text.startswith("/"):
+        if _is_slash_prefixed_input(event):
             return
 
         # Check for wake keywords first
@@ -1094,7 +1103,6 @@ class BusySchedulePlugin(Star):
                     event,
                     extra_components=extra_comps,
                 )
-                self.busy_mgr.update_last_message_time()
                 await self.busy_mgr.wake_up("keyword")
                 event.stop_event()
                 return
@@ -1161,8 +1169,40 @@ class BusySchedulePlugin(Star):
                     self._schedule_delivery(user_id, period, reason="max_count")
             return
 
-        # Not busy - update last message time for chat protection
-        self.busy_mgr.update_last_message_time()
+    @filter.on_agent_begin()
+    async def on_agent_begin(self, event: AstrMessageEvent, *_args):
+        """Guard busy entry while a normal conversational Agent is running."""
+        if not self._get_config("enabled", True):
+            return
+        if event.get_extra("spark_proactive_retrieval", False):
+            return
+        if isinstance(event, CronMessageEvent):
+            return
+        if _is_slash_prefixed_input(event):
+            return
+        token = id(event)
+        event.set_extra("busy_schedule_chat_agent", token)
+        self.busy_mgr.mark_reply_inflight(token)
+
+    @filter.on_llm_response()
+    async def on_llm_response(self, event: AstrMessageEvent, response):
+        """Refresh protection after a normal Agent returns usable assistant text."""
+        token = event.get_extra("busy_schedule_chat_agent", None)
+        if not isinstance(token, int):
+            return
+        if is_usable_assistant_response(response):
+            self.busy_mgr.record_chat_model_activity()
+            logger.debug(
+                "[BusySchedule] Chat protection refreshed by main Agent response"
+            )
+
+    @filter.on_agent_done()
+    async def on_agent_done(self, event: AstrMessageEvent, *_args):
+        """Always release the in-flight conversational reply guard."""
+        token = event.get_extra("busy_schedule_chat_agent", None)
+        if isinstance(token, int):
+            self.busy_mgr.clear_reply_inflight(token)
+            event.set_extra("busy_schedule_chat_agent", None)
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -1176,6 +1216,12 @@ class BusySchedulePlugin(Star):
         self._configure_schedule_edit_tool(req)
         if not self._get_config("enabled", True):
             return
+
+        if is_natural_spark_proactive(event):
+            self.busy_mgr.record_chat_model_activity()
+            logger.debug(
+                "[BusySchedule] Chat protection refreshed by Spark proactive request"
+            )
 
         # Record the umo for use in daily auto-generation
         umo = event.unified_msg_origin
@@ -1571,15 +1617,15 @@ class BusySchedulePlugin(Star):
             )
 
         # Chat protection status
-        if self.busy_mgr._last_user_message_time:
+        if self.busy_mgr._last_chat_model_activity_time:
             inactive_minutes = (
-                now - self.busy_mgr._last_user_message_time
+                now - self.busy_mgr._last_chat_model_activity_time
             ).total_seconds() / 60
             protect_minutes = self._get_config("chat_protect_minutes", 10)
             if inactive_minutes < protect_minutes:
                 remaining = protect_minutes - inactive_minutes
                 response_parts.append(
-                    f"\n🛡️ 聊天保护中：还需 {int(remaining)} 分钟无消息才能进入忙碌"
+                    f"\n🛡️ 聊天保护中：距最近对话模型活动还需 {int(remaining)} 分钟"
                 )
 
         # Message queue stats

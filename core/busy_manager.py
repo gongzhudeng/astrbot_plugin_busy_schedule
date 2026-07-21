@@ -31,7 +31,8 @@ class BusyPeriodManager:
         self._current_busy_schedule_time: Optional[tuple[int, int]] = None
         self._busy_start_time: Optional[datetime] = None
         self._wakeup_time: Optional[datetime] = None  # When AI was woken up by keyword
-        self._last_user_message_time: Optional[datetime] = None
+        self._last_chat_model_activity_time: Optional[datetime] = None
+        self._reply_inflight: dict[int, datetime] = {}
         self._last_adjust_time: Optional[datetime] = None
 
         # Callbacks
@@ -59,16 +60,39 @@ class BusyPeriodManager:
             return self._current_busy_period.activity
         return None
 
-    def update_last_message_time(self):
-        """Update the time of last user message."""
-        self._last_user_message_time = datetime.now()
+    def record_chat_model_activity(self):
+        """Record a qualifying conversational model activity."""
+        self._last_chat_model_activity_time = datetime.now()
+
+    def mark_reply_inflight(self, token: int, timeout_seconds: int = 300):
+        """Temporarily block busy entry while a conversational reply is running."""
+        self._reply_inflight[token] = datetime.now() + timedelta(
+            seconds=max(1, timeout_seconds)
+        )
+
+    def clear_reply_inflight(self, token: int):
+        """Clear one conversational reply guard."""
+        self._reply_inflight.pop(token, None)
+
+    def _has_reply_inflight(self, now: datetime) -> bool:
+        expired = [
+            token for token, deadline in self._reply_inflight.items() if deadline <= now
+        ]
+        for token in expired:
+            self._reply_inflight.pop(token, None)
+        return bool(self._reply_inflight)
 
     def _can_enter_busy(self, now: datetime) -> bool:
-        """Check if AI can enter busy state (chat protection)."""
+        """Check if AI can enter busy state after conversational activity."""
+        if self._has_reply_inflight(now):
+            return False
+
         protect_minutes = self._config_value("chat_protect_minutes", 10)
 
-        if self._last_user_message_time:
-            inactive_minutes = (now - self._last_user_message_time).total_seconds() / 60
+        if self._last_chat_model_activity_time:
+            inactive_minutes = (
+                now - self._last_chat_model_activity_time
+            ).total_seconds() / 60
             return inactive_minutes >= protect_minutes
 
         return True

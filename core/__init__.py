@@ -1,13 +1,21 @@
-from .data import ScheduleDataManager
-from .generator import ScheduleGenerator
-from .busy_manager import BusyPeriodManager
-from .message_interceptor import MessageInterceptor
-from .prompt_injector import PromptInjector
+from importlib import import_module
 
-__all__ = [
-    "ScheduleDataManager",
-    "ScheduleGenerator",
-    "BusyPeriodManager",
-    "MessageInterceptor",
-    "PromptInjector",
-]
+_EXPORTS = {
+    "ScheduleDataManager": (".data", "ScheduleDataManager"),
+    "ScheduleGenerator": (".generator", "ScheduleGenerator"),
+    "BusyPeriodManager": (".busy_manager", "BusyPeriodManager"),
+    "MessageInterceptor": (".message_interceptor", "MessageInterceptor"),
+    "PromptInjector": (".prompt_injector", "PromptInjector"),
+}
+
+__all__ = list(_EXPORTS)
+
+
+def __getattr__(name: str):
+    try:
+        module_name, attribute_name = _EXPORTS[name]
+    except KeyError as exc:
+        raise AttributeError(name) from exc
+    value = getattr(import_module(module_name, __name__), attribute_name)
+    globals()[name] = value
+    return value
