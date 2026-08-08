@@ -284,6 +284,18 @@ class ScheduleGenerator:
 
         return providers
 
+    def _persona_max_chars(self) -> int:
+        """Return the configured persona budget, preserving short personas in full."""
+        try:
+            return max(0, int(self._cfg("persona_max_chars", 4000)))
+        except (TypeError, ValueError):
+            return 4000
+
+    def _truncate_persona(self, value: object) -> str:
+        text = str(value or "")
+        limit = self._persona_max_chars()
+        return text if limit == 0 else text[:limit]
+
     async def _get_persona_desc(self, umo: str | None = None) -> str:
         """Get bot persona description for schedule generation.
 
@@ -312,19 +324,15 @@ class ScheduleGenerator:
                 if persona_mgr:
                     for persona in persona_mgr.personas:
                         if persona.persona_id == persona_id:
-                            return (
-                                persona.system_prompt[:500]
-                                if persona.system_prompt
-                                else ""
-                            )
+                            return self._truncate_persona(persona.system_prompt)
 
             # 3. System default persona via persona_manager
             try:
                 p = await self.context.persona_manager.get_default_persona_v3()
                 if isinstance(p, dict) and p.get("prompt"):
-                    return p["prompt"][:500]
+                    return self._truncate_persona(p["prompt"])
                 if hasattr(p, "prompt") and p.prompt:
-                    return p.prompt[:500]
+                    return self._truncate_persona(p.prompt)
             except Exception:
                 pass
 
@@ -333,26 +341,236 @@ class ScheduleGenerator:
         except Exception:
             return "一个活泼可爱的AI助手"
 
-    def _get_history_schedules(self, target_date: date, days: int = 3) -> str:
-        """Get recent history schedules for reference."""
+    @staticmethod
+    def _clean_pool(values: object) -> list[str]:
+        """Return unique non-empty pool values while preserving config order."""
+        if not isinstance(values, (list, tuple)):
+            return []
+        cleaned = []
+        seen = set()
+        for value in values:
+            item = str(value or "").strip()
+            if item and item not in seen:
+                seen.add(item)
+                cleaned.append(item)
+        return cleaned
+
+    def _select_pool_value(
+        self,
+        values: object,
+        previous: str,
+        fallback: str,
+        pool_name: str,
+    ) -> str:
+        """Select a pool value while avoiding yesterday when possible."""
+        candidates = self._clean_pool(values)
+        if not candidates:
+            return fallback
+
+        available = [item for item in candidates if item != previous]
+        if available:
+            return random.choice(available)
+
+        logger.warning(
+            f"[BusySchedule] Pool {pool_name!r} has no value other than yesterday; "
+            "allowing the configured value"
+        )
+        return random.choice(candidates)
+
+    def _select_creative_context(self, target_date: date) -> dict[str, str]:
+        """Select all creative values once for prompt and persistence."""
+        pool = self._cfg("pool", {})
+        pool = pool if isinstance(pool, dict) else {}
+        previous = self.data_mgr.get(target_date - timedelta(days=1))
+        previous_values = {
+            "daily_theme": getattr(previous, "daily_theme", "") if previous else "",
+            "mood_color": getattr(previous, "mood_color", "") if previous else "",
+            "outfit_style": previous.outfit_style if previous else "",
+            "schedule_type": getattr(previous, "schedule_type", "") if previous else "",
+        }
+        return {
+            "daily_theme": self._select_pool_value(
+                pool.get("daily_themes"),
+                previous_values["daily_theme"],
+                "随性日",
+                "daily_themes",
+            ),
+            "mood_color": self._select_pool_value(
+                pool.get("mood_colors"),
+                previous_values["mood_color"],
+                "随性",
+                "mood_colors",
+            ),
+            "outfit_style": self._select_pool_value(
+                pool.get("outfit_styles"),
+                previous_values["outfit_style"],
+                "休闲风",
+                "outfit_styles",
+            ),
+            "schedule_type": self._select_pool_value(
+                pool.get("schedule_types"),
+                previous_values["schedule_type"],
+                "随性漫游型",
+                "schedule_types",
+            ),
+        }
+
+    @staticmethod
+    def _history_activity_lines(data: ScheduleData) -> list[str]:
+        """Return usable full-day activity lines from structured or legacy data."""
+        if data.busy_periods:
+            lines = []
+            for period in data.busy_periods:
+                end = f"-{period.end_time}" if period.end_time else ""
+                lines.append(f"{period.start_time}{end} {period.activity}".strip())
+            return lines
+        return [line.strip() for line in data.schedule.splitlines() if line.strip()]
+
+    @staticmethod
+    def _history_activity_duration_minutes(data: ScheduleData, index: int) -> int:
+        """Return a structured activity duration for history prioritization."""
+        if index >= len(data.busy_periods):
+            return 0
+        period = data.busy_periods[index]
+        if not period.end_time:
+            return 0
+        try:
+            start_hour, start_minute = map(int, period.start_time.split(":", 1))
+            end_hour, end_minute = map(int, period.end_time.split(":", 1))
+            start = start_hour * 60 + start_minute
+            end = end_hour * 60 + end_minute
+            if end <= start:
+                end += 24 * 60
+            return end - start
+        except (TypeError, ValueError):
+            return 0
+
+    def _history_activity_score(
+        self, data: ScheduleData, index: int
+    ) -> tuple[int, int]:
+        """Rank notable and long activities before using timeline sampling."""
+        line = self._history_activity_lines(data)[index]
+        notable_words = (
+            "【外出】",
+            "【用餐】",
+            "【主动分享】",
+            "外出",
+            "用餐",
+            "外卖",
+            "早餐",
+            "午餐",
+            "晚餐",
+            "电影",
+            "游戏",
+            "分享",
+        )
+        notable = int(any(word in line for word in notable_words))
+        duration = self._history_activity_duration_minutes(data, index)
+        return notable, duration
+
+    def _summarize_history_day(self, data: ScheduleData) -> str:
+        """Summarize representative activities across one whole schedule day."""
+        lines = self._history_activity_lines(data)
+        if not lines:
+            return ""
+
+        max_items = min(8, len(lines))
+        selected_indexes = {0, len(lines) - 1}
+        interior_count = max(0, len(lines) - 2)
+
+        # Pick the strongest activity from each third so morning, afternoon, and
+        # evening remain visible even when the first part has many key words.
+        bucket_count = min(3, interior_count)
+        for bucket in range(bucket_count):
+            start = 1 + (bucket * interior_count) // bucket_count
+            stop = 1 + ((bucket + 1) * interior_count) // bucket_count
+            candidates = [
+                index for index in range(start, stop) if index not in selected_indexes
+            ]
+            if candidates:
+                selected_indexes.add(
+                    max(
+                        candidates,
+                        key=lambda index: (
+                            self._history_activity_score(data, index),
+                            -index,
+                        ),
+                    )
+                )
+
+        # Fill remaining slots with evenly spaced activities. This is the fallback
+        # for legacy schedules and prevents summaries from collapsing to the prefix.
+        remaining = max_items - len(selected_indexes)
+        for slot in range(1, remaining + 1):
+            candidates = [
+                index
+                for index in range(1, len(lines) - 1)
+                if index not in selected_indexes
+            ]
+            if not candidates:
+                break
+            ideal = round(slot * (len(lines) - 1) / (remaining + 1))
+            selected_indexes.add(
+                min(
+                    candidates,
+                    key=lambda index: (
+                        abs(index - ideal),
+                        -self._history_activity_score(data, index)[0],
+                        index,
+                    ),
+                )
+            )
+
+        indexes = sorted(selected_indexes)
+        item_limit = 72
+        summary_lines = [lines[index][:item_limit] for index in indexes]
+        summary = "；".join(summary_lines)
+        try:
+            daily_limit = max(0, int(self._cfg("history_day_max_chars", 420)))
+        except (TypeError, ValueError):
+            daily_limit = 420
+        return summary if daily_limit == 0 else summary[:daily_limit]
+
+    def _get_history_schedules(self, target_date: date, days: int | None = None) -> str:
+        """Get bounded, all-day history summaries for reference."""
+        if days is None:
+            try:
+                days = max(1, int(self._cfg("reference_history_days", 3)))
+            except (TypeError, ValueError):
+                days = 3
+
         history = []
         for i in range(1, days + 1):
             past_date = target_date - timedelta(days=i)
             data = self.data_mgr.get(past_date)
             if not data or not data.schedule:
                 continue
+            summary = self._summarize_history_day(data)
+            if not summary:
+                continue
+            metadata = [
+                f"主题：{data.daily_theme}" if data.daily_theme else "",
+                f"心情色彩：{data.mood_color}" if data.mood_color else "",
+                f"类型：{data.schedule_type}" if data.schedule_type else "",
+            ]
+            metadata_text = " ".join(item for item in metadata if item)
             style = (data.outfit_style or "").strip()
             outfit = data.outfit[:40] if data.outfit else ""
-            schedule = data.schedule[:60]
+            prefix = f"[{past_date:%Y-%m-%d}]"
             if style:
-                history.append(
-                    f"[{past_date.strftime('%Y-%m-%d')}] 风格：{style} 穿搭：{outfit} 日程：{schedule}"
-                )
-            else:
-                history.append(
-                    f"[{past_date.strftime('%Y-%m-%d')}] 穿搭：{outfit} 日程：{schedule}"
-                )
-        return "\n".join(history) if history else "无历史日程"
+                prefix += f" 风格：{style}"
+            if metadata_text:
+                prefix += f" {metadata_text}"
+            history.append(f"{prefix} 穿搭：{outfit} 日程：{summary}")
+
+        if not history:
+            return "无历史日程"
+        try:
+            total_limit = max(0, int(self._cfg("history_total_max_chars", 1800)))
+        except (TypeError, ValueError):
+            total_limit = 1800
+        result = "\n".join(history)
+        return result if total_limit == 0 else result[:total_limit]
 
     def _get_yesterday_last_activity(self, target_date: date) -> str:
         """Get the last activity entry from yesterday's schedule.
@@ -594,12 +812,27 @@ class ScheduleGenerator:
             logger.warning(f"[BusySchedule] _get_rag_context failed: {e}")
             return ""
 
+    async def _get_emotion_context(
+        self, umo: str | None = None, target_date: date | None = None
+    ) -> str:
+        """Read settled mood context without coupling to Emotion storage."""
+        callback = getattr(self.context, "_emotion_state_schedule_context", None)
+        if not callable(callback) or not umo:
+            return "暂无已结算心情参考。"
+        try:
+            result = await callback(umo, target_date)
+            return str(result or "暂无已结算心情参考。").strip()
+        except Exception as exc:
+            logger.warning(f"[BusySchedule] Emotion context unavailable: {exc}")
+            return "暂无已结算心情参考。"
+
     async def _build_prompt(
         self,
         target_date: date,
         extra: str | None = None,
         umo: str | None = None,
         weather: WeatherSnapshot | None = None,
+        creative_context: dict[str, str] | None = None,
     ) -> str:
         """Build the prompt for schedule generation.
 
@@ -609,23 +842,22 @@ class ScheduleGenerator:
         if not template:
             raise RuntimeError("prompt_template is empty")
 
-        pool = self._cfg("pool", {})
-        daily_themes = pool.get("daily_themes", [])
-        mood_colors = pool.get("mood_colors", [])
-        outfit_styles = pool.get("outfit_styles", [])
-        schedule_types = pool.get("schedule_types", [])
+        creative = creative_context or self._select_creative_context(target_date)
+        settled_emotion = await self._get_emotion_context(umo, target_date)
+        emotion_context = settled_emotion
+        if "{mood_color}" not in template:
+            emotion_context = (
+                f"随机心情色彩：{creative['mood_color']}\n"
+                f"内心世界已结算参考：{settled_emotion}"
+            )
 
         ctx = {
             "date_str": target_date.strftime("%Y年%m月%d日"),
             "weekday": get_weekday_cn(target_date),
             "holiday": get_holiday(target_date) or "普通日子",
             "persona_desc": await self._get_persona_desc(umo),
-            "daily_theme": random.choice(daily_themes) if daily_themes else "随性日",
-            "mood_color": random.choice(mood_colors) if mood_colors else "随性",
-            "outfit_style": random.choice(outfit_styles) if outfit_styles else "休闲风",
-            "schedule_type": random.choice(schedule_types)
-            if schedule_types
-            else "随性漫游型",
+            "emotion_context": emotion_context,
+            **creative,
             "history_schedules": self._get_history_schedules(target_date),
             "last_yesterday_activity": self._get_yesterday_last_activity(target_date),
             "recent_chats": await self._get_recent_chats(umo),
@@ -899,6 +1131,7 @@ class ScheduleGenerator:
         self._generation_future = asyncio.get_running_loop().create_future()
         try:
             schedule_time = parse_schedule_time(self._cfg("schedule_time", "07:00"))
+            creative_context = self._select_creative_context(target_date)
             weather = None
             weather_service = getattr(self, "weather_service", None)
             if weather_service:
@@ -910,7 +1143,13 @@ class ScheduleGenerator:
                     logger.warning(
                         f"[BusySchedule] Weather unavailable for generation: {exc}"
                     )
-            prompt = await self._build_prompt(target_date, extra, umo, weather=weather)
+            prompt = await self._build_prompt(
+                target_date,
+                extra,
+                umo,
+                weather=weather,
+                creative_context=creative_context,
+            )
             providers = self._get_providers()
 
             if not providers:
@@ -994,9 +1233,19 @@ class ScheduleGenerator:
                 )
 
             # Commit only after the complete result has passed validation.
+            returned_style = str(result.get("outfit_style", "")).strip()
+            selected_style = creative_context["outfit_style"]
+            if returned_style and returned_style != selected_style:
+                logger.warning(
+                    f"[BusySchedule] Model returned outfit_style {returned_style!r}; "
+                    f"using selected style {selected_style!r}"
+                )
             data = ScheduleData(
                 date=target_date.strftime("%Y-%m-%d"),
-                outfit_style=result.get("outfit_style", ""),
+                outfit_style=selected_style,
+                daily_theme=creative_context["daily_theme"],
+                mood_color=creative_context["mood_color"],
+                schedule_type=creative_context["schedule_type"],
                 outfit=result.get("outfit", ""),
                 hairstyle=result.get("hairstyle", ""),
                 schedule=result.get("schedule", ""),

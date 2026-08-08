@@ -25,9 +25,9 @@ from .core.chat_protection import (
 from .core.data import (
     ActiveSchedule,
     BusyPeriod,
-    ResolvedPeriod,
     MediaExecutionRecord,
     MediaExecutionStore,
+    ResolvedPeriod,
     ScheduleDataManager,
     get_schedule_owner_date,
     parse_clock_time,
@@ -42,6 +42,7 @@ from .core.generator import (
 from .core.message_input import is_slash_prefixed_message
 from .core.message_interceptor import MessageInterceptor
 from .core.prompt_injector import PromptInjector
+from .core.request_content import replace_temp_user_content
 from .core.schedule_editor import (
     ScheduleEditError,
     ScheduleEditor,
@@ -80,11 +81,32 @@ def _replace_prompt_block(
     return re.sub(pattern, block, prompt, flags=re.DOTALL)
 
 
+def _position_emotion_anchor(prompt: str, cache_end_marker: str) -> str:
+    """Keep the optional emotion block directly after the daily static block."""
+    anchor = "<!-- EMOTION_STATE_ANCHOR -->"
+    emotion_start = "<!-- EMOTION_STATE_BEGIN -->"
+    emotion_end = "<!-- /EMOTION_STATE_END -->"
+    emotion_pattern = f"{re.escape(emotion_start)}.*?{re.escape(emotion_end)}"
+    match = re.search(emotion_pattern, prompt, flags=re.DOTALL)
+    emotion_block = match.group(0) if match else ""
+    cleaned = re.sub(
+        f"(?:\r?\n)*{emotion_pattern}(?:\r?\n)*",
+        "\n\n",
+        prompt,
+        flags=re.DOTALL,
+    )
+    cleaned = re.sub(f"(?:\r?\n)*{re.escape(anchor)}(?:\r?\n)*", "\n\n", cleaned)
+    insertion = f"{cache_end_marker}\n{anchor}"
+    if emotion_block:
+        insertion = f"{insertion}\n{emotion_block}"
+    return cleaned.replace(cache_end_marker, insertion, 1)
+
+
 @register(
     "astrbot_plugin_busy_schedule",
     "灵犀 · AI忙碌时段管理",
     "让AI拥有真实的生活节奏！自动计算忙碌时段、智能拦截合并消息、特殊关键词唤醒",
-    "v1.3.6",
+    "v2.7.0",
     "https://github.com/gongzhudeng/astrbot_plugin_busy_schedule",
 )
 class BusySchedulePlugin(Star):
@@ -191,6 +213,7 @@ class BusySchedulePlugin(Star):
 
         self.context._busy_schedule_wake_and_flush = _wake_and_flush
         self.context._busy_schedule_get_timeline = self._export_timeline
+        self.context._busy_schedule_get_facts = self._export_facts
         self.context._busy_schedule_record_media_success = self.record_media_success
         logger.info(
             "[BusySchedule] Structured timeline interface registered "
@@ -237,11 +260,14 @@ class BusySchedulePlugin(Star):
             self._busy_poll_task.cancel()
         self._busy_poll_task = None
 
-        if (
-            getattr(self.context, "_busy_schedule_get_timeline", None)
-            == self._export_timeline
-        ):
-            delattr(self.context, "_busy_schedule_get_timeline")
+        exported_callbacks = {
+            "_busy_schedule_get_timeline": self._export_timeline,
+            "_busy_schedule_get_facts": self._export_facts,
+            "_busy_schedule_record_media_success": self.record_media_success,
+        }
+        for name, callback in exported_callbacks.items():
+            if getattr(self.context, name, None) == callback:
+                delattr(self.context, name)
 
         logger.info("[BusySchedule] Plugin terminated")
 
@@ -393,6 +419,33 @@ class BusySchedulePlugin(Star):
                 }
             )
         return timeline
+
+    def _export_facts(self, now: Optional[datetime] = None) -> dict:
+        """Expose schedule and activity facts without deriving emotional state."""
+        current_time = now or datetime.now()
+        active = self._get_active_schedule(current_time)
+        if not active:
+            return {
+                "owner_date": "",
+                "current_activity": "",
+                "next_activity": "",
+                "is_busy": False,
+                "is_sleeping": False,
+                "weather": "",
+                "timeline": [],
+            }
+        resolved = self._get_resolved_timeline(active.owner_date)
+        current, next_period = self.injector._get_activity_state(resolved, current_time)
+        weather = getattr(active.data, "weather", None)
+        return {
+            "owner_date": active.owner_date.isoformat(),
+            "current_activity": current.period.activity if current else "",
+            "next_activity": next_period.period.activity if next_period else "",
+            "is_busy": bool(self.busy_mgr and self.busy_mgr.is_busy),
+            "is_sleeping": bool(current and current.period.is_sleep),
+            "weather": weather.format_summary() if weather else "",
+            "timeline": self._export_timeline(active.owner_date),
+        }
 
     @staticmethod
     def _media_activity_key(
@@ -817,7 +870,8 @@ class BusySchedulePlugin(Star):
             period.end_time or datetime.now().strftime("%H:%M"),
         )
 
-        if not merged_text:
+        user_message = self.interceptor.get_merged_user_message(user_id)
+        if not merged_text or not user_message:
             return False
 
         extra_components = self.interceptor.get_extra_components(user_id)
@@ -833,13 +887,13 @@ class BusySchedulePlugin(Star):
         # Use the last event as template
         last_event = events[-1]
 
-        # Prepend wake_prefix so WakingCheckStage re-evaluates is_wake=True
-        # (it ignores pre-set is_wake and recalculates from scratch each time)
+        # Build a clean event with the newest queued message as the real user input.
+        # The merged explanation is attached later as provider-only user content.
+        last_message = user_message
         wake_prefixes = self.context.get_config().get("wake_prefix", ["/"])
         wake_prefix = wake_prefixes[0] if wake_prefixes else "/"
-        prefixed_text = wake_prefix + merged_text
+        prefixed_text = wake_prefix + last_message
 
-        # Build a clean event instead of reusing or deep-copying a stopped one
         reinjected_message = last_event.message_obj.__class__()
         reinjected_message.__dict__.update(last_event.message_obj.__dict__)
         reinjected_message.type = last_event.get_message_type()
@@ -887,8 +941,8 @@ class BusySchedulePlugin(Star):
         reinjected_event._temporary_local_files = []
         reinjected_event.platform = last_event.platform_meta
 
-        # Mark as busy_schedule merged to prevent re-interception
         reinjected_event.set_extra("busy_schedule_merged", True)
+        reinjected_event.set_extra("busy_schedule_temp_user_content", merged_text)
         # Also mark as chat_merger merged so chat_merger does not re-intercept
         reinjected_event.set_extra("chat_merger_merged", True)
 
@@ -1213,6 +1267,7 @@ class BusySchedulePlugin(Star):
         2. 当前与下一活动只在日程推进时变化。
         3. 忙碌状态仅在忙碌期间动态附加。
         """
+        replace_temp_user_content(req)
         self._configure_schedule_edit_tool(req)
         if not self._get_config("enabled", True):
             return
@@ -1238,15 +1293,16 @@ class BusySchedulePlugin(Star):
         current_period = next((item for item in timeline if item.contains(now)), None)
         self._sync_media_execution(active, current_period)
 
-        # Part 1 + 2: static, activity state, and execution records have separate lifetimes.
+        # Stable daily content stays in the system prefix. Volatile state and wake
+        # explanations are appended as one provider-only user tail in fixed order.
         static_injection = self.injector.build_static_injection(data)
+        schedule_injection = self.injector.build_schedule_injection(data)
         activity_injection = self.injector.build_activity_injection(data, timeline, now)
         execution_injection = self.injector.build_execution_injection(
             self.media_execution.to_dict()
         )
         custom_injection = self.injector.build_custom_injection()
 
-        # Part 3: busy flag (dynamic, only when busy)
         busy_injection = ""
         if self.busy_mgr.is_busy and self.busy_mgr.current_activity:
             period = BusyPeriod(
@@ -1256,9 +1312,7 @@ class BusySchedulePlugin(Star):
             )
             busy_injection = self.injector.build_busy_state_injection(period)
 
-        # Inject into system_prompt
         current_prompt = req.system_prompt or ""
-
         cache_marker = "<!-- BUSY_SCHEDULE_CACHE -->"
         cache_end_marker = "<!-- /BUSY_SCHEDULE_CACHE -->"
         custom_marker = "<!-- BUSY_SCHEDULE_CUSTOM -->"
@@ -1270,27 +1324,31 @@ class BusySchedulePlugin(Star):
         busy_marker = "<!-- BUSY_SCHEDULE_BUSY -->"
         busy_end_marker = "<!-- /BUSY_SCHEDULE_BUSY -->"
 
-        # Each block has its own cache lifetime.
         current_prompt = _replace_prompt_block(
             current_prompt, cache_marker, cache_end_marker, static_injection
         )
-        current_prompt = _replace_prompt_block(
-            current_prompt, custom_marker, custom_end_marker, custom_injection
-        )
-        current_prompt = _replace_prompt_block(
-            current_prompt, activity_marker, activity_end_marker, activity_injection
-        )
-        current_prompt = _replace_prompt_block(
-            current_prompt,
-            execution_marker,
-            execution_end_marker,
-            execution_injection,
-        )
-        current_prompt = _replace_prompt_block(
-            current_prompt, busy_marker, busy_end_marker, busy_injection
-        )
-
+        current_prompt = _position_emotion_anchor(current_prompt, cache_end_marker)
+        for marker, end_marker in (
+            (custom_marker, custom_end_marker),
+            (activity_marker, activity_end_marker),
+            (execution_marker, execution_end_marker),
+            (busy_marker, busy_end_marker),
+        ):
+            current_prompt = _replace_prompt_block(
+                current_prompt, marker, end_marker, ""
+            )
         req.system_prompt = current_prompt
+
+        wake_content = event.get_extra("busy_schedule_temp_user_content", "")
+        replace_temp_user_content(
+            req,
+            schedule_injection,
+            custom_injection,
+            activity_injection,
+            execution_injection,
+            busy_injection,
+            wake_content,
+        )
 
     async def _refresh_after_schedule_edit(self) -> None:
         """Synchronize prompt context and busy state after an atomic edit."""
@@ -1751,10 +1809,11 @@ class BusySchedulePlugin(Star):
         # Part 0: custom user-defined injection
         custom_text = self.injector.build_custom_injection()
 
-        # Part 1: static (outfit + schedule)
+        # Part 1: stable outfit and weather block.
         static_text = self.injector.build_static_injection(data)
+        schedule_text = self.injector.build_schedule_injection(data)
 
-        # Part 2: activity and execution blocks have separate cache lifetimes.
+        # Part 2: volatile blocks share the temporary user-content tail.
         activity_text = self.injector.build_activity_injection(data, timeline, now)
         execution_text = self.injector.build_execution_injection(
             self.media_execution.to_dict()
@@ -1775,55 +1834,31 @@ class BusySchedulePlugin(Star):
             "=" * 30,
             "",
             "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-            "【缓存块 · 穿搭+天气+完整日程】",
+            "【稳定块 · 穿搭+天气】",
             "📍 注入位置：system_prompt 中，人设之后",
             "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-            static_text if static_text else "（无内容 - 日程未生成）",
+            static_text if static_text else "（无稳定内容）",
+            "",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            "【临时用户内容尾部 · 固定顺序】",
+            "📍 注入位置：当前 user 内容末尾，不写入 system_prompt",
+            "🔄 本次请求可见，后续历史不保存",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            "[日程]",
+            schedule_text if schedule_text else "（无日程内容）",
+            "",
+            "[自定义注入]",
+            custom_text if custom_text else "（无自定义内容）",
+            "",
+            "[活动状态]",
+            activity_text if activity_text else "（无活动状态）",
+            "",
+            "[执行记录]",
+            execution_text if execution_text else "（未启用执行记录）",
+            "",
+            "[忙碌状态]",
+            busy_text if busy_text else "（当前不忙碌）",
         ]
-
-        if custom_text:
-            parts.extend(
-                [
-                    "",
-                    "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-                    "【自定义注入词】",
-                    "📍 注入位置：日程安排之后，当前活动之前",
-                    "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-                    custom_text,
-                ]
-            )
-
-        parts.extend(
-            [
-                "",
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-                "【活动状态块】",
-                "📍 注入位置：system_prompt 中，自定义注入词之后",
-                "🔄 更新频率：当前活动或下一个活动切换时",
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-                activity_text if activity_text else "（无活动状态）",
-                "",
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-                "【执行记录块】",
-                "📍 注入位置：system_prompt 中，活动状态之后",
-                "🔄 更新频率：图片或语音实际发送成功时",
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-                execution_text if execution_text else "（未启用执行记录）",
-            ]
-        )
-
-        if busy_text:
-            parts.extend(
-                [
-                    "",
-                    "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-                    "【动态块 · 忙碌标记】",
-                    "📍 注入位置：system_prompt 末尾",
-                    "🔄 更新频率：进入/退出忙碌时",
-                    "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-                    busy_text,
-                ]
-            )
 
         parts.extend(["", "=" * 30])
 

@@ -4,7 +4,6 @@ import json
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Optional
 
 from astrbot.api import logger
 
@@ -44,7 +43,7 @@ class BusyPeriod:
     """Represents a busy or available period in a schedule."""
 
     start_time: str  # HH:MM format
-    end_time: Optional[str]
+    end_time: str | None
     activity: str
     is_busy: bool = True
     period_type: str = "activity"
@@ -70,7 +69,7 @@ class BusyPeriod:
         owner_date: date,
         schedule_h: int,
         schedule_m: int,
-        resolved_end: Optional[datetime] = None,
+        resolved_end: datetime | None = None,
     ) -> tuple[datetime, datetime]:
         """Expand this period into absolute datetimes for a schedule cycle."""
         s_h, s_m = parse_clock_time(self.start_time)
@@ -93,9 +92,9 @@ class BusyPeriod:
     def contains(
         self,
         time: datetime,
-        owner_date: Optional[date] = None,
+        owner_date: date | None = None,
         schedule_time: tuple[int, int] = (7, 0),
-        resolved_end: Optional[datetime] = None,
+        resolved_end: datetime | None = None,
     ) -> bool:
         """Check whether time falls inside this resolved period."""
         base = owner_date if owner_date is not None else time.date()
@@ -159,7 +158,7 @@ def get_first_activity_start(
 def resolve_schedule_periods(
     active: ActiveSchedule,
     schedule_time: tuple[int, int],
-    next_active: Optional[ActiveSchedule] = None,
+    next_active: ActiveSchedule | None = None,
 ) -> list[ResolvedPeriod]:
     """Resolve one effective schedule, including its open sleep end."""
     wake_time = None
@@ -187,15 +186,18 @@ class ScheduleData:
 
     date: str  # YYYY-MM-DD format
     outfit_style: str = ""
+    daily_theme: str = ""
+    mood_color: str = ""
+    schedule_type: str = ""
     outfit: str = ""
     hairstyle: str = (
         ""  # optional, e.g. "双马尾"; empty means use reference image default
     )
     schedule: str = ""
     busy_periods: list[BusyPeriod] = field(default_factory=list)
-    weather: Optional[WeatherSnapshot] = None
+    weather: WeatherSnapshot | None = None
     status: str = "pending"  # pending, generating, completed, failed
-    last_updated: Optional[str] = None
+    last_updated: str | None = None
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -323,8 +325,7 @@ class ScheduleDataManager:
         if not self.data_file.exists():
             return
         try:
-            with open(self.data_file, "r", encoding="utf-8") as f:
-                raw_data = json.load(f)
+            raw_data = json.loads(self.data_file.read_text(encoding="utf-8"))
             for date_str, item in raw_data.items():
                 self._data[date_str] = ScheduleData.from_dict(item)
             logger.info(
@@ -338,17 +339,19 @@ class ScheduleDataManager:
         try:
             self.data_file.parent.mkdir(parents=True, exist_ok=True)
             data_dict = {k: v.to_dict() for k, v in self._data.items()}
-            with open(self.data_file, "w", encoding="utf-8") as f:
-                json.dump(data_dict, f, ensure_ascii=False, indent=2)
+            self.data_file.write_text(
+                json.dumps(data_dict, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
         except Exception as e:
             logger.error(f"[BusySchedule] Failed to save schedule data: {e}")
 
-    def get(self, target_date: date) -> Optional[ScheduleData]:
+    def get(self, target_date: date) -> ScheduleData | None:
         """Get schedule data for a specific date."""
         date_str = target_date.strftime("%Y-%m-%d")
         return self._data.get(date_str)
 
-    def get_active(self, owner_date: date) -> Optional[ActiveSchedule]:
+    def get_active(self, owner_date: date) -> ActiveSchedule | None:
         """Project the newest usable completed schedule onto owner_date."""
         current = self.get(owner_date)
         if current and current.status == "completed":
@@ -361,7 +364,7 @@ class ScheduleDataManager:
 
     def get_latest_completed(
         self, target_date: date
-    ) -> Optional[tuple[date, ScheduleData]]:
+    ) -> tuple[date, ScheduleData] | None:
         """Return the newest completed schedule on or before target_date."""
         candidates = []
         for date_str, data in self._data.items():

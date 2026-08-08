@@ -1,8 +1,7 @@
 """Message interceptor module - handles message queueing and merging during busy periods."""
 
-from datetime import datetime
-from typing import Optional
 from collections import defaultdict
+from datetime import datetime
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
@@ -81,9 +80,21 @@ class MessageInterceptor:
         """Get queued messages for a user."""
         return self._message_queues.get(user_id, [])
 
+    def get_merged_user_message(self, user_id: str) -> str | None:
+        """Return queued messages as the user content without explanatory wrappers."""
+        messages = self._message_queues.get(user_id, [])
+        if not messages:
+            return None
+
+        parts = []
+        for msg in messages:
+            timestamp = datetime.fromisoformat(msg["timestamp"]).strftime("%H:%M")
+            parts.append(f"[{timestamp}] {msg['text']}")
+        return "\n".join(parts)
+
     def get_merged_message(
         self, user_id: str, busy_start_time: str, busy_end_time: str
-    ) -> Optional[str]:
+    ) -> str | None:
         """Get merged message text for a user."""
         messages = self._message_queues.get(user_id, [])
         if not messages:

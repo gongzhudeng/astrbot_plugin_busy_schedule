@@ -38,11 +38,7 @@ class PromptInjector:
         return f"<character_custom>\n{custom}\n</character_custom>"
 
     def build_static_injection(self, data: ScheduleData) -> str:
-        """Build static (cacheable) prompt injection - outfit, weather summary, and schedule.
-
-        This part changes only once per day and should be placed after persona prompt
-        for optimal caching.
-        """
+        """Build the daily outfit and weather block for the stable system prefix."""
         if not data or data.status != "completed":
             return ""
 
@@ -55,23 +51,27 @@ class PromptInjector:
             outfit_text += f"\n发型：{data.hairstyle}"
         parts.append(outfit_text)
 
-        # Weather summary block between outfit and schedule
-        parts.append("")
-        parts.append("## 今日天气")
+        parts.extend(["", "## 今日天气"])
         weather = getattr(data, "weather", None)
         if weather is not None:
             parts.append(weather.format_summary())
         else:
             parts.append("天气暂不可用")
-
-        parts += [
-            "",
-            "## 今日日程安排",
-            data.schedule if data.schedule else "未安排",
-            "</character_static>",
-        ]
-
+        parts.append("</character_static>")
         return "\n".join(parts)
+
+    def build_schedule_injection(self, data: ScheduleData) -> str:
+        """Build the current schedule for the temporary user-content tail."""
+        if not data or data.status != "completed":
+            return ""
+        return "\n".join(
+            [
+                "<character_schedule>",
+                "## 今日日程安排",
+                data.schedule if data.schedule else "未安排",
+                "</character_schedule>",
+            ]
+        )
 
     def build_busy_state_injection(
         self,
