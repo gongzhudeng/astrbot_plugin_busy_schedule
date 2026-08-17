@@ -59,7 +59,7 @@ def test_temp_tail_is_removed_from_persisted_user_history():
     ).mark_as_temp()
     message = Message(
         role="user",
-        content=[TextPart(text="[10:33] real queued message"), temp_part],
+        content=[TextPart(text="real queued message"), temp_part],
     )
 
     saved = dump_messages_with_checkpoints([message])
@@ -68,7 +68,7 @@ def test_temp_tail_is_removed_from_persisted_user_history():
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": "[10:33] real queued message"},
+                {"type": "text", "text": "real queued message"},
             ],
         }
     ]

@@ -64,6 +64,23 @@
       }
     }
   },
+  "图片显示": {
+    "description": "日程与状态图片设置",
+    "type": "object",
+    "items": {
+      "schedule_image_theme": {
+        "description": "图片主题",
+        "hint": "自动切换在 07:00-18:59 使用白天主题，其余时间使用夜间主题。时间按 AstrBot 全局时区判断。",
+        "type": "string",
+        "default": "自动切换",
+        "options": [
+          "自动切换",
+          "白天模式",
+          "夜间模式"
+        ]
+      }
+    }
+  },
   "忙碌时段": {
     "description": "忙碌时段配置",
     "type": "object",
@@ -272,13 +289,13 @@
       },
       "merge_prefix": {
         "description": "合并消息前缀",
-        "hint": "合并消息前添加的提示，{start_time}和{end_time}会被替换",
+        "hint": "仅用于延迟消息临时上下文。支持 {start_time}、{end_time}、{received_start}、{received_end}、{processing_time}、{message_count}；旧配置中的“以下是”会在显示时规范为“这些是”",
         "type": "text",
-        "default": "[以下是你在忙碌时段（{start_time}-{end_time}）收到的用户消息：]"
+        "default": "[这些是你在忙碌时段（{start_time}-{end_time}）收到的用户消息：]"
       },
       "merge_suffix": {
         "description": "合并消息后缀",
-        "hint": "合并消息后添加的提示",
+        "hint": "仅用于延迟消息临时上下文。支持 {start_time}、{end_time}、{received_start}、{received_end}、{processing_time}、{message_count}",
         "type": "text",
         "default": "[请回复用户，并说明你刚才在做什么。]"
       }

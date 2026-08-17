@@ -38,7 +38,7 @@ class PromptInjector:
         return f"<character_custom>\n{custom}\n</character_custom>"
 
     def build_static_injection(self, data: ScheduleData) -> str:
-        """Build the daily outfit and weather block for the stable system prefix."""
+        """Build the complete daily block in its stable outfit/weather/schedule order."""
         if not data or data.status != "completed":
             return ""
 
@@ -57,11 +57,17 @@ class PromptInjector:
             parts.append(weather.format_summary())
         else:
             parts.append("天气暂不可用")
+        parts.extend(["", "## 今日日程安排"])
+        parts.append(data.schedule if data.schedule else "未安排")
         parts.append("</character_static>")
         return "\n".join(parts)
 
     def build_schedule_injection(self, data: ScheduleData) -> str:
-        """Build the current schedule for the temporary user-content tail."""
+        """Build the schedule block for compatibility with older callers.
+
+        The request hook uses :meth:`build_static_injection`, so the schedule is
+        not appended to the temporary user tail anymore.
+        """
         if not data or data.status != "completed":
             return ""
         return "\n".join(
@@ -81,7 +87,7 @@ class PromptInjector:
 
         Activity details live in their own independently managed prompt block.
         """
-        return f"<character_busy>\n## 当前处于忙碌状态，正在{busy_period.activity}\n</character_busy>"
+        return "<character_busy>\n## 当前处于忙碌状态\n</character_busy>"
 
     def _get_activity_state(
         self,

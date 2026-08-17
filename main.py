@@ -7,13 +7,14 @@ import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.event.filter import EventMessageType
 from astrbot.api.star import Context, Star, register
 from astrbot.core.cron.events import CronMessageEvent
-from astrbot.core.message.components import Plain
+from astrbot.core.message.components import Image, Plain
 from astrbot.core.provider.entities import ProviderRequest
 from astrbot.core.star.star_tools import StarTools
 
@@ -39,6 +40,7 @@ from .core.generator import (
     DeterministicScheduleError,
     ScheduleGenerator,
 )
+from .core.image_renderer import BusyScheduleImageRenderer, BusyStatusImageData
 from .core.message_input import is_slash_prefixed_message
 from .core.message_interceptor import MessageInterceptor
 from .core.prompt_injector import PromptInjector
@@ -81,32 +83,63 @@ def _replace_prompt_block(
     return re.sub(pattern, block, prompt, flags=re.DOTALL)
 
 
-def _position_emotion_anchor(prompt: str, cache_end_marker: str) -> str:
-    """Keep the optional emotion block directly after the daily static block."""
+def _rebuild_system_prompt(prompt: str, blocks: dict[str, str]) -> str:
+    """Rebuild this plugin's blocks in one deterministic order.
+
+    The dynamic-persona hook has already finished when this runs, while the
+    emotion-state hook runs later.  Removing and re-adding all owned markers on
+    every request prevents stale blocks from surviving activity/state changes.
+    """
+    prompt = prompt or ""
+    block_markers = (
+        ("<!-- BUSY_SCHEDULE_CUSTOM -->", "<!-- /BUSY_SCHEDULE_CUSTOM -->"),
+        ("<!-- BUSY_SCHEDULE_CACHE -->", "<!-- /BUSY_SCHEDULE_CACHE -->"),
+        ("<!-- BUSY_SCHEDULE_ACTIVITY -->", "<!-- /BUSY_SCHEDULE_ACTIVITY -->"),
+        ("<!-- BUSY_SCHEDULE_BUSY -->", "<!-- /BUSY_SCHEDULE_BUSY -->"),
+        ("<!-- BUSY_SCHEDULE_EXECUTION -->", "<!-- /BUSY_SCHEDULE_EXECUTION -->"),
+    )
     anchor = "<!-- EMOTION_STATE_ANCHOR -->"
     emotion_start = "<!-- EMOTION_STATE_BEGIN -->"
     emotion_end = "<!-- /EMOTION_STATE_END -->"
     emotion_pattern = f"{re.escape(emotion_start)}.*?{re.escape(emotion_end)}"
     match = re.search(emotion_pattern, prompt, flags=re.DOTALL)
     emotion_block = match.group(0) if match else ""
-    cleaned = re.sub(
-        f"(?:\r?\n)*{emotion_pattern}(?:\r?\n)*",
-        "\n\n",
-        prompt,
-        flags=re.DOTALL,
-    )
+    cleaned = re.sub(f"(?:\r?\n)*{emotion_pattern}(?:\r?\n)*", "\n\n", prompt, flags=re.DOTALL)
     cleaned = re.sub(f"(?:\r?\n)*{re.escape(anchor)}(?:\r?\n)*", "\n\n", cleaned)
-    insertion = f"{cache_end_marker}\n{anchor}"
+    for marker, end_marker in block_markers:
+        cleaned = re.sub(
+            f"(?:\r?\n)*{re.escape(marker)}.*?{re.escape(end_marker)}(?:\r?\n)*",
+            "\n\n",
+            cleaned,
+            flags=re.DOTALL,
+        )
+
+    ordered = [
+        (block_markers[1], blocks.get("daily", "")),
+        (block_markers[0], blocks.get("custom", "")),
+        (block_markers[2], blocks.get("activity", "")),
+        (block_markers[3], blocks.get("busy", "")),
+    ]
+    sections = []
+    for (marker, end_marker), content in ordered:
+        if content and content.strip():
+            sections.append(f"{marker}\n{content.strip()}\n{end_marker}")
+    sections.append(anchor)
     if emotion_block:
-        insertion = f"{insertion}\n{emotion_block}"
-    return cleaned.replace(cache_end_marker, insertion, 1)
+        sections.append(emotion_block)
+    execution = blocks.get("execution", "")
+    if execution and execution.strip():
+        marker, end_marker = block_markers[4]
+        sections.append(f"{marker}\n{execution.strip()}\n{end_marker}")
+    suffix = "\n\n".join(sections)
+    return f"{cleaned.rstrip()}\n\n{suffix}" if cleaned.strip() else suffix
 
 
 @register(
     "astrbot_plugin_busy_schedule",
     "灵犀 · AI忙碌时段管理",
     "让AI拥有真实的生活节奏！自动计算忙碌时段、智能拦截合并消息、特殊关键词唤醒",
-    "v2.7.0",
+    "v2.8.0",
     "https://github.com/gongzhudeng/astrbot_plugin_busy_schedule",
 )
 class BusySchedulePlugin(Star):
@@ -129,6 +162,7 @@ class BusySchedulePlugin(Star):
         self.injector: Optional[PromptInjector] = None
         self.schedule_editor: Optional[ScheduleEditor] = None
         self.weather_service: Optional[WeatherService] = None
+        self.image_renderer = BusyScheduleImageRenderer(Path(__file__).parent)
         self._schedule_edit_lock = asyncio.Lock()
 
         # Background tasks
@@ -176,7 +210,10 @@ class BusySchedulePlugin(Star):
             weather_service=self.weather_service,
         )
         self.busy_mgr = BusyPeriodManager(self.config, self.data_mgr)
-        self.interceptor = MessageInterceptor(self.config)
+        self.interceptor = MessageInterceptor(
+            self.config,
+            timezone=self._get_astrbot_timezone(),
+        )
         self.injector = PromptInjector(self.config)
         self.schedule_editor = ScheduleEditor()
 
@@ -736,7 +773,7 @@ class BusySchedulePlugin(Star):
                 finally:
                     self._suppress_exit_delivery = False
 
-            return await self._send_merged_messages(user_id, period)
+            return await self._send_merged_messages(user_id, period, reason)
 
     def _start_peek_timer(self, user_id: str, period: BusyPeriod):
         """Start or reset the latched peek countdown for one user."""
@@ -846,10 +883,12 @@ class BusySchedulePlugin(Star):
                         queue_msgs = self.interceptor.get_queued_messages(user_id)
                         if queue_msgs:
                             newest = max(
-                                datetime.fromisoformat(m["timestamp"])
+                                self.interceptor._parse_timestamp(m["timestamp"])
                                 for m in queue_msgs
                             )
-                            if (datetime.now() - newest).total_seconds() < quiet:
+                            if (
+                                self.interceptor._now() - newest
+                            ).total_seconds() < quiet:
                                 logger.info(
                                     f"[BusySchedule] Poll skipped for {user_id}: quiet period active"
                                 )
@@ -862,16 +901,22 @@ class BusySchedulePlugin(Star):
         except asyncio.CancelledError:
             pass
 
-    async def _send_merged_messages(self, user_id: str, period: BusyPeriod) -> bool:
+    async def _send_merged_messages(
+        self, user_id: str, period: BusyPeriod, reason: str = "unknown"
+    ) -> bool:
         """Re-inject one merged queue and commit it only after enqueue succeeds."""
-        merged_text = self.interceptor.get_merged_message(
+        user_message = self.interceptor.get_merged_user_message(user_id)
+        if not user_message:
+            return False
+
+        delivery_payload = self.interceptor.build_delivery_payload(
             user_id,
             period.start_time,
             period.end_time or datetime.now().strftime("%H:%M"),
+            reason=reason,
+            activity=period.activity,
         )
-
-        user_message = self.interceptor.get_merged_user_message(user_id)
-        if not merged_text or not user_message:
+        if not delivery_payload:
             return False
 
         extra_components = self.interceptor.get_extra_components(user_id)
@@ -942,13 +987,18 @@ class BusySchedulePlugin(Star):
         reinjected_event.platform = last_event.platform_meta
 
         reinjected_event.set_extra("busy_schedule_merged", True)
-        reinjected_event.set_extra("busy_schedule_temp_user_content", merged_text)
+        # The request hook renders this metadata at the actual processing time.
+        # Message bodies remain solely in the real user message and are not copied
+        # into the temporary wake explanation or conversation history.
+        reinjected_event.set_extra("busy_schedule_wake_event", delivery_payload)
+        # Alias retained for integrations that call this a delivery event.
+        reinjected_event.set_extra("busy_schedule_delivery_event", delivery_payload)
         # Also mark as chat_merger merged so chat_merger does not re-intercept
         reinjected_event.set_extra("chat_merger_merged", True)
 
         logger.info(
             f"[BusySchedule] Sending merged messages for {user_id}: "
-            f"{len(merged_text)} chars, content: {merged_text[:80]}..."
+            f"{len(user_message)} chars, {delivery_payload['message_count']} messages"
         )
 
         try:
@@ -1080,6 +1130,7 @@ class BusySchedulePlugin(Star):
         # Nested groups take priority — user-edited values live here
         for group_name in [
             "基础设置",
+            "图片显示",
             "忙碌时段",
             "随机接收",
             "定时检查",
@@ -1105,6 +1156,31 @@ class BusySchedulePlugin(Star):
             return schema_default
 
         return default
+
+    def _get_astrbot_timezone(self) -> str | None:
+        """Read AstrBot's global timezone for delayed-message timestamps."""
+        try:
+            config = self.context.get_config()
+            if hasattr(config, "get"):
+                value = config.get("timezone")
+                return str(value) if value else None
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[BusySchedule] Cannot read AstrBot timezone: %s", exc)
+        return None
+
+    def _now_in_astrbot_timezone(self) -> datetime:
+        """Return current time using AstrBot's configured timezone when valid."""
+        value = self._get_astrbot_timezone()
+        if value:
+            try:
+                return datetime.now(ZoneInfo(value))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[BusySchedule] Invalid AstrBot timezone %r; using local timezone: %s",
+                    value,
+                    exc,
+                )
+        return datetime.now().astimezone()
 
     def _configure_schedule_edit_tool(self, req: ProviderRequest) -> bool:
         """Apply the per-request schedule editor switch to the available tool set."""
@@ -1169,7 +1245,7 @@ class BusySchedulePlugin(Star):
                     end_time=now.strftime("%H:%M"),
                     activity="忙碌时段",
                 )
-                await self._send_merged_messages(user_id, period)
+                await self._send_merged_messages(user_id, period, reason="keyword")
                 event.stop_event()
                 return
             else:
@@ -1258,15 +1334,9 @@ class BusySchedulePlugin(Star):
             self.busy_mgr.clear_reply_inflight(token)
             event.set_extra("busy_schedule_chat_agent", None)
 
-    @filter.on_llm_request()
+    @filter.on_llm_request(priority=-100)
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
-        """向 LLM 请求注入穿搭、日程、当前活动和忙碌状态。
-
-        为提高提示词缓存命中率，注入内容按变化频率分层：
-        1. 穿搭与完整日程通常每天变化一次。
-        2. 当前与下一活动只在日程推进时变化。
-        3. 忙碌状态仅在忙碌期间动态附加。
-        """
+        """Inject ordered system state and render delayed-message timing context."""
         replace_temp_user_content(req)
         self._configure_schedule_edit_tool(req)
         if not self._get_config("enabled", True):
@@ -1286,69 +1356,62 @@ class BusySchedulePlugin(Star):
 
         now = datetime.now()
         active = self._get_active_schedule(now)
-        if not active:
-            return
-        data = active.data
-        timeline = self._get_resolved_timeline(active.owner_date)
-        current_period = next((item for item in timeline if item.contains(now)), None)
-        self._sync_media_execution(active, current_period)
+        data = active.data if active else None
+        timeline = self._get_resolved_timeline(active.owner_date) if active else []
+        current_period = (
+            next((item for item in timeline if item.contains(now)), None)
+            if timeline
+            else None
+        )
+        if active:
+            self._sync_media_execution(active, current_period)
 
-        # Stable daily content stays in the system prefix. Volatile state and wake
-        # explanations are appended as one provider-only user tail in fixed order.
-        static_injection = self.injector.build_static_injection(data)
-        schedule_injection = self.injector.build_schedule_injection(data)
-        activity_injection = self.injector.build_activity_injection(data, timeline, now)
-        execution_injection = self.injector.build_execution_injection(
-            self.media_execution.to_dict()
+        static_injection = self.injector.build_static_injection(data) if data else ""
+        activity_injection = (
+            self.injector.build_activity_injection(data, timeline, now)
+            if data
+            else ""
+        )
+        execution_injection = (
+            self.injector.build_execution_injection(self.media_execution.to_dict())
+            if active
+            else ""
         )
         custom_injection = self.injector.build_custom_injection()
 
         busy_injection = ""
-        if self.busy_mgr.is_busy and self.busy_mgr.current_activity:
+        if self.busy_mgr.is_busy:
             period = BusyPeriod(
                 start_time="",
                 end_time="",
-                activity=self.busy_mgr.current_activity,
+                activity=self.busy_mgr.current_activity or "",
             )
             busy_injection = self.injector.build_busy_state_injection(period)
 
-        current_prompt = req.system_prompt or ""
-        cache_marker = "<!-- BUSY_SCHEDULE_CACHE -->"
-        cache_end_marker = "<!-- /BUSY_SCHEDULE_CACHE -->"
-        custom_marker = "<!-- BUSY_SCHEDULE_CUSTOM -->"
-        custom_end_marker = "<!-- /BUSY_SCHEDULE_CUSTOM -->"
-        activity_marker = "<!-- BUSY_SCHEDULE_ACTIVITY -->"
-        activity_end_marker = "<!-- /BUSY_SCHEDULE_ACTIVITY -->"
-        execution_marker = "<!-- BUSY_SCHEDULE_EXECUTION -->"
-        execution_end_marker = "<!-- /BUSY_SCHEDULE_EXECUTION -->"
-        busy_marker = "<!-- BUSY_SCHEDULE_BUSY -->"
-        busy_end_marker = "<!-- /BUSY_SCHEDULE_BUSY -->"
-
-        current_prompt = _replace_prompt_block(
-            current_prompt, cache_marker, cache_end_marker, static_injection
+        req.system_prompt = _rebuild_system_prompt(
+            req.system_prompt or "",
+            {
+                "custom": custom_injection,
+                "daily": static_injection,
+                "activity": activity_injection,
+                "busy": busy_injection,
+                "execution": execution_injection,
+            },
         )
-        current_prompt = _position_emotion_anchor(current_prompt, cache_end_marker)
-        for marker, end_marker in (
-            (custom_marker, custom_end_marker),
-            (activity_marker, activity_end_marker),
-            (execution_marker, execution_end_marker),
-            (busy_marker, busy_end_marker),
-        ):
-            current_prompt = _replace_prompt_block(
-                current_prompt, marker, end_marker, ""
+
+        wake_event = event.get_extra("busy_schedule_wake_event", None)
+        if not isinstance(wake_event, dict):
+            wake_event = event.get_extra("busy_schedule_delivery_event", None)
+        if isinstance(wake_event, dict):
+            wake_content = self.interceptor.render_wake_context(
+                wake_event,
+                processing_time=self._now_in_astrbot_timezone(),
             )
-        req.system_prompt = current_prompt
-
-        wake_content = event.get_extra("busy_schedule_temp_user_content", "")
-        replace_temp_user_content(
-            req,
-            schedule_injection,
-            custom_injection,
-            activity_injection,
-            execution_injection,
-            busy_injection,
-            wake_content,
-        )
+        else:
+            # Compatibility with events produced by an older in-flight plugin
+            # task; new deliveries always use the structured event above.
+            wake_content = event.get_extra("busy_schedule_temp_user_content", "")
+        replace_temp_user_content(req, wake_content)
 
     async def _refresh_after_schedule_edit(self) -> None:
         """Synchronize prompt context and busy state after an atomic edit."""
@@ -1591,7 +1654,18 @@ class BusySchedulePlugin(Star):
         else:
             response_parts.extend(["", "✅ 当前状态：在线"])
 
-        yield event.plain_result("\n".join(response_parts))
+        try:
+            png = self.image_renderer.render_schedule(
+                data=data,
+                now=self._now_in_astrbot_timezone(),
+                is_busy=self.busy_mgr.is_busy,
+                mode=self._get_config("schedule_image_theme", "自动切换"),
+                source_note=source_line,
+            )
+            yield event.chain_result([Image.fromBytes(png)])
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("[BusySchedule] Schedule image rendering failed: %s", exc)
+            yield event.plain_result("\n".join(response_parts))
 
     @filter.command("忙碌重写", alias={"busy renew"})
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -1650,6 +1724,18 @@ class BusySchedulePlugin(Star):
         now = datetime.now()
 
         response_parts = ["📊 忙碌状态信息", ""]
+        activity = ""
+        remaining_mins = None
+        current_start = ""
+        current_end = ""
+        current_timeline = next(
+            (
+                item
+                for item in self._get_resolved_timeline(self._get_effective_date())
+                if item.contains(now)
+            ),
+            None,
+        )
 
         # Current status
         if self.busy_mgr.is_busy:
@@ -1657,24 +1743,35 @@ class BusySchedulePlugin(Star):
             response_parts.append(f"💤 当前状态：忙碌中（{activity}）")
             resolved = self.busy_mgr._current_resolved_period
             if resolved:
+                current_start = resolved.start.strftime("%H:%M")
+                current_end = resolved.end.strftime("%H:%M")
                 remaining_secs = (resolved.end - now).total_seconds()
                 if remaining_secs > 0:
                     remaining_mins = int(remaining_secs / 60)
                     response_parts.append(f"⏱️ 剩余时间：约 {remaining_mins} 分钟")
         else:
             response_parts.append("✅ 当前状态：在线")
+            if current_timeline:
+                activity = current_timeline.period.activity
+                current_start = current_timeline.start.strftime("%H:%M")
+                current_end = current_timeline.end.strftime("%H:%M")
+                response_parts.append(f"🎯 当前活动：{activity}")
 
         # Next busy period
         next_resolved = self.busy_mgr.get_next_busy_period(now)
+        next_busy_text = ""
         if next_resolved:
             period = next_resolved.period
-            response_parts.append(
-                f"\n⏰ 下一个忙碌时段："
+            next_busy_text = (
                 f"{next_resolved.start.strftime('%m-%d %H:%M')}-"
                 f"{next_resolved.end.strftime('%m-%d %H:%M')} {period.activity}"
             )
+            response_parts.append(
+                f"\n⏰ 下一个忙碌时段：{next_busy_text}"
+            )
 
         # Chat protection status
+        chat_protection_text = ""
         if self.busy_mgr._last_chat_model_activity_time:
             inactive_minutes = (
                 now - self.busy_mgr._last_chat_model_activity_time
@@ -1682,12 +1779,14 @@ class BusySchedulePlugin(Star):
             protect_minutes = self._get_config("chat_protect_minutes", 10)
             if inactive_minutes < protect_minutes:
                 remaining = protect_minutes - inactive_minutes
+                chat_protection_text = f"距保护结束约 {int(remaining)} 分钟"
                 response_parts.append(
                     f"\n🛡️ 聊天保护中：距最近对话模型活动还需 {int(remaining)} 分钟"
                 )
 
         # Message queue stats
         queue_stats = self.interceptor.get_queue_stats()
+        queued_messages = sum(int(stats.get("count", 0)) for stats in queue_stats.values())
         if queue_stats:
             response_parts.append("\n📨 待处理消息：")
             for user_id, stats in queue_stats.items():
@@ -1695,7 +1794,26 @@ class BusySchedulePlugin(Star):
                     f"  用户 {user_id[:8]}...：{stats['count']} 条消息"
                 )
 
-        yield event.plain_result("\n".join(response_parts))
+        try:
+            png = self.image_renderer.render_status(
+                BusyStatusImageData(
+                    is_busy=self.busy_mgr.is_busy,
+                    activity=activity,
+                    remaining_minutes=remaining_mins,
+                    current_start=current_start,
+                    current_end=current_end,
+                    next_busy=next_busy_text,
+                    chat_protection=chat_protection_text,
+                    queued_messages=queued_messages,
+                    queued_users=len(queue_stats),
+                ),
+                now=self._now_in_astrbot_timezone(),
+                mode=self._get_config("schedule_image_theme", "自动切换"),
+            )
+            yield event.chain_result([Image.fromBytes(png)])
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("[BusySchedule] Status image rendering failed: %s", exc)
+            yield event.plain_result("\n".join(response_parts))
 
     @filter.command("忙碌帮助", alias={"busy help"})
     async def cmd_busy_help(self, event: AstrMessageEvent):
@@ -1798,25 +1916,26 @@ class BusySchedulePlugin(Star):
         """展示当前注入到 LLM 的提示词内容"""
         now = datetime.now()
         active = self._get_active_schedule(now)
-        if not active:
-            yield event.plain_result("当前没有可用的已完成日程")
-            return
-        data = active.data
-        timeline = self._get_resolved_timeline(active.owner_date)
+        data = active.data if active else None
+        timeline = self._get_resolved_timeline(active.owner_date) if active else []
         current_period = next((item for item in timeline if item.contains(now)), None)
-        self._sync_media_execution(active, current_period)
+        if active:
+            self._sync_media_execution(active, current_period)
 
         # Part 0: custom user-defined injection
         custom_text = self.injector.build_custom_injection()
 
-        # Part 1: stable outfit and weather block.
+        # Part 1: stable daily block.
         static_text = self.injector.build_static_injection(data)
-        schedule_text = self.injector.build_schedule_injection(data)
 
-        # Part 2: volatile blocks share the temporary user-content tail.
-        activity_text = self.injector.build_activity_injection(data, timeline, now)
-        execution_text = self.injector.build_execution_injection(
-            self.media_execution.to_dict()
+        # Part 2: volatile blocks follow the same system_prompt order as requests.
+        activity_text = (
+            self.injector.build_activity_injection(data, timeline, now) if data else ""
+        )
+        execution_text = (
+            self.injector.build_execution_injection(self.media_execution.to_dict())
+            if active
+            else ""
         )
 
         # Part 3: busy flag (only when busy)
@@ -1833,31 +1952,28 @@ class BusySchedulePlugin(Star):
             "📋 提示词注入预览",
             "=" * 30,
             "",
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-            "【稳定块 · 穿搭+天气】",
-            "📍 注入位置：system_prompt 中，人设之后",
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-            static_text if static_text else "（无稳定内容）",
+            "【system_prompt 固定顺序】",
+            "AstrBot 人设 → 今日穿搭/天气/日程 → 自定义提示 → 下一个/当前活动 → 忙碌状态 → 内心世界锚点 → 执行记录",
             "",
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-            "【临时用户内容尾部 · 固定顺序】",
-            "📍 注入位置：当前 user 内容末尾，不写入 system_prompt",
-            "🔄 本次请求可见，后续历史不保存",
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-            "[日程]",
-            schedule_text if schedule_text else "（无日程内容）",
+            "[今日穿搭 · 今日天气 · 今日日程]",
+            static_text if static_text else "（无已完成日程）",
             "",
-            "[自定义注入]",
+            "[自定义提示]",
             custom_text if custom_text else "（无自定义内容）",
             "",
             "[活动状态]",
             activity_text if activity_text else "（无活动状态）",
             "",
+            "[忙碌状态]",
+            busy_text if busy_text else "（当前不忙碌）",
+            "",
+            "[内心世界锚点]",
+            "<!-- EMOTION_STATE_ANCHOR -->",
+            "",
             "[执行记录]",
             execution_text if execution_text else "（未启用执行记录）",
             "",
-            "[忙碌状态]",
-            busy_text if busy_text else "（当前不忙碌）",
+            "延迟消息说明仅在真正发送延迟消息时作为临时 user 上下文注入，不写入历史。",
         ]
 
         parts.extend(["", "=" * 30])
