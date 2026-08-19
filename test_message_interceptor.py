@@ -39,7 +39,11 @@ def test_queue_uses_configured_timezone_and_clean_multi_message_body():
         ]
     )
     interceptor = MessageInterceptor(
-        {"消息合并": {"merge_prefix": "[以下是 {received_start}-{received_end} ({message_count})]"}},
+        {
+            "消息合并": {
+                "merge_prefix": "[以下是 {received_start}-{received_end} ({message_count})]"
+            }
+        },
         timezone="Asia/Shanghai",
         clock=lambda: next(times),
     )
@@ -94,10 +98,17 @@ def test_wake_context_is_temporary_even_without_an_active_schedule():
     )
 
     plugin = BusySchedulePlugin.__new__(BusySchedulePlugin)
+    calendar_dates = []
     plugin.context = SimpleNamespace(get_config=lambda: {"timezone": "Asia/Shanghai"})
     plugin.config = {}
     plugin.interceptor = interceptor
-    plugin.injector = SimpleNamespace(build_custom_injection=lambda: "")
+    plugin.injector = SimpleNamespace(
+        build_custom_injection=lambda: "",
+        build_calendar_injection=lambda calendar_date: (
+            calendar_dates.append(calendar_date)
+            or "<character_calendar>日期</character_calendar>"
+        ),
+    )
     plugin.busy_mgr = SimpleNamespace(is_busy=False)
     plugin._schedule_target_umo = "u"
     plugin._configure_schedule_edit_tool = lambda _req: False
@@ -110,6 +121,8 @@ def test_wake_context_is_temporary_even_without_an_active_schedule():
     event = EventStub(busy_schedule_wake_event=payload)
     asyncio.run(plugin.on_llm_request(event, request))
 
+    assert "BUSY_SCHEDULE_CALENDAR" in request.system_prompt
+    assert calendar_dates == [datetime(2026, 8, 18).date()]
     assert "BUSY_SCHEDULE_CACHE" not in request.system_prompt
     assert "EMOTION_STATE_ANCHOR" in request.system_prompt
     assert len(request.extra_user_content_parts) == 1

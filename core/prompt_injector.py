@@ -1,8 +1,14 @@
 """Prompt injector module - handles system prompt injection for different states."""
 
-from datetime import datetime
+from __future__ import annotations
 
-from .data import BusyPeriod, ResolvedPeriod, ScheduleData
+from datetime import date, datetime
+from typing import TYPE_CHECKING
+
+from .calendar_context import build_calendar_context
+
+if TYPE_CHECKING:
+    from .data import BusyPeriod, ResolvedPeriod, ScheduleData
 
 
 class PromptInjector:
@@ -36,6 +42,34 @@ class PromptInjector:
         if not custom:
             return ""
         return f"<character_custom>\n{custom}\n</character_custom>"
+
+    def build_calendar_injection(self, date_obj: date) -> str:
+        """Build the date context that is available on every LLM request.
+
+        Args:
+            date_obj: Local calendar date for the current request.
+
+        Returns:
+            A stable XML-like prompt block with date and special-day facts.
+        """
+        if self._cfg("enable_calendar_context_injection", True) is False:
+            return ""
+        context = build_calendar_context(date_obj, self.config)
+        custom_days = context["special_days"]
+        return "\n".join(
+            [
+                "<character_calendar>",
+                "## 今日日期上下文",
+                f"- 公历日期：{context['date_str']}",
+                f"- 星期：{context['weekday']}",
+                f"- 农历：{context['lunar_date'] or '未知'}",
+                f"- 节日：{context['holiday']}",
+                f"- 特别日：{context['special_day']}",
+                "- 自定义特别日：",
+                custom_days,
+                "</character_calendar>",
+            ]
+        )
 
     def build_static_injection(self, data: ScheduleData) -> str:
         """Build the complete daily block in its stable outfit/weather/schedule order."""

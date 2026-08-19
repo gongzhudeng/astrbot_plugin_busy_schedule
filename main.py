@@ -92,6 +92,7 @@ def _rebuild_system_prompt(prompt: str, blocks: dict[str, str]) -> str:
     """
     prompt = prompt or ""
     block_markers = (
+        ("<!-- BUSY_SCHEDULE_CALENDAR -->", "<!-- /BUSY_SCHEDULE_CALENDAR -->"),
         ("<!-- BUSY_SCHEDULE_CUSTOM -->", "<!-- /BUSY_SCHEDULE_CUSTOM -->"),
         ("<!-- BUSY_SCHEDULE_CACHE -->", "<!-- /BUSY_SCHEDULE_CACHE -->"),
         ("<!-- BUSY_SCHEDULE_ACTIVITY -->", "<!-- /BUSY_SCHEDULE_ACTIVITY -->"),
@@ -115,10 +116,11 @@ def _rebuild_system_prompt(prompt: str, blocks: dict[str, str]) -> str:
         )
 
     ordered = [
-        (block_markers[1], blocks.get("daily", "")),
-        (block_markers[0], blocks.get("custom", "")),
-        (block_markers[2], blocks.get("activity", "")),
-        (block_markers[3], blocks.get("busy", "")),
+        (block_markers[0], blocks.get("calendar", "")),
+        (block_markers[2], blocks.get("daily", "")),
+        (block_markers[1], blocks.get("custom", "")),
+        (block_markers[3], blocks.get("activity", "")),
+        (block_markers[4], blocks.get("busy", "")),
     ]
     sections = []
     for (marker, end_marker), content in ordered:
@@ -129,7 +131,7 @@ def _rebuild_system_prompt(prompt: str, blocks: dict[str, str]) -> str:
         sections.append(emotion_block)
     execution = blocks.get("execution", "")
     if execution and execution.strip():
-        marker, end_marker = block_markers[4]
+        marker, end_marker = block_markers[5]
         sections.append(f"{marker}\n{execution.strip()}\n{end_marker}")
     suffix = "\n\n".join(sections)
     return f"{cleaned.rstrip()}\n\n{suffix}" if cleaned.strip() else suffix
@@ -139,7 +141,7 @@ def _rebuild_system_prompt(prompt: str, blocks: dict[str, str]) -> str:
     "astrbot_plugin_busy_schedule",
     "灵犀 · AI忙碌时段管理",
     "让AI拥有真实的生活节奏！自动计算忙碌时段、智能拦截合并消息、特殊关键词唤醒",
-    "v2.8.0",
+    "v2.9.0",
     "https://github.com/gongzhudeng/astrbot_plugin_busy_schedule",
 )
 class BusySchedulePlugin(Star):
@@ -1355,6 +1357,12 @@ class BusySchedulePlugin(Star):
             self._save_state()
 
         now = datetime.now()
+        calendar_injection = ""
+        build_calendar_injection = getattr(self.injector, "build_calendar_injection", None)
+        if callable(build_calendar_injection):
+            calendar_injection = build_calendar_injection(
+                self._now_in_astrbot_timezone().date()
+            )
         active = self._get_active_schedule(now)
         data = active.data if active else None
         timeline = self._get_resolved_timeline(active.owner_date) if active else []
@@ -1391,6 +1399,7 @@ class BusySchedulePlugin(Star):
         req.system_prompt = _rebuild_system_prompt(
             req.system_prompt or "",
             {
+                "calendar": calendar_injection,
                 "custom": custom_injection,
                 "daily": static_injection,
                 "activity": activity_injection,

@@ -35,6 +35,7 @@ persona
     rebuilt = _rebuild_system_prompt(
         prompt,
         {
+            "calendar": "calendar",
             "custom": "custom",
             "daily": "outfit\nweather\nschedule",
             "activity": "activity",
@@ -44,6 +45,7 @@ persona
     )
 
     positions = [
+        rebuilt.index("BUSY_SCHEDULE_CALENDAR"),
         rebuilt.index("BUSY_SCHEDULE_CACHE"),
         rebuilt.index("BUSY_SCHEDULE_CUSTOM"),
         rebuilt.index("BUSY_SCHEDULE_ACTIVITY"),
@@ -71,6 +73,7 @@ def test_missing_busy_or_execution_does_not_leave_stale_content():
 
 def test_changing_one_dynamic_block_keeps_the_other_blocks_identical():
     blocks = {
+        "calendar": "calendar",
         "custom": "custom",
         "daily": "daily",
         "activity": "activity 1",
@@ -81,6 +84,6 @@ def test_changing_one_dynamic_block_keeps_the_other_blocks_identical():
     updated = _rebuild_system_prompt(original, {**blocks, "activity": "activity 2"})
 
     assert _block(updated, "ACTIVITY") == "activity 2"
-    for name in ("CUSTOM", "CACHE", "BUSY", "EXECUTION"):
+    for name in ("CALENDAR", "CUSTOM", "CACHE", "BUSY", "EXECUTION"):
         assert _block(updated, name) == _block(original, name)
         assert updated.count(f"BUSY_SCHEDULE_{name}") == 2

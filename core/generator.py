@@ -11,6 +11,7 @@ from pathlib import Path
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.star import Context
 
+from .calendar_context import build_calendar_context
 from .data import (
     BusyPeriod,
     ScheduleData,
@@ -49,8 +50,6 @@ _DSL_TAG_PROTOCOL = (
     "- 【主动分享】：既非外出也非用餐但适合主动联系Mando；不与【外出】【用餐】叠加\n"
     "- 同一标签不重复；首个起床活动必须含「小怡醒来」；睡眠活动必须含「睡觉」\n"
 )
-
-
 def _load_schema_defaults() -> dict:
     """Load default values from _conf_schema.json."""
     schema_path = Path(__file__).parent.parent / "_conf_schema.json"
@@ -82,41 +81,6 @@ def _load_schema_defaults() -> dict:
 
 
 _SCHEMA_DEFAULTS = _load_schema_defaults()
-
-
-def get_holiday(date_obj: date) -> str:
-    """Get holiday name for a date. Uses holidays lib with fallback dict."""
-    # Chinese holidays via python-holidays
-    try:
-        import holidays as _holidays
-
-        cn_holidays = _holidays.CN()
-        name = cn_holidays.get(date_obj)
-        if name:
-            return name
-    except Exception:
-        pass
-
-    # Fallback: common holidays not always in the lib
-    _EXTRA_HOLIDAYS = {
-        (2, 14): "情人节",
-        (3, 8): "妇女节",
-        (3, 14): "白色情人节",
-        (5, 20): "网络情人节",
-        (6, 1): "儿童节",
-        (8, 14): "绿色情人节",
-        (10, 31): "万圣节",
-        (11, 11): "双十一",
-        (12, 24): "平安夜",
-        (12, 25): "圣诞节",
-    }
-    return _EXTRA_HOLIDAYS.get((date_obj.month, date_obj.day), "")
-
-
-def get_weekday_cn(date_obj: date) -> str:
-    """Get Chinese weekday name."""
-    weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
-    return weekdays[date_obj.weekday()]
 
 
 def _extract_json_obj(text: str) -> dict | None:
@@ -852,9 +816,7 @@ class ScheduleGenerator:
             )
 
         ctx = {
-            "date_str": target_date.strftime("%Y年%m月%d日"),
-            "weekday": get_weekday_cn(target_date),
-            "holiday": get_holiday(target_date) or "普通日子",
+            **build_calendar_context(target_date, self.config),
             "persona_desc": await self._get_persona_desc(umo),
             "emotion_context": emotion_context,
             **creative,
@@ -879,6 +841,17 @@ class ScheduleGenerator:
             prompt = template
             for k, v in ctx.items():
                 prompt = prompt.replace(f"{{{k}}}", str(v))
+
+        if "{lunar_date}" not in template and "{today_summary}" not in template:
+            prompt += (
+                "\n\n## 今日日期与特别日上下文\n"
+                f"- 今日摘要：{ctx['today_summary']}\n"
+                f"- 农历：{ctx['lunar_date'] or '未知'}\n"
+                f"- 节日：{ctx['holiday']}\n"
+                f"- 特别日：{ctx['special_day']}\n"
+                f"- 自定义特别日：\n{ctx['special_days']}\n"
+                "如果存在节日或特别日，可将其自然融入活动主题；不要把文化节日误写成法定放假。"
+            )
 
         if extra:
             prompt += f"\n\n## 用户补充要求\n{extra}"
