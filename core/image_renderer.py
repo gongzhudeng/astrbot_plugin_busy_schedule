@@ -70,6 +70,7 @@ class BusyScheduleImageRenderer:
         is_busy: bool,
         mode: object = "自动切换",
         source_note: str = "",
+        calendar_context: dict[str, str] | None = None,
     ) -> bytes:
         """Render one complete schedule as PNG bytes.
 
@@ -79,6 +80,7 @@ class BusyScheduleImageRenderer:
             is_busy: Current plugin busy state.
             mode: Automatic, day, or night display mode.
             source_note: Optional warning for fallback schedule data.
+            calendar_context: Optional holiday and custom special-day labels.
 
         Returns:
             Encoded RGB PNG bytes.
@@ -92,11 +94,11 @@ class BusyScheduleImageRenderer:
         )
         if theme == "night":
             image = self._render_night_schedule(
-                data, local_now, is_busy, entries, source_note
+                data, local_now, is_busy, entries, source_note, calendar_context
             )
         else:
             image = self._render_day_schedule(
-                data, local_now, is_busy, entries, source_note
+                data, local_now, is_busy, entries, source_note, calendar_context
             )
         return self._encode_png(image)
 
@@ -203,6 +205,32 @@ class BusyScheduleImageRenderer:
     @staticmethod
     def _text_width(draw, text, font):
         return draw.textbbox((0, 0), text, font=font)[2]
+
+    def _ellipsize(self, draw, text: str, font, max_width: int) -> str:
+        """Keep user-defined observance names inside the image header."""
+        if self._text_width(draw, text, font) <= max_width:
+            return text
+        suffix = "…"
+        shortened = text
+        while shortened and self._text_width(draw, shortened + suffix, font) > max_width:
+            shortened = shortened[:-1]
+        return shortened + suffix
+
+    @staticmethod
+    def _calendar_observance(calendar_context: dict[str, str] | None) -> str:
+        if not calendar_context:
+            return ""
+        labels: list[str] = []
+        holiday = str(calendar_context.get("holiday", "")).strip()
+        if holiday and holiday != "无已知节日":
+            labels.append(holiday)
+        custom_text = str(calendar_context.get("special_days", "")).strip()
+        if custom_text and custom_text != "无自定义特别日":
+            for line in custom_text.splitlines():
+                label = line.removeprefix("- ").strip()
+                if label and label not in labels:
+                    labels.append(label)
+        return " / ".join(labels) if labels else "无已知节日"
 
     @staticmethod
     def _centered_text_xy(draw, box, text, font):
@@ -343,7 +371,9 @@ class BusyScheduleImageRenderer:
     def _weekday(value: date) -> str:
         return ("一", "二", "三", "四", "五", "六", "日")[value.weekday()]
 
-    def _render_day_schedule(self, data, now, is_busy, entries, source_note):
+    def _render_day_schedule(
+        self, data, now, is_busy, entries, source_note, calendar_context=None
+    ):
         fonts = self._fonts()
         probe = ImageDraw.Draw(Image.new("RGB", (self.width, 100)))
         outfit = self._outfit_items(data)
@@ -389,9 +419,13 @@ class BusyScheduleImageRenderer:
             image.alpha_composite(avatar, (82, 78))
         display_date = date.fromisoformat(str(data.date))
         draw.text((264, 67), "小怡的今日行程", font=fonts["hero"], fill="#27324A")
+        date_line = (
+            f"{display_date:%Y.%m.%d}  ·  星期{self._weekday(display_date)}"
+            f"  ·  {self._calendar_observance(calendar_context)}"
+        )
         draw.text(
             (267, 137),
-            f"{display_date:%Y.%m.%d}  ·  星期{self._weekday(display_date)}",
+            self._ellipsize(draw, date_line, fonts["small"], 455),
             font=fonts["small"],
             fill="#69748B",
         )
@@ -521,7 +555,9 @@ class BusyScheduleImageRenderer:
         )
         return image.convert("RGB")
 
-    def _render_night_schedule(self, data, now, is_busy, entries, source_note):
+    def _render_night_schedule(
+        self, data, now, is_busy, entries, source_note, calendar_context=None
+    ):
         fonts = self._fonts()
         probe = ImageDraw.Draw(Image.new("RGB", (self.width, 100)))
         outfit_text = " / ".join(
@@ -555,9 +591,13 @@ class BusyScheduleImageRenderer:
         draw.text((58, 61), "DAILY", font=fonts["tiny"], fill="#80D7C5")
         draw.text((58, 92), "小怡的今日片单", font=fonts["hero"], fill="#F4F1EA")
         display_date = date.fromisoformat(str(data.date))
+        date_line = (
+            f"{display_date:%Y / %m / %d}  ·  星期{self._weekday(display_date)}"
+            f"  ·  {self._calendar_observance(calendar_context)}"
+        )
         draw.text(
             (61, 164),
-            f"{display_date:%Y / %m / %d}  ·  星期{self._weekday(display_date)}",
+            self._ellipsize(draw, date_line, fonts["small"], 720),
             font=fonts["small"],
             fill="#A7ABB3",
         )

@@ -19,6 +19,7 @@ from astrbot.core.provider.entities import ProviderRequest
 from astrbot.core.star.star_tools import StarTools
 
 from .core.busy_manager import BusyPeriodManager
+from .core.calendar_context import build_calendar_context
 from .core.chat_protection import (
     is_natural_spark_proactive,
     is_usable_assistant_response,
@@ -91,13 +92,22 @@ def _rebuild_system_prompt(prompt: str, blocks: dict[str, str]) -> str:
     every request prevents stale blocks from surviving activity/state changes.
     """
     prompt = prompt or ""
-    block_markers = (
-        ("<!-- BUSY_SCHEDULE_CALENDAR -->", "<!-- /BUSY_SCHEDULE_CALENDAR -->"),
-        ("<!-- BUSY_SCHEDULE_CUSTOM -->", "<!-- /BUSY_SCHEDULE_CUSTOM -->"),
-        ("<!-- BUSY_SCHEDULE_CACHE -->", "<!-- /BUSY_SCHEDULE_CACHE -->"),
-        ("<!-- BUSY_SCHEDULE_ACTIVITY -->", "<!-- /BUSY_SCHEDULE_ACTIVITY -->"),
-        ("<!-- BUSY_SCHEDULE_BUSY -->", "<!-- /BUSY_SCHEDULE_BUSY -->"),
-        ("<!-- BUSY_SCHEDULE_EXECUTION -->", "<!-- /BUSY_SCHEDULE_EXECUTION -->"),
+    markers = {
+        "daily": ("<!-- BUSY_SCHEDULE_CACHE -->", "<!-- /BUSY_SCHEDULE_CACHE -->"),
+        "custom": ("<!-- BUSY_SCHEDULE_CUSTOM -->", "<!-- /BUSY_SCHEDULE_CUSTOM -->"),
+        "activity": (
+            "<!-- BUSY_SCHEDULE_ACTIVITY -->",
+            "<!-- /BUSY_SCHEDULE_ACTIVITY -->",
+        ),
+        "busy": ("<!-- BUSY_SCHEDULE_BUSY -->", "<!-- /BUSY_SCHEDULE_BUSY -->"),
+        "execution": (
+            "<!-- BUSY_SCHEDULE_EXECUTION -->",
+            "<!-- /BUSY_SCHEDULE_EXECUTION -->",
+        ),
+    }
+    legacy_calendar_marker = (
+        "<!-- BUSY_SCHEDULE_CALENDAR -->",
+        "<!-- /BUSY_SCHEDULE_CALENDAR -->",
     )
     anchor = "<!-- EMOTION_STATE_ANCHOR -->"
     emotion_start = "<!-- EMOTION_STATE_BEGIN -->"
@@ -107,7 +117,7 @@ def _rebuild_system_prompt(prompt: str, blocks: dict[str, str]) -> str:
     emotion_block = match.group(0) if match else ""
     cleaned = re.sub(f"(?:\r?\n)*{emotion_pattern}(?:\r?\n)*", "\n\n", prompt, flags=re.DOTALL)
     cleaned = re.sub(f"(?:\r?\n)*{re.escape(anchor)}(?:\r?\n)*", "\n\n", cleaned)
-    for marker, end_marker in block_markers:
+    for marker, end_marker in (legacy_calendar_marker, *markers.values()):
         cleaned = re.sub(
             f"(?:\r?\n)*{re.escape(marker)}.*?{re.escape(end_marker)}(?:\r?\n)*",
             "\n\n",
@@ -116,11 +126,11 @@ def _rebuild_system_prompt(prompt: str, blocks: dict[str, str]) -> str:
         )
 
     ordered = [
-        (block_markers[0], blocks.get("calendar", "")),
-        (block_markers[2], blocks.get("daily", "")),
-        (block_markers[1], blocks.get("custom", "")),
-        (block_markers[3], blocks.get("activity", "")),
-        (block_markers[4], blocks.get("busy", "")),
+        (legacy_calendar_marker, blocks.get("calendar", "")),
+        (markers["daily"], blocks.get("daily", "")),
+        (markers["custom"], blocks.get("custom", "")),
+        (markers["activity"], blocks.get("activity", "")),
+        (markers["busy"], blocks.get("busy", "")),
     ]
     sections = []
     for (marker, end_marker), content in ordered:
@@ -131,7 +141,7 @@ def _rebuild_system_prompt(prompt: str, blocks: dict[str, str]) -> str:
         sections.append(emotion_block)
     execution = blocks.get("execution", "")
     if execution and execution.strip():
-        marker, end_marker = block_markers[5]
+        marker, end_marker = markers["execution"]
         sections.append(f"{marker}\n{execution.strip()}\n{end_marker}")
     suffix = "\n\n".join(sections)
     return f"{cleaned.rstrip()}\n\n{suffix}" if cleaned.strip() else suffix
@@ -141,7 +151,7 @@ def _rebuild_system_prompt(prompt: str, blocks: dict[str, str]) -> str:
     "astrbot_plugin_busy_schedule",
     "灵犀 · AI忙碌时段管理",
     "让AI拥有真实的生活节奏！自动计算忙碌时段、智能拦截合并消息、特殊关键词唤醒",
-    "v2.9.0",
+    "v2.9.1",
     "https://github.com/gongzhudeng/astrbot_plugin_busy_schedule",
 )
 class BusySchedulePlugin(Star):
@@ -1357,12 +1367,7 @@ class BusySchedulePlugin(Star):
             self._save_state()
 
         now = datetime.now()
-        calendar_injection = ""
-        build_calendar_injection = getattr(self.injector, "build_calendar_injection", None)
-        if callable(build_calendar_injection):
-            calendar_injection = build_calendar_injection(
-                self._now_in_astrbot_timezone().date()
-            )
+        calendar_date = self._now_in_astrbot_timezone().date()
         active = self._get_active_schedule(now)
         data = active.data if active else None
         timeline = self._get_resolved_timeline(active.owner_date) if active else []
@@ -1374,7 +1379,20 @@ class BusySchedulePlugin(Star):
         if active:
             self._sync_media_execution(active, current_period)
 
-        static_injection = self.injector.build_static_injection(data) if data else ""
+        build_static = getattr(self.injector, "build_static_injection", None)
+        if callable(build_static):
+            static_injection = build_static(data, calendar_date=calendar_date)
+        else:  # compatibility with injectors supplied by older integrations/tests
+            build_calendar = getattr(self.injector, "build_calendar_injection", None)
+            static_injection = ""
+            if callable(build_calendar):
+                legacy_calendar = build_calendar(calendar_date)
+            else:
+                legacy_calendar = ""
+        if not callable(build_static):
+            calendar_injection = legacy_calendar
+        else:
+            calendar_injection = ""
         activity_injection = (
             self.injector.build_activity_injection(data, timeline, now)
             if data
@@ -1399,9 +1417,9 @@ class BusySchedulePlugin(Star):
         req.system_prompt = _rebuild_system_prompt(
             req.system_prompt or "",
             {
-                "calendar": calendar_injection,
                 "custom": custom_injection,
                 "daily": static_injection,
+                "calendar": calendar_injection,
                 "activity": activity_injection,
                 "busy": busy_injection,
                 "execution": execution_injection,
@@ -1631,6 +1649,7 @@ class BusySchedulePlugin(Star):
                     f"当前周期生成失败，继续显示上一份可用日程：{e}"
                 )
         display_date = date.fromisoformat(data.date)
+        calendar_context = build_calendar_context(display_date, self.config)
         is_current_cycle = display_date == owner_date
         weather_line = (
             f"🌦️ 天气：{data.weather.format_summary()}"
@@ -1645,7 +1664,11 @@ class BusySchedulePlugin(Star):
 
         # Build response
         response_parts = [
-            f"📅 {display_date.strftime('%Y-%m-%d')}",
+            f"📅 日期：{calendar_context['date_str']}",
+            f"📆 星期：{calendar_context['weekday']}",
+            f"🌙 农历：{calendar_context['lunar_date'] or '未知'}",
+            f"🎋 节日：{calendar_context['holiday']}",
+            f"⭐ 自定义特别日：{calendar_context['special_days'].replace(chr(10), '；')}",
             *([source_line] if source_line else []),
             weather_line,
             "",
@@ -1670,6 +1693,7 @@ class BusySchedulePlugin(Star):
                 is_busy=self.busy_mgr.is_busy,
                 mode=self._get_config("schedule_image_theme", "自动切换"),
                 source_note=source_line,
+                calendar_context=calendar_context,
             )
             yield event.chain_result([Image.fromBytes(png)])
         except Exception as exc:  # noqa: BLE001
@@ -1935,7 +1959,9 @@ class BusySchedulePlugin(Star):
         custom_text = self.injector.build_custom_injection()
 
         # Part 1: stable daily block.
-        static_text = self.injector.build_static_injection(data)
+        static_text = self.injector.build_static_injection(
+            data, calendar_date=self._now_in_astrbot_timezone().date()
+        )
 
         # Part 2: volatile blocks follow the same system_prompt order as requests.
         activity_text = (
@@ -1962,10 +1988,10 @@ class BusySchedulePlugin(Star):
             "=" * 30,
             "",
             "【system_prompt 固定顺序】",
-            "AstrBot 人设 → 今日穿搭/天气/日程 → 自定义提示 → 下一个/当前活动 → 忙碌状态 → 内心世界锚点 → 执行记录",
+            "AstrBot 人设 → 今日日期/穿搭/天气/日程（同一静态块） → 自定义提示 → 下一个/当前活动 → 忙碌状态 → 内心世界锚点 → 执行记录",
             "",
-            "[今日穿搭 · 今日天气 · 今日日程]",
-            static_text if static_text else "（无已完成日程）",
+            "[今日日期 · 今日穿搭 · 今日天气 · 今日日程]",
+            static_text if static_text else "（日期注入已关闭，且无已完成日程）",
             "",
             "[自定义提示]",
             custom_text if custom_text else "（无自定义内容）",

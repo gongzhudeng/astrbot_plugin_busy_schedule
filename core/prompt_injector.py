@@ -44,7 +44,7 @@ class PromptInjector:
         return f"<character_custom>\n{custom}\n</character_custom>"
 
     def build_calendar_injection(self, date_obj: date) -> str:
-        """Build the date context that is available on every LLM request.
+        """Build the legacy standalone date block for compatible callers.
 
         Args:
             date_obj: Local calendar date for the current request.
@@ -52,34 +52,53 @@ class PromptInjector:
         Returns:
             A stable XML-like prompt block with date and special-day facts.
         """
+        lines = self._build_calendar_lines(date_obj)
+        if not lines:
+            return ""
+        return "\n".join(["<character_calendar>", *lines, "</character_calendar>"])
+
+    def _build_calendar_lines(self, date_obj: date) -> list[str]:
+        """Build date-only lines without a changing clock-time value."""
         if self._cfg("enable_calendar_context_injection", True) is False:
-            return ""
+            return []
         context = build_calendar_context(date_obj, self.config)
-        custom_days = context["special_days"]
-        return "\n".join(
-            [
-                "<character_calendar>",
-                "## 今日日期上下文",
-                f"- 公历日期：{context['date_str']}",
-                f"- 星期：{context['weekday']}",
-                f"- 农历：{context['lunar_date'] or '未知'}",
-                f"- 节日：{context['holiday']}",
-                f"- 特别日：{context['special_day']}",
-                "- 自定义特别日：",
-                custom_days,
-                "</character_calendar>",
-            ]
-        )
+        return [
+            "## 今日日期",
+            f"- 公历日期：{context['date_str']}",
+            f"- 星期：{context['weekday']}",
+            f"- 农历：{context['lunar_date'] or '未知'}",
+            f"- 节日：{context['holiday']}",
+            "- 自定义特别日：",
+            context["special_days"],
+        ]
 
-    def build_static_injection(self, data: ScheduleData) -> str:
-        """Build the complete daily block in its stable outfit/weather/schedule order."""
-        if not data or data.status != "completed":
+    def build_static_injection(
+        self,
+        data: ScheduleData | None,
+        calendar_date: date | None = None,
+    ) -> str:
+        """Build the stable date/outfit/weather/schedule prompt block."""
+        has_schedule = bool(data and data.status == "completed")
+        if calendar_date is None and has_schedule:
+            try:
+                calendar_date = date.fromisoformat(str(data.date))
+            except (TypeError, ValueError):
+                calendar_date = None
+
+        calendar_lines = (
+            self._build_calendar_lines(calendar_date) if calendar_date else []
+        )
+        if not calendar_lines and not has_schedule:
             return ""
 
-        parts = [
-            "<character_static>",
-            "## 今日穿搭",
-        ]
+        parts = ["<character_static>", *calendar_lines]
+        if not has_schedule:
+            parts.append("</character_static>")
+            return "\n".join(parts)
+
+        if calendar_lines:
+            parts.append("")
+        parts.append("## 今日穿搭")
         outfit_text = data.outfit if data.outfit else "未设置"
         if data.hairstyle:
             outfit_text += f"\n发型：{data.hairstyle}"
