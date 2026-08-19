@@ -51,10 +51,22 @@
         "default": ""
       },
       "enable_calendar_context_injection": {
-        "description": "注入今日日期上下文",
-        "hint": "默认将公历日期、星期、农历、节日和自定义特别日注入每次对话的 system_prompt；关闭后仅影响普通对话注入，不影响日程生成。",
+        "description": "旧版日期上下文开关（兼容项）",
+        "hint": "当“日期上下文注入模式”选择“跟随旧开关”时生效；关闭后仅影响普通对话注入，不影响日程生成。",
         "type": "bool",
         "default": true
+      },
+      "calendar_context_injection_mode": {
+        "description": "日期上下文注入模式",
+        "hint": "始终注入：平时只显示公历日期、星期、农历，有节日或特别日才追加；仅在有节日或特别日时注入：平时完全不注入，命中时只显示节日或特别日；完全关闭：任何日期上下文都不注入。",
+        "type": "string",
+        "options": [
+          "跟随旧开关",
+          "始终注入",
+          "仅在有节日或特别日时注入",
+          "完全关闭"
+        ],
+        "default": "跟随旧开关"
       },
       "current_activity_execution_record_enabled": {
         "description": "启用当前活动拍照/语音执行记录",

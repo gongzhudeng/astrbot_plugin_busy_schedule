@@ -58,19 +58,59 @@ class PromptInjector:
         return "\n".join(["<character_calendar>", *lines, "</character_calendar>"])
 
     def _build_calendar_lines(self, date_obj: date) -> list[str]:
-        """Build date-only lines without a changing clock-time value."""
-        if self._cfg("enable_calendar_context_injection", True) is False:
-            return []
+        """Build only the configured calendar facts, never a changing clock time."""
+        mode = self._calendar_injection_mode()
         context = build_calendar_context(date_obj, self.config)
+        holiday_name = context["holiday"]
+        has_holiday = holiday_name != "无已知节日"
+        custom_text = context["special_days"]
+        has_custom_days = custom_text != "无自定义特别日"
+
+        if mode == "disabled":
+            return []
+
+        if mode == "notable_only":
+            if not has_holiday and not has_custom_days:
+                return []
+            lines = ["## 今日特别日"]
+            if has_holiday:
+                lines.append(f"- 节日：{holiday_name}")
+            if has_custom_days:
+                lines.append(custom_text)
+            return lines
+
+        # Always mode: ordinary days contain only the three calendar basics.
         return [
             "## 今日日期",
             f"- 公历日期：{context['date_str']}",
             f"- 星期：{context['weekday']}",
             f"- 农历：{context['lunar_date'] or '未知'}",
-            f"- 节日：{context['holiday']}",
-            "- 自定义特别日：",
-            context["special_days"],
+            *([f"- 节日：{holiday_name}"] if has_holiday else []),
+            *(["- 自定义特别日：", custom_text] if has_custom_days else []),
         ]
+
+    def _calendar_injection_mode(self) -> str:
+        """Resolve the new mode setting while preserving the old bool option."""
+        configured = self._cfg("calendar_context_injection_mode", None)
+        if configured in (None, "", "跟随旧开关"):
+            return (
+                "always"
+                if self._cfg("enable_calendar_context_injection", True) is not False
+                else "disabled"
+            )
+        normalized = str(configured).strip().casefold()
+        if normalized in {"始终注入", "always", "on"}:
+            return "always"
+        if normalized in {
+            "仅在有节日或特别日时注入",
+            "仅在有节日或特别日时",
+            "notable_only",
+            "notable-only",
+        }:
+            return "notable_only"
+        if normalized in {"完全关闭", "关闭", "disabled", "off", "none"}:
+            return "disabled"
+        return "always"
 
     def build_static_injection(
         self,
