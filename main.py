@@ -461,6 +461,7 @@ class BusySchedulePlugin(Star):
                     "owner_date": active.owner_date.isoformat(),
                     "activity": period.activity,
                     "period_type": period.period_type,
+                    "is_busy": period.is_busy,
                     "start": start,
                     "end": end,
                     "valid": valid,

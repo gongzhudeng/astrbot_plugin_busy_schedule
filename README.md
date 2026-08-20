@@ -124,7 +124,7 @@ AstrBot 的 Current datetime 与处理时间代表真正回复时刻；接收时
 ## 开发信息
 
 - 作者：BusySchedule
-- 版本：v2.9.3
+- 版本：v2.9.4
 - 依赖：Pillow
 
 ## 致谢
