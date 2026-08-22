@@ -151,7 +151,7 @@ def _rebuild_system_prompt(prompt: str, blocks: dict[str, str]) -> str:
     "astrbot_plugin_busy_schedule",
     "灵犀 · AI忙碌时段管理",
     "让AI拥有真实的生活节奏！自动计算忙碌时段、智能拦截合并消息、特殊关键词唤醒",
-    "v2.9.3",
+    "v2.9.5",
     "https://github.com/gongzhudeng/astrbot_plugin_busy_schedule",
 )
 class BusySchedulePlugin(Star):
@@ -321,13 +321,14 @@ class BusySchedulePlugin(Star):
         logger.info("[BusySchedule] Plugin terminated")
 
     def _disable_cycle_retries(self, owner_date: date, error: Exception) -> None:
-        """Mark a deterministic protocol failure as handled for this cycle."""
+        """Stop automatic retries for a failed schedule cycle."""
         self._last_refresh_owner_date = owner_date
         self._refresh_retry_owner_date = None
         self._refresh_retry_after = None
         logger.error(
             f"[BusySchedule] Schedule protocol failed for {owner_date}; "
-            f"automatic retries disabled for this cycle: {error}"
+            f"automatic retries disabled for this cycle; run a manual generation "
+            f"command to retry: {error}"
         )
 
     async def _ensure_today_schedule_async(self):
@@ -358,9 +359,7 @@ class BusySchedulePlugin(Star):
             except DeterministicScheduleError as e:
                 self._disable_cycle_retries(owner_date, e)
             except Exception as e:
-                self._refresh_retry_owner_date = owner_date
-                self._refresh_retry_after = datetime.now() + timedelta(minutes=5)
-                logger.error(f"[BusySchedule] Failed to generate schedule: {e}")
+                self._disable_cycle_retries(owner_date, e)
 
         self._sync_schedule_to_context()
 
@@ -602,9 +601,7 @@ class BusySchedulePlugin(Star):
                 except DeterministicScheduleError as e:
                     self._disable_cycle_retries(owner_date, e)
                 except Exception as e:
-                    self._refresh_retry_owner_date = owner_date
-                    self._refresh_retry_after = now + timedelta(minutes=5)
-                    logger.error(f"[BusySchedule] Daily refresh failed: {e}")
+                    self._disable_cycle_retries(owner_date, e)
 
                 self._sync_schedule_to_context()
 

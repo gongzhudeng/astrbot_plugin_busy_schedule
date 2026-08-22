@@ -447,6 +447,28 @@
         },
         "default": 10
       },
+      "schedule_model_max_retries": {
+        "description": "每个日程模型最大重试次数",
+        "hint": "只计算首次请求之后的追加重试次数；0 表示当前模型失败后立即切换下一个模型。",
+        "type": "int",
+        "slider": {
+          "min": 0,
+          "max": 10,
+          "step": 1
+        },
+        "default": 1
+      },
+      "schedule_model_timeout_seconds": {
+        "description": "单次日程模型最大等待时间（秒）",
+        "hint": "每次模型调用的插件层硬超时；超时后按重试次数处理，当前模型耗尽后切换后备模型。",
+        "type": "int",
+        "slider": {
+          "min": 5,
+          "max": 3600,
+          "step": 5
+        },
+        "default": 180
+      },
       "pool": {
         "description": "创意池",
         "hint": "每次生成日程时，各个池会随机选择一个来并入日程生成提示词",

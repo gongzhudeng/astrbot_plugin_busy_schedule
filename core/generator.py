@@ -4,6 +4,7 @@ import asyncio
 import json
 import random
 import re
+import time
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -147,7 +148,6 @@ class DeterministicScheduleError(RuntimeError):
 class ScheduleGenerator:
     """Generates daily schedule with busy period markers."""
 
-    _LLM_CALL_ATTEMPTS = 3
     _FORMAT_REPAIR_ATTEMPTS = 1
 
     def __init__(
@@ -191,6 +191,23 @@ class ScheduleGenerator:
         if schema_default is not None:
             return schema_default
         return default
+
+    def _schedule_model_max_retries(self) -> int:
+        """Return additional retries for one schedule provider (excluding first call)."""
+        try:
+            return max(0, min(10, int(self._cfg("schedule_model_max_retries", 1))))
+        except (TypeError, ValueError):
+            return 1
+
+    def _schedule_model_timeout_seconds(self) -> float:
+        """Return the wall-clock limit for one provider call."""
+        try:
+            return max(
+                1.0,
+                min(3600.0, float(self._cfg("schedule_model_timeout_seconds", 180))),
+            )
+        except (TypeError, ValueError):
+            return 180.0
 
     @staticmethod
     def _provider_id(provider: object) -> str:
@@ -1043,37 +1060,64 @@ class ScheduleGenerator:
         session_id: str,
         system_prompt: str = "",
     ) -> tuple[str, object]:
-        """Call each provider in order, retrying before switching."""
+        """Call each provider in order, then switch immediately after its attempts."""
         if not providers:
             raise RuntimeError("No LLM provider available")
 
         last_error = "all providers returned empty responses"
+        max_retries = self._schedule_model_max_retries()
+        max_attempts = max_retries + 1
+        timeout_seconds = self._schedule_model_timeout_seconds()
         for provider_index, provider in enumerate(providers):
             provider_id = self._provider_id(provider)
             if provider_index > 0:
                 logger.warning(
                     f"[BusySchedule] Switching to schedule fallback provider: {provider_id}"
                 )
-            for attempt in range(self._LLM_CALL_ATTEMPTS):
+            for attempt in range(max_attempts):
+                started = time.perf_counter()
                 try:
-                    resp = await provider.text_chat(
-                        prompt=prompt,
-                        session_id=session_id,
-                        system_prompt=system_prompt or None,
+                    # Keep AstrBot's transport retry layer to one request. The
+                    # plugin-level loop owns the configured retry semantics.
+                    resp = await asyncio.wait_for(
+                        provider.text_chat(
+                            prompt=prompt,
+                            session_id=session_id,
+                            system_prompt=system_prompt or None,
+                            request_max_retries=1,
+                        ),
+                        timeout=timeout_seconds,
                     )
                     text = _extract_completion_text(resp)
                     if text:
+                        logger.info(
+                            f"[BusySchedule] LLM success provider={provider_id} "
+                            f"attempt={attempt + 1}/{max_attempts} "
+                            f"elapsed={time.perf_counter() - started:.1f}s"
+                        )
                         return text, provider
                     last_error = f"provider {provider_id} returned an empty response"
                     logger.warning(
                         f"[BusySchedule] Empty LLM response from {provider_id} "
-                        f"(attempt {attempt + 1}/{self._LLM_CALL_ATTEMPTS})"
+                        f"(attempt {attempt + 1}/{max_attempts}, "
+                        f"elapsed={time.perf_counter() - started:.1f}s)"
+                    )
+                except asyncio.TimeoutError:
+                    last_error = (
+                        f"provider {provider_id} timed out after "
+                        f"{timeout_seconds:.1f}s"
+                    )
+                    logger.warning(
+                        f"[BusySchedule] LLM timeout provider={provider_id} "
+                        f"attempt={attempt + 1}/{max_attempts} "
+                        f"limit={timeout_seconds:.1f}s"
                     )
                 except Exception as exc:
                     last_error = f"provider {provider_id} failed: {exc}"
                     logger.warning(
                         f"[BusySchedule] LLM call failed on {provider_id} "
-                        f"(attempt {attempt + 1}/{self._LLM_CALL_ATTEMPTS}): {exc}"
+                        f"(attempt {attempt + 1}/{max_attempts}, "
+                        f"elapsed={time.perf_counter() - started:.1f}s): {exc}"
                     )
                 finally:
                     await self._cleanup_session(session_id)
