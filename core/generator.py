@@ -51,6 +51,8 @@ _DSL_TAG_PROTOCOL = (
     "- 【主动分享】：既非外出也非用餐但适合主动联系Mando；不与【外出】【用餐】叠加\n"
     "- 同一标签不重复；首个起床活动必须含「小怡醒来」；睡眠活动必须含「睡觉」\n"
 )
+
+
 def _load_schema_defaults() -> dict:
     """Load default values from _conf_schema.json."""
     schema_path = Path(__file__).parent.parent / "_conf_schema.json"
@@ -1104,8 +1106,7 @@ class ScheduleGenerator:
                     )
                 except asyncio.TimeoutError:
                     last_error = (
-                        f"provider {provider_id} timed out after "
-                        f"{timeout_seconds:.1f}s"
+                        f"provider {provider_id} timed out after {timeout_seconds:.1f}s"
                     )
                     logger.warning(
                         f"[BusySchedule] LLM timeout provider={provider_id} "

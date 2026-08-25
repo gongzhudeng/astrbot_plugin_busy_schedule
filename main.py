@@ -6,7 +6,6 @@ import random
 import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Optional
 from zoneinfo import ZoneInfo
 
 from astrbot.api import AstrBotConfig, logger
@@ -115,7 +114,9 @@ def _rebuild_system_prompt(prompt: str, blocks: dict[str, str]) -> str:
     emotion_pattern = f"{re.escape(emotion_start)}.*?{re.escape(emotion_end)}"
     match = re.search(emotion_pattern, prompt, flags=re.DOTALL)
     emotion_block = match.group(0) if match else ""
-    cleaned = re.sub(f"(?:\r?\n)*{emotion_pattern}(?:\r?\n)*", "\n\n", prompt, flags=re.DOTALL)
+    cleaned = re.sub(
+        f"(?:\r?\n)*{emotion_pattern}(?:\r?\n)*", "\n\n", prompt, flags=re.DOTALL
+    )
     cleaned = re.sub(f"(?:\r?\n)*{re.escape(anchor)}(?:\r?\n)*", "\n\n", cleaned)
     for marker, end_marker in (legacy_calendar_marker, *markers.values()):
         cleaned = re.sub(
@@ -167,24 +168,24 @@ class BusySchedulePlugin(Star):
         self.schedule_data_file = self.data_dir / "schedule_data.json"
 
         # Core modules (initialized in initialize())
-        self.data_mgr: Optional[ScheduleDataManager] = None
-        self.generator: Optional[ScheduleGenerator] = None
-        self.busy_mgr: Optional[BusyPeriodManager] = None
-        self.interceptor: Optional[MessageInterceptor] = None
-        self.injector: Optional[PromptInjector] = None
-        self.schedule_editor: Optional[ScheduleEditor] = None
-        self.weather_service: Optional[WeatherService] = None
+        self.data_mgr: ScheduleDataManager | None = None
+        self.generator: ScheduleGenerator | None = None
+        self.busy_mgr: BusyPeriodManager | None = None
+        self.interceptor: MessageInterceptor | None = None
+        self.injector: PromptInjector | None = None
+        self.schedule_editor: ScheduleEditor | None = None
+        self.weather_service: WeatherService | None = None
         self.image_renderer = BusyScheduleImageRenderer(Path(__file__).parent)
         self._schedule_edit_lock = asyncio.Lock()
 
         # Background tasks
-        self._state_check_task: Optional[asyncio.Task] = None
-        self._schedule_gen_task: Optional[asyncio.Task] = None
-        self._daily_refresh_task: Optional[asyncio.Task] = None
+        self._state_check_task: asyncio.Task | None = None
+        self._schedule_gen_task: asyncio.Task | None = None
+        self._daily_refresh_task: asyncio.Task | None = None
 
-        self._last_refresh_owner_date: Optional[date] = None
-        self._refresh_retry_owner_date: Optional[date] = None
-        self._refresh_retry_after: Optional[datetime] = None
+        self._last_refresh_owner_date: date | None = None
+        self._refresh_retry_owner_date: date | None = None
+        self._refresh_retry_after: datetime | None = None
 
         # Peek state: probability stays latched until its delivery transaction finishes
         self._peek_timers: dict[str, asyncio.Task] = {}
@@ -196,11 +197,11 @@ class BusySchedulePlugin(Star):
         self._suppress_exit_delivery = False
 
         # Periodic poll task: background loop that fires while busy
-        self._busy_poll_task: Optional[asyncio.Task] = None
+        self._busy_poll_task: asyncio.Task | None = None
 
         # Target umo for daily schedule generation (persisted across restarts)
-        self._schedule_target_umo: Optional[str] = None
-        self._state_file: Optional[Path] = None
+        self._schedule_target_umo: str | None = None
+        self._state_file: Path | None = None
         self.media_execution = MediaExecutionStore()
         self._media_operation_counter = 0
 
@@ -364,8 +365,8 @@ class BusySchedulePlugin(Star):
         self._sync_schedule_to_context()
 
     def _get_active_schedule(
-        self, now: Optional[datetime] = None
-    ) -> Optional[ActiveSchedule]:
+        self, now: datetime | None = None
+    ) -> ActiveSchedule | None:
         """Return completed data projected onto the current owner cycle."""
         current = now or datetime.now()
         owner_date = get_schedule_owner_date(
@@ -401,7 +402,7 @@ class BusySchedulePlugin(Star):
             resolved.extend(periods)
         return sorted(resolved, key=lambda item: item.start)
 
-    def _export_timeline(self, owner_date: Optional[date] = None) -> list[dict]:
+    def _export_timeline(self, owner_date: date | None = None) -> list[dict]:
         """Return a framework-neutral schedule timeline for downstream plugins."""
         target_date = owner_date or self._get_effective_date()
         active = self.data_mgr.get_active(target_date)
@@ -469,7 +470,7 @@ class BusySchedulePlugin(Star):
             )
         return timeline
 
-    def _export_facts(self, now: Optional[datetime] = None) -> dict:
+    def _export_facts(self, now: datetime | None = None) -> dict:
         """Expose schedule and activity facts without deriving emotional state."""
         current_time = now or datetime.now()
         active = self._get_active_schedule(current_time)
@@ -635,7 +636,7 @@ class BusySchedulePlugin(Star):
                         f"cooldown={self.busy_mgr._is_in_wakeup_cooldown(datetime.now())}"
                     )
 
-    def _current_period(self) -> Optional[BusyPeriod]:
+    def _current_period(self) -> BusyPeriod | None:
         return self.busy_mgr._current_busy_period
 
     def _is_sleeping(self) -> bool:
@@ -1392,9 +1393,7 @@ class BusySchedulePlugin(Star):
         else:
             calendar_injection = ""
         activity_injection = (
-            self.injector.build_activity_injection(data, timeline, now)
-            if data
-            else ""
+            self.injector.build_activity_injection(data, timeline, now) if data else ""
         )
         execution_injection = (
             self.injector.build_execution_injection(self.media_execution.to_dict())
@@ -1458,7 +1457,10 @@ class BusySchedulePlugin(Star):
         用户明确提出调整，或双方已形成因天气变化、降雨时段、温度变化等原因调整
         安排的意图，属于合理触发条件；不能仅因日程中存在天气描述就擅自调整。
         过去活动不可修改；当前普通活动只能修改 end_time；未来普通活动可以新增、
-        更新或删除。穿搭变化使用 set_outfit，通常还应新增未来的换衣服活动。
+        更新或删除。用户要求调整今日穿搭时，无论是整体更换还是只改上衣、下装、
+        发型等某一处，都用 set_outfit 完成。调整穿搭后须检查后续活动是否仍引用
+        旧穿搭（如"在镜子面前自拍小裙子"这类造型活动），如有应在同一次
+        operations_json 中一并更新对应活动；通常还应新增未来的换衣服活动。
         删除重要活动可能需要询问用户时，先使用 mode=check 检查；不要向用户展示
         原始操作 JSON、机械预览或表格。
 
@@ -1466,7 +1468,8 @@ class BusySchedulePlugin(Star):
         - add 使用 start_time、end_time、activity、is_busy。
         - update/remove 使用 target_start_time 和可选的 target_activity 定位。
         - update 可设置 start_time、end_time、activity、is_busy。
-        - set_outfit 使用 outfit 和可选的 outfit_style、hairstyle。
+        - set_outfit 使用 outfit 和可选的 outfit_style、hairstyle；不传 hairstyle
+          表示保留当前发型，用户要求去掉发型时必须显式传 "hairstyle": ""。
 
         Args:
             operations_json(string): action 为 add、update、remove 或 set_outfit 的 JSON 数组。
@@ -1564,6 +1567,8 @@ class BusySchedulePlugin(Star):
                     "status": "saved",
                     "message": "the current schedule was updated",
                     "changes": result.changes,
+                    "outfit": result.data.outfit,
+                    "hairstyle": result.data.hairstyle,
                     "last_updated": result.data.last_updated,
                 },
                 ensure_ascii=False,
@@ -1797,9 +1802,7 @@ class BusySchedulePlugin(Star):
                 f"{next_resolved.start.strftime('%m-%d %H:%M')}-"
                 f"{next_resolved.end.strftime('%m-%d %H:%M')} {period.activity}"
             )
-            response_parts.append(
-                f"\n⏰ 下一个忙碌时段：{next_busy_text}"
-            )
+            response_parts.append(f"\n⏰ 下一个忙碌时段：{next_busy_text}")
 
         # Chat protection status
         chat_protection_text = ""
@@ -1817,7 +1820,9 @@ class BusySchedulePlugin(Star):
 
         # Message queue stats
         queue_stats = self.interceptor.get_queue_stats()
-        queued_messages = sum(int(stats.get("count", 0)) for stats in queue_stats.values())
+        queued_messages = sum(
+            int(stats.get("count", 0)) for stats in queue_stats.values()
+        )
         if queue_stats:
             response_parts.append("\n📨 待处理消息：")
             for user_id, stats in queue_stats.items():

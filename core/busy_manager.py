@@ -1,7 +1,7 @@
 """Busy period manager - handles busy state, sleep, and chat protection."""
 
-from datetime import datetime, date, timedelta
-from typing import Optional
+from datetime import date, datetime, timedelta
+
 from astrbot.api import logger
 
 from .data import (
@@ -24,16 +24,16 @@ class BusyPeriodManager:
 
         # State tracking
         self._is_busy: bool = False
-        self._current_busy_period: Optional[BusyPeriod] = None
-        self._current_resolved_period: Optional[ResolvedPeriod] = None
+        self._current_busy_period: BusyPeriod | None = None
+        self._current_resolved_period: ResolvedPeriod | None = None
         self._is_manual_period: bool = False
-        self._current_busy_owner_date: Optional[date] = None
-        self._current_busy_schedule_time: Optional[tuple[int, int]] = None
-        self._busy_start_time: Optional[datetime] = None
-        self._wakeup_time: Optional[datetime] = None  # When AI was woken up by keyword
-        self._last_chat_model_activity_time: Optional[datetime] = None
+        self._current_busy_owner_date: date | None = None
+        self._current_busy_schedule_time: tuple[int, int] | None = None
+        self._busy_start_time: datetime | None = None
+        self._wakeup_time: datetime | None = None  # When AI was woken up by keyword
+        self._last_chat_model_activity_time: datetime | None = None
         self._reply_inflight: dict[int, datetime] = {}
-        self._last_adjust_time: Optional[datetime] = None
+        self._last_adjust_time: datetime | None = None
 
         # Callbacks
         self._on_enter_busy = None
@@ -54,7 +54,7 @@ class BusyPeriodManager:
         return self._is_busy
 
     @property
-    def current_activity(self) -> Optional[str]:
+    def current_activity(self) -> str | None:
         """Get current busy activity description."""
         if self._current_busy_period:
             return self._current_busy_period.activity
@@ -122,7 +122,7 @@ class BusyPeriodManager:
         """Return the schedule-cycle date that owns the given moment."""
         return get_schedule_owner_date(now, self._parse_schedule_time())
 
-    def _get_active_schedule(self, now: datetime) -> Optional[ActiveSchedule]:
+    def _get_active_schedule(self, now: datetime) -> ActiveSchedule | None:
         """Resolve completed data projected onto the current cycle."""
         return self.data_mgr.get_active(self._get_schedule_owner_date(now))
 
@@ -142,7 +142,7 @@ class BusyPeriodManager:
             )
             return []
 
-    def get_current_busy_period(self, now: datetime) -> Optional[ResolvedPeriod]:
+    def get_current_busy_period(self, now: datetime) -> ResolvedPeriod | None:
         """Return the current busy period on the absolute timeline."""
         owner_date = self._get_schedule_owner_date(now)
         for cycle_date in (owner_date - timedelta(days=1), owner_date):
@@ -151,7 +151,7 @@ class BusyPeriodManager:
                     return resolved
         return None
 
-    def get_next_busy_period(self, now: datetime) -> Optional[ResolvedPeriod]:
+    def get_next_busy_period(self, now: datetime) -> ResolvedPeriod | None:
         """Return the next busy period across the current and next cycle."""
         owner_date = self._get_schedule_owner_date(now)
         candidates = []
@@ -203,7 +203,7 @@ class BusyPeriodManager:
     async def _enter_busy(
         self,
         period: BusyPeriod | ResolvedPeriod,
-        owner_date: Optional[date] = None,
+        owner_date: date | None = None,
     ):
         """Enter busy state and retain its resolved absolute range."""
         resolved = period if isinstance(period, ResolvedPeriod) else None

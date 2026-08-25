@@ -268,7 +268,11 @@ class MessageInterceptor:
         }
         prefix = str(self.merge_prefix).replace("以下是", "这些是")
         return "\n".join(
-            [self._format_template(prefix, values), user_message, self._format_template(self.merge_suffix, values)]
+            [
+                self._format_template(prefix, values),
+                user_message,
+                self._format_template(self.merge_suffix, values),
+            ]
         )
 
     def get_extra_components(self, user_id: str) -> list:

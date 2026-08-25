@@ -212,7 +212,9 @@ class BusyScheduleImageRenderer:
             return text
         suffix = "…"
         shortened = text
-        while shortened and self._text_width(draw, shortened + suffix, font) > max_width:
+        while (
+            shortened and self._text_width(draw, shortened + suffix, font) > max_width
+        ):
             shortened = shortened[:-1]
         return shortened + suffix
 

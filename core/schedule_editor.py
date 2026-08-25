@@ -216,7 +216,18 @@ class ScheduleEditor:
                     operation.get("outfit_style", updated.outfit_style)
                 ).strip()
                 if "hairstyle" in operation:
-                    updated.hairstyle = str(operation.get("hairstyle", "")).strip()
+                    new_hairstyle = str(operation.get("hairstyle", "")).strip()
+                    if new_hairstyle != updated.hairstyle:
+                        updated.hairstyle = new_hairstyle
+                        changes.append(
+                            "cleared hairstyle"
+                            if not new_hairstyle
+                            else f"updated hairstyle to {new_hairstyle}"
+                        )
+                    elif updated.hairstyle:
+                        changes.append(f"hairstyle unchanged: {updated.hairstyle}")
+                elif updated.hairstyle:
+                    changes.append(f"hairstyle unchanged: {updated.hairstyle}")
                 changes.append("updated current outfit")
                 continue
 
