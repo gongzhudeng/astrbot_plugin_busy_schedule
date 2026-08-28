@@ -1,7 +1,7 @@
 """Calendar context for schedule generation and chat prompt injection."""
 
 import logging
-from datetime import date
+from datetime import date, timedelta
 
 try:
     from astrbot.api import logger
@@ -10,6 +10,10 @@ except Exception:  # pragma: no cover - allows standalone calendar tests
 
 _WEEKDAY_CN = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
 _WEEKDAY_SHORT = ("一", "二", "三", "四", "五", "六", "日")
+_RULE_MODE_EXACT = "只此一天"
+_RULE_MODE_ANNUAL_MONTHLY = "每年或每月重复"
+_RULE_MODE_LUNAR = "农历每年"
+_RULE_MODE_WEEKLY = "每周重复"
 _WEEKDAY_LOOKUP = {
     "星期一": 0,
     "周一": 0,
@@ -281,7 +285,14 @@ _LUNAR_YEAR_DAYS = tuple(
 def _cfg_lookup(config: object, key: str, default=None):
     if not isinstance(config, dict):
         return default
-    for group_name in ("基础设置", "忙碌时段", "关键词设置", "消息合并", "日程生成"):
+    for group_name in (
+        "基础设置",
+        "忙碌时段",
+        "关键词设置",
+        "消息合并",
+        "作息制度",
+        "日程生成",
+    ):
         group = config.get(group_name, {})
         if isinstance(group, dict):
             value = group.get(key)
@@ -315,6 +326,149 @@ def _normalize_weekday(value: object) -> int | None:
     if text.isdigit():
         return _normalize_weekday(int(text))
     return _WEEKDAY_LOOKUP.get(text)
+
+
+def _parse_weekday_list(value: object) -> list[int]:
+    """Normalize a weekday config value into zero-based weekday indexes.
+
+    Accepts a single weekday name or digit (string or int) or a list of them,
+    as saved by the multi-select weekday control. Invalid entries are skipped.
+
+    Args:
+        value: Raw config value of a weekday field.
+
+    Returns:
+        De-duplicated zero-based weekday indexes in input order.
+    """
+    entries = list(value) if isinstance(value, (list, tuple)) else [value]
+    weekdays: list[int] = []
+    for entry in entries:
+        weekday = _normalize_weekday(entry)
+        if weekday is not None and weekday not in weekdays:
+            weekdays.append(weekday)
+    return weekdays
+
+
+def _parse_date_list(values: object) -> set[date]:
+    """Parse a config list of ISO date strings into a set of dates.
+
+    Args:
+        values: Raw config value expected to be a list of ``YYYY-MM-DD`` strings.
+
+    Returns:
+        Parsed dates; invalid or empty entries are skipped.
+    """
+    parsed: set[date] = set()
+    if not isinstance(values, (list, tuple)):
+        return parsed
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        try:
+            parsed.add(date.fromisoformat(text))
+        except ValueError:
+            continue
+    return parsed
+
+
+def _is_big_week_saturday_work(date_obj: date, config: object | None = None) -> bool | None:
+    """Return whether this week's Saturday is a workday under alternating weeks.
+
+    Mirrors the Companion Rhythm Assistant: weeks are paired by counting whole
+    weeks from the configured base Saturday, so the alternation stays stable
+    across year boundaries.
+
+    Args:
+        date_obj: Local calendar date; its week's Saturday is evaluated.
+        config: Plugin configuration containing the big/small week anchor.
+
+    Returns:
+        True for a big week (Saturday worked), False for a small week, or None
+        when the anchor date is missing or invalid.
+    """
+    anchor_text = str(_cfg_lookup(config, "big_week_base_saturday", "") or "").strip()
+    anchor = None
+    if anchor_text:
+        try:
+            anchor = date.fromisoformat(anchor_text)
+        except ValueError:
+            anchor = None
+    if anchor is None:
+        logger.warning(
+            "[BusySchedule] Big/small week anchor Saturday %r is missing or invalid",
+            anchor_text,
+        )
+        return None
+    base_type = str(
+        _cfg_lookup(config, "big_week_base_type", "基准周六上班")
+        or "基准周六上班"
+    ).strip()
+    base_is_work = base_type == "基准周六上班"
+    saturday = date_obj + timedelta(days=(5 - date_obj.weekday()))
+    same_as_base = ((saturday - anchor).days // 7) % 2 == 0
+    return same_as_base if base_is_work else not same_as_base
+
+
+def get_work_status(date_obj: date, config: object | None = None) -> str:
+    """Return the user's work/rest status line for the schedule prompt.
+
+    The status belongs to the user (not the AI persona), so the configured
+    label prefix keeps it unambiguous inside the generated schedule. Temporary
+    rest/work dates take priority over the configured work mode.
+
+    Args:
+        date_obj: Local calendar date to evaluate.
+        config: Plugin configuration containing the "作息制度" group.
+
+    Returns:
+        A complete prompt line such as ``- 用户的作息：今天上班（大周）``, or an
+        empty string when unset or unresolvable.
+    """
+    work_mode = str(_cfg_lookup(config, "work_mode", "") or "").strip()
+    if not work_mode:
+        return ""
+    label = str(
+        _cfg_lookup(config, "work_status_label", "用户的作息") or "用户的作息"
+    ).strip() or "用户的作息"
+
+    def line(status: str) -> str:
+        return f"- {label}：{status}"
+
+    if date_obj in _parse_date_list(_cfg_lookup(config, "temp_rest_dates", [])):
+        return line("今天休息（临时休息日）")
+    if date_obj in _parse_date_list(_cfg_lookup(config, "temp_work_dates", [])):
+        return line("今天上班（临时工作日）")
+
+    weekday_index = date_obj.weekday()
+    if work_mode == "双休":
+        return line("今天上班" if weekday_index <= 4 else "今天休息（双休）")
+    if work_mode == "单休":
+        return line("今天上班" if weekday_index <= 5 else "今天休息（单休）")
+    if work_mode == "无休":
+        return line("今天上班（无休）")
+    if work_mode == "自定义":
+        workdays = _parse_weekday_list(_cfg_lookup(config, "custom_work_days", []))
+        return line("今天上班" if weekday_index in workdays else "今天休息")
+    if work_mode == "大小周":
+        big_week = _is_big_week_saturday_work(date_obj, config)
+        if big_week is None:
+            return ""
+        if weekday_index <= 4:
+            return line(
+                "今天上班（大周，本周六上班）"
+                if big_week
+                else "今天上班（小周，本周六休息）"
+            )
+        if weekday_index == 5:
+            return line(
+                "今天上班（大周）" if big_week else "今天休息（小周，双休）"
+            )
+        return line(
+            "今天休息（大周，单休周）" if big_week else "今天休息（小周，双休周）"
+        )
+    logger.warning("[BusySchedule] Unknown work mode %r; skipping work status", work_mode)
+    return ""
 
 
 def _lunar_month_days(year_index: int, month: int) -> int:
@@ -504,9 +658,23 @@ def _parse_special_day_rules(config: object, date_obj: date) -> list[str]:
         if item.get("enabled", True) is False:
             continue
 
+        mode = str(item.get("rule_type") or "").strip()
         exact_date = None
-        exact_text = str(item.get("date") or item.get("special_date") or "").strip()
-        if exact_text:
+        year = None
+        month = None
+        day = None
+        weekdays: list[int] = []
+        lunar_label = ""
+        pre_matched = False
+
+        if mode == _RULE_MODE_EXACT:
+            exact_text = str(item.get("date") or "").strip()
+            if not exact_text:
+                logger.warning(
+                    "[BusySchedule] Ignoring special day rule %s: exact mode requires a date",
+                    index,
+                )
+                continue
             try:
                 exact_date = date.fromisoformat(exact_text)
             except ValueError:
@@ -515,51 +683,117 @@ def _parse_special_day_rules(config: object, date_obj: date) -> list[str]:
                     index,
                     exact_text,
                 )
-                exact_date = None
+                continue
+        elif mode == _RULE_MODE_ANNUAL_MONTHLY:
+            month = _safe_int(item.get("month")) or None
+            day = _safe_int(item.get("day")) or None
+            if month is not None and not 1 <= month <= 12:
+                logger.warning(
+                    "[BusySchedule] Ignoring special day rule %s: invalid month", index
+                )
+                continue
+            if day is not None and not 1 <= day <= 31:
+                logger.warning(
+                    "[BusySchedule] Ignoring special day rule %s: invalid day", index
+                )
+                continue
+            if month is None and day is None:
+                logger.warning(
+                    "[BusySchedule] Ignoring special day rule %s: yearly/monthly repeat requires month or day",
+                    index,
+                )
+                continue
+        elif mode == _RULE_MODE_LUNAR:
+            lunar_month = _safe_int(item.get("lunar_month")) or None
+            lunar_day = _safe_int(item.get("lunar_day")) or None
+            if lunar_month is not None and not 1 <= lunar_month <= 12:
+                logger.warning(
+                    "[BusySchedule] Ignoring special day rule %s: invalid lunar month",
+                    index,
+                )
+                continue
+            if lunar_day is not None and not 1 <= lunar_day <= 30:
+                logger.warning(
+                    "[BusySchedule] Ignoring special day rule %s: invalid lunar day",
+                    index,
+                )
+                continue
+            if lunar_month is None or lunar_day is None:
+                logger.warning(
+                    "[BusySchedule] Ignoring special day rule %s: lunar mode requires lunar month and day",
+                    index,
+                )
+                continue
+            lunar = _solar_to_lunar(date_obj)
+            if not lunar or lunar[3] or (lunar[1], lunar[2]) != (lunar_month, lunar_day):
+                continue
+            lunar_label = f"农历{_lunar_month_cn(lunar_month)}{_lunar_day_cn(lunar_day)}"
+            pre_matched = True
+        elif mode == _RULE_MODE_WEEKLY:
+            weekdays = _parse_weekday_list(item.get("weekday"))
+            if not weekdays:
+                logger.warning(
+                    "[BusySchedule] Ignoring special day rule %s: weekly mode requires at least one valid weekday",
+                    index,
+                )
+                continue
+        else:
+            # Legacy rules without a match mode: every filled condition is ANDed.
+            exact_text = str(item.get("date") or item.get("special_date") or "").strip()
+            if exact_text:
+                try:
+                    exact_date = date.fromisoformat(exact_text)
+                except ValueError:
+                    logger.warning(
+                        "[BusySchedule] Ignoring special day rule %s: invalid date %r",
+                        index,
+                        exact_text,
+                    )
+                    exact_date = None
 
-        year = _safe_int(item.get("year"))
-        month = _safe_int(item.get("month"))
-        day = _safe_int(item.get("day"))
-        year = year or None
-        month = month or None
-        day = day or None
-        weekday = _normalize_weekday(item.get("weekday") or item.get("week_day"))
-        if month is not None and not 1 <= month <= 12:
-            logger.warning(
-                "[BusySchedule] Ignoring special day rule %s: invalid month", index
-            )
-            continue
-        if day is not None and not 1 <= day <= 31:
-            logger.warning(
-                "[BusySchedule] Ignoring special day rule %s: invalid day", index
-            )
-            continue
-        if weekday is None and item.get("weekday") not in (None, ""):
-            logger.warning(
-                "[BusySchedule] Ignoring special day rule %s: invalid weekday",
-                index,
-            )
-            continue
+            year = _safe_int(item.get("year")) or None
+            month = _safe_int(item.get("month")) or None
+            day = _safe_int(item.get("day")) or None
+            if month is not None and not 1 <= month <= 12:
+                logger.warning(
+                    "[BusySchedule] Ignoring special day rule %s: invalid month", index
+                )
+                continue
+            if day is not None and not 1 <= day <= 31:
+                logger.warning(
+                    "[BusySchedule] Ignoring special day rule %s: invalid day", index
+                )
+                continue
+            raw_weekday = item.get("weekday") or item.get("week_day")
+            if raw_weekday not in (None, ""):
+                weekdays = _parse_weekday_list(raw_weekday)
+                if not weekdays:
+                    logger.warning(
+                        "[BusySchedule] Ignoring special day rule %s: invalid weekday",
+                        index,
+                    )
+                    continue
 
-        has_condition = any(
-            value is not None for value in (exact_date, year, month, day, weekday)
-        )
-        if not has_condition:
-            logger.warning(
-                "[BusySchedule] Ignoring special day rule %s: no date condition", index
-            )
-            continue
+        if not pre_matched:
+            has_condition = any(
+                value is not None for value in (exact_date, year, month, day)
+            ) or bool(weekdays)
+            if not has_condition:
+                logger.warning(
+                    "[BusySchedule] Ignoring special day rule %s: no date condition", index
+                )
+                continue
 
-        if exact_date and date_obj != exact_date:
-            continue
-        if year is not None and date_obj.year != year:
-            continue
-        if month is not None and date_obj.month != month:
-            continue
-        if day is not None and date_obj.day != day:
-            continue
-        if weekday is not None and date_obj.weekday() != weekday:
-            continue
+            if exact_date and date_obj != exact_date:
+                continue
+            if year is not None and date_obj.year != year:
+                continue
+            if month is not None and date_obj.month != month:
+                continue
+            if day is not None and date_obj.day != day:
+                continue
+            if weekdays and date_obj.weekday() not in weekdays:
+                continue
 
         title = str(
             item.get("title") or item.get("name") or item.get("label") or ""
@@ -569,14 +803,20 @@ def _parse_special_day_rules(config: object, date_obj: date) -> list[str]:
 
         if title:
             label = title if not note else f"{title}（{note}）"
+        elif pre_matched:
+            label = lunar_label
         elif exact_date is not None:
             label = exact_date.isoformat()
         elif month is not None and day is not None:
             label = f"{month}月{day}日"
-        elif month is None and day is not None and weekday is None:
+        elif month is None and day is not None:
             label = f"每月{day}日"
-        elif weekday is not None:
-            label = f"每周{_WEEKDAY_SHORT[weekday]}"
+        elif month is not None:
+            label = f"{month}月"
+        elif weekdays:
+            label = "每周" + "、".join(
+                _WEEKDAY_SHORT[weekday] for weekday in sorted(weekdays)
+            )
         else:
             label = note or "特别日子"
 
@@ -608,6 +848,7 @@ def build_calendar_context(
     holiday = holiday_name or "无已知节日"
     lunar_date = get_lunar_date_cn(date_obj)
     special_days = _parse_special_day_rules(config, date_obj)
+    work_status = get_work_status(date_obj, config)
     special_day = (
         holiday_name or (special_days[0] if special_days else "") or "无特别日"
     )
@@ -622,6 +863,7 @@ def build_calendar_context(
     return {
         "date_str": date_obj.strftime("%Y年%m月%d日"),
         "weekday": get_weekday_cn(date_obj),
+        "work_status": work_status,
         "holiday": holiday,
         "lunar_date": lunar_date,
         "special_day": special_day,

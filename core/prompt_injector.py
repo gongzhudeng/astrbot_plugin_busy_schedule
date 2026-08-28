@@ -24,6 +24,7 @@ class PromptInjector:
             "忙碌时段",
             "关键词设置",
             "消息合并",
+            "作息制度",
             "日程生成",
         ]:
             group = self.config.get(group_name, {})
@@ -80,14 +81,21 @@ class PromptInjector:
             return lines
 
         # Always mode: ordinary days contain only the three calendar basics.
-        return [
+        lines = [
             "## 今日日期",
             f"- 公历日期：{context['date_str']}",
             f"- 星期：{context['weekday']}",
             f"- 农历：{context['lunar_date'] or '未知'}",
-            *([f"- 节日：{holiday_name}"] if has_holiday else []),
-            *(["- 自定义特别日：", custom_text] if has_custom_days else []),
         ]
+        # Opt-in: the work status belongs to the user, so conversations only
+        # carry it when explicitly enabled (generation prompt always has it).
+        if self._cfg("work_status_to_chat", False) and context.get("work_status"):
+            lines.append(context["work_status"])
+        if has_holiday:
+            lines.append(f"- 节日：{holiday_name}")
+        if has_custom_days:
+            lines.extend(["- 自定义特别日：", custom_text])
+        return lines
 
     def _calendar_injection_mode(self) -> str:
         """Resolve the new mode setting while preserving the old bool option."""

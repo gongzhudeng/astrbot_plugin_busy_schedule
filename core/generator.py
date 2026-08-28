@@ -862,15 +862,23 @@ class ScheduleGenerator:
                 prompt = prompt.replace(f"{{{k}}}", str(v))
 
         if "{lunar_date}" not in template and "{today_summary}" not in template:
-            prompt += (
-                "\n\n## 今日日期与特别日上下文\n"
-                f"- 今日摘要：{ctx['today_summary']}\n"
-                f"- 农历：{ctx['lunar_date'] or '未知'}\n"
-                f"- 节日：{ctx['holiday']}\n"
-                f"- 特别日：{ctx['special_day']}\n"
-                f"- 自定义特别日：\n{ctx['special_days']}\n"
-                "如果存在节日或特别日，可将其自然融入活动主题；不要把文化节日误写成法定放假。"
+            fallback_lines = [
+                "\n\n## 今日日期与特别日上下文",
+                f"- 今日摘要：{ctx['today_summary']}",
+                f"- 农历：{ctx['lunar_date'] or '未知'}",
+            ]
+            # Templates that already render {work_status} must not get the line twice.
+            if ctx.get("work_status") and "{work_status}" not in template:
+                fallback_lines.append(ctx["work_status"])
+            fallback_lines.extend(
+                [
+                    f"- 节日：{ctx['holiday']}",
+                    f"- 特别日：{ctx['special_day']}",
+                    f"- 自定义特别日：\n{ctx['special_days']}",
+                    "如果存在节日或特别日，可将其自然融入活动主题；不要把文化节日误写成法定放假。",
+                ]
             )
+            prompt += "\n".join(fallback_lines)
 
         if extra:
             prompt += f"\n\n## 用户补充要求\n{extra}"
