@@ -157,3 +157,42 @@ def test_status_renders_both_themes(tmp_path):
     assert day.size == night.size == (1080, 1050)
     assert day.mode == night.mode == "RGB"
     assert day.getpixel((500, 20)) != night.getpixel((500, 20))
+
+
+def test_weather_note_lines_wrap_and_truncate(tmp_path):
+    renderer = BusyScheduleImageRenderer(tmp_path)
+    draw = ImageDraw.Draw(Image.new("RGB", (1080, 100)))
+    font = renderer._fonts()["tiny"]
+
+    single = renderer._note_lines(draw, "主要降水时段 07:00~09:00", font, 162)
+    assert single == ["降水 07:00~09:00"]
+
+    double = renderer._note_lines(
+        draw, "主要降水时段 07:00~09:00、15:00~16:30", font, 162
+    )
+    assert len(double) == 2
+    assert all(renderer._text_width(draw, line, font) <= 162 for line in double)
+
+    triple = renderer._note_lines(
+        draw, "主要降水时段 07:00~09:00、11:00~13:00、20:00~22:00", font, 162
+    )
+    assert len(triple) == 2
+    assert triple[-1].endswith("…")
+    assert all(renderer._text_width(draw, line, font) <= 162 for line in triple)
+
+
+def test_schedule_renders_with_multiline_precipitation_note(tmp_path):
+    renderer = BusyScheduleImageRenderer(tmp_path)
+    schedule = make_schedule()
+    schedule.weather.summary = "主要降水时段 07:00~09:00、11:00~13:00、20:00~22:00"
+
+    day = open_png(
+        renderer.render_schedule(schedule, datetime(2026, 8, 29, 10), False, "白天模式")
+    )
+    night = open_png(
+        renderer.render_schedule(schedule, datetime(2026, 8, 29, 21), True, "夜间模式")
+    )
+
+    assert day.width == night.width == 1080
+    assert day.height > 1200
+    assert night.height > 1200

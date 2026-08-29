@@ -271,6 +271,40 @@ class BusyScheduleImageRenderer:
             y += font.size + spacing
         return y
 
+    def _note_lines(self, draw, text: str, font, max_width: int, max_lines: int = 2):
+        """Compact the precipitation note and wrap it at range boundaries.
+
+        Args:
+            draw: Probe drawing context used for measuring text.
+            text: Raw weather summary, e.g. ``主要降水时段 07:00~09:00``.
+            font: Font the note will be drawn with.
+            max_width: Maximum pixel width of a single line.
+            max_lines: Maximum number of lines to keep.
+
+        Returns:
+            At most ``max_lines`` strings; dropped or over-wide content is
+            ellipsized.
+        """
+        parts = str(text).replace("主要降水时段 ", "降水 ").split("、")
+        lines = [parts[0]] if parts else []
+        for part in parts[1:]:
+            if (
+                lines
+                and self._text_width(draw, lines[-1] + "、" + part, font) <= max_width
+            ):
+                lines[-1] += "、" + part
+            else:
+                lines.append(part)
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            lines[-1] = lines[-1].rstrip("、") + "…"
+        return [
+            self._ellipsize(draw, line, font, max_width)
+            if self._text_width(draw, line, font) > max_width
+            else line
+            for line in lines
+        ]
+
     @staticmethod
     def _at_cycle_time(
         owner_date: date, value: str | None, reference: datetime | None
@@ -461,12 +495,47 @@ class BusyScheduleImageRenderer:
             fill=status_color,
         )
         location, temperature, weather_note = self._weather(data)
-        self._rounded(draw, (760, 79, 978, 220), 28, "#FFF4C9")
-        draw.text(
-            (788, 96), f"{location} · 今日天气", font=fonts["tiny"], fill="#806A27"
+        self._rounded(draw, (760, 79, 978, 236), 28, "#FFF4C9")
+        label_text = f"{location} · 今日天气"
+        note_lines = self._note_lines(probe, weather_note, fonts["tiny"], 162)
+        label_bounds = probe.textbbox((0, 0), label_text, font=fonts["tiny"])
+        temp_bounds = probe.textbbox((0, 0), temperature, font=fonts["section"])
+        note_bounds = probe.textbbox((0, 0), note_lines[0], font=fonts["tiny"])
+        note_height = (len(note_lines) - 1) * (fonts["tiny"].size + 5) + (
+            note_bounds[3] - note_bounds[1]
         )
-        draw.text((788, 134), temperature, font=fonts["section"], fill="#4E4324")
-        draw.text((788, 180), weather_note, font=fonts["tiny"], fill="#806A27")
+        content_height = (
+            label_bounds[3]
+            - label_bounds[1]
+            + 16
+            + temp_bounds[3]
+            - temp_bounds[1]
+            + 10
+            + note_height
+        )
+        content_y = 79 + (236 - 79 - content_height) / 2
+        draw.text(
+            (788, content_y - label_bounds[1]),
+            label_text,
+            font=fonts["tiny"],
+            fill="#806A27",
+        )
+        content_y += label_bounds[3] - label_bounds[1] + 16
+        draw.text(
+            (788, content_y - temp_bounds[1]),
+            temperature,
+            font=fonts["section"],
+            fill="#4E4324",
+        )
+        content_y += temp_bounds[3] - temp_bounds[1] + 10
+        self._multiline(
+            draw,
+            (788, content_y - note_bounds[1]),
+            note_lines,
+            fonts["tiny"],
+            "#806A27",
+            spacing=5,
+        )
 
         top = 300
         if source_note:
@@ -626,7 +695,15 @@ class BusyScheduleImageRenderer:
             font=fonts["body_bold"],
             fill="#F4C866",
         )
-        draw.text((558, 313), weather_note, font=fonts["small"], fill="#A7ABB3")
+        note_lines = self._note_lines(probe, weather_note, fonts["small"], 440)
+        note_bounds = probe.textbbox((0, 0), note_lines[0], font=fonts["small"])
+        note_height = (len(note_lines) - 1) * (fonts["small"].size + 4) + (
+            note_bounds[3] - note_bounds[1]
+        )
+        note_y = 292 + (364 - 292 - note_height) / 2 - note_bounds[1]
+        self._multiline(
+            draw, (558, note_y), note_lines, fonts["small"], "#A7ABB3", spacing=4
+        )
         top = 390
         if source_note:
             self._rounded(draw, (58, top, 1022, top + 38), 10, "#453D27")

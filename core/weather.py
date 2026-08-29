@@ -523,7 +523,7 @@ class WeatherService:
                 daily_max if daily_max is not None else max(temperatures)
             ),
             hours=hours,
-            summary=_precipitation_summary(hours),
+            summary=_precipitation_summary(hours, cycle_start.date()),
         )
 
 
@@ -738,7 +738,16 @@ def _format_weather_risks(hours: list[WeatherHour], base_date: date) -> list[str
     return risks
 
 
-def _precipitation_summary(hours: list[WeatherHour]) -> str:
+def _precipitation_summary(hours: list[WeatherHour], base_date: date) -> str:
+    """Summarize wet hour groups relative to the schedule cycle start day.
+
+    Args:
+        hours: Forecast hours covering the schedule cycle.
+        base_date: Day whose ranges can omit the ``MM-DD`` date prefix.
+
+    Returns:
+        Human-readable precipitation summary text.
+    """
     wet = [
         hour
         for hour in hours
@@ -761,5 +770,8 @@ def _precipitation_summary(hours: list[WeatherHour]) -> str:
     for group in groups[:3]:
         start = datetime.fromisoformat(group[0].time)
         end = datetime.fromisoformat(group[-1].time) + timedelta(hours=1)
-        ranges.append(f"{start.strftime('%m-%d %H:%M')}~{end.strftime('%H:%M')}")
+        start_text = start.strftime("%H:%M")
+        if start.date() != base_date:
+            start_text = start.strftime("%m-%d %H:%M")
+        ranges.append(f"{start_text}~{end.strftime('%H:%M')}")
     return "主要降水时段 " + "、".join(ranges)
