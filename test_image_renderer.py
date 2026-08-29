@@ -6,7 +6,8 @@ from astrbot_plugin_busy_schedule.core.image_renderer import (
     BusyScheduleImageRenderer,
     BusyStatusImageData,
 )
-from PIL import Image, ImageDraw
+from astrbot_plugin_busy_schedule.core.style_kit import Canvas, font
+from PIL import Image
 
 
 def make_schedule():
@@ -112,25 +113,23 @@ def test_day_outfit_card_grows_for_future_hairstyle_content(tmp_path):
 
 def test_multiline_activity_row_reserves_additional_bottom_spacing(tmp_path):
     renderer = BusyScheduleImageRenderer(tmp_path)
-    font = renderer._fonts()["body"]
-    draw = ImageDraw.Draw(Image.new("RGB", (1080, 100)))
-    entries = [
-        {"activity": "短活动"},
-        {"activity": "这是一段会稳定换成多行的很长活动描述" * 4},
-    ]
-
-    measured = renderer._measure_rows(
-        draw,
-        entries,
-        300,
-        font,
-        base=103,
-        line_step=40,
-        text_top=51,
-        bottom_padding=24,
+    short = make_schedule()
+    short.schedule = "10:00-11:00 短活动 【可回复】"
+    long_schedule = make_schedule()
+    long_schedule.schedule = (
+        "10:00-11:00 这是一段会稳定换成多行的很长活动描述" * 4 + " 【可回复】"
     )
 
-    assert measured[1][2] >= measured[0][2] + 40
+    short_png = open_png(
+        renderer.render_schedule(short, datetime(2026, 8, 17, 10), False, "白天模式")
+    )
+    long_png = open_png(
+        renderer.render_schedule(
+            long_schedule, datetime(2026, 8, 17, 10), False, "白天模式"
+        )
+    )
+
+    assert long_png.height >= short_png.height + 36
 
 
 def test_status_renders_both_themes(tmp_path):
@@ -154,31 +153,32 @@ def test_status_renders_both_themes(tmp_path):
         renderer.render_status(status, datetime(2026, 8, 17, 22), "夜间模式")
     )
 
-    assert day.size == night.size == (1080, 1050)
+    assert day.width == night.width == 1080
+    assert day.height == night.height > 800
     assert day.mode == night.mode == "RGB"
     assert day.getpixel((500, 20)) != night.getpixel((500, 20))
 
 
 def test_weather_note_lines_wrap_and_truncate(tmp_path):
     renderer = BusyScheduleImageRenderer(tmp_path)
-    draw = ImageDraw.Draw(Image.new("RGB", (1080, 100)))
-    font = renderer._fonts()["tiny"]
+    probe = Canvas(height=8)
+    note_font = font(15, 450)
 
-    single = renderer._note_lines(draw, "主要降水时段 07:00~09:00", font, 162)
+    single = renderer._note_lines(probe, "主要降水时段 07:00~09:00", note_font, 120)
     assert single == ["降水 07:00~09:00"]
 
     double = renderer._note_lines(
-        draw, "主要降水时段 07:00~09:00、15:00~16:30", font, 162
+        probe, "主要降水时段 07:00~09:00、15:00~16:30", note_font, 120
     )
     assert len(double) == 2
-    assert all(renderer._text_width(draw, line, font) <= 162 for line in double)
+    assert all(probe.tlen(line, note_font) <= 120 for line in double)
 
     triple = renderer._note_lines(
-        draw, "主要降水时段 07:00~09:00、11:00~13:00、20:00~22:00", font, 162
+        probe, "主要降水时段 07:00~09:00、11:00~13:00、20:00~22:00", note_font, 120
     )
     assert len(triple) == 2
     assert triple[-1].endswith("…")
-    assert all(renderer._text_width(draw, line, font) <= 162 for line in triple)
+    assert all(probe.tlen(line, note_font) <= 120 for line in triple)
 
 
 def test_schedule_renders_with_multiline_precipitation_note(tmp_path):

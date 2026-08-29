@@ -1,15 +1,14 @@
-"""Local Pillow renderer for busy schedule command images."""
+"""Glassmorphism Pillow renderer for busy schedule command images (B7)."""
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
+from .style_kit import Canvas, c, font
 
 
 @dataclass(frozen=True)
@@ -92,15 +91,9 @@ class BusyScheduleImageRenderer:
             date.fromisoformat(str(getattr(data, "date"))),
             local_now,
         )
-        if theme == "night":
-            image = self._render_night_schedule(
-                data, local_now, is_busy, entries, source_note, calendar_context
-            )
-        else:
-            image = self._render_day_schedule(
-                data, local_now, is_busy, entries, source_note, calendar_context
-            )
-        return self._encode_png(image)
+        return self._render_schedule(
+            data, local_now, is_busy, entries, source_note, calendar_context, theme
+        )
 
     def render_status(
         self,
@@ -118,193 +111,49 @@ class BusyScheduleImageRenderer:
         Returns:
             Encoded RGB PNG bytes.
         """
-        if self.resolve_theme(mode, now) == "night":
-            image = self._render_night_status(status, now)
-        else:
-            image = self._render_day_status(status, now)
-        return self._encode_png(image)
+        theme = self.resolve_theme(mode, now)
+        return self._render_status(status, now, theme)
 
-    def _font(self, size: int, bold: bool = False):
-        candidates = []
-        if bold:
-            candidates.extend(
-                [
-                    Path(r"C:\Windows\Fonts\Dengb.ttf"),
-                    Path(r"C:\Windows\Fonts\msyhbd.ttc"),
-                    Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"),
-                    Path("/System/Library/Fonts/PingFang.ttc"),
-                ]
-            )
-        candidates.extend(
-            [
-                Path(r"C:\Windows\Fonts\NotoSansSC-VF.ttf"),
-                Path(r"C:\Windows\Fonts\msyh.ttc"),
-                Path(r"C:\Windows\Fonts\simhei.ttf"),
-                Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
-                Path("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
-                Path("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"),
-                Path("/System/Library/Fonts/PingFang.ttc"),
-            ]
-        )
-        for path in candidates:
-            if path.is_file():
-                return ImageFont.truetype(str(path), size)
-        return ImageFont.load_default(size=size)
-
-    def _fonts(self) -> dict[str, Any]:
+    # -- palette -----------------------------------------------------------
+    @staticmethod
+    def _palette(theme: str) -> dict[str, Any]:
+        if theme == "night":
+            return {
+                "stops": [(0, c("#171331")), (0.5, c("#1E1A44")), (1, c("#12101F"))],
+                "glows": [
+                    ("#6A55C8", 880, 260, 300, 85),
+                    ("#A85A7A", 140, 1300, 300, 50),
+                    ("#4E4E9E", 900, 2400, 300, 50),
+                ],
+                "ink": "#ECE8F8",
+                "sub": "#9890B5",
+                "accent": "#A18CF0",
+                "coral": "#F08A70",
+                "gold": "#D8BC80",
+                "tint": (46, 42, 82),
+                "talpha": 135,
+                "line": (255, 255, 255, 46),
+                "shadow_a": 95,
+            }
         return {
-            "hero": self._font(56, True),
-            "title": self._font(42, True),
-            "section": self._font(32, True),
-            "body": self._font(28),
-            "body_bold": self._font(28, True),
-            "small": self._font(23),
-            "small_bold": self._font(23, True),
-            "tiny": self._font(19),
-            "time": self._font(24, True),
+            "stops": [(0, c("#F0E6F8")), (0.5, c("#E4E8FA")), (1, c("#FAE9E8"))],
+            "glows": [
+                ("#B79BEB", 880, 260, 300, 85),
+                ("#E8A8C0", 140, 1300, 300, 55),
+                ("#8FA0E8", 900, 2400, 300, 50),
+            ],
+            "ink": "#2E2840",
+            "sub": "#7E7494",
+            "accent": "#8B72E0",
+            "coral": "#E0785E",
+            "gold": "#C09040",
+            "tint": (255, 255, 255),
+            "talpha": 135,
+            "line": (255, 255, 255, 215),
+            "shadow_a": 40,
         }
 
-    def _load_avatar(self, size: int, border: tuple[int, int, int, int]):
-        # Read on every render so replacing logo.png takes effect immediately.
-        try:
-            source = Image.open(self.plugin_dir / "logo.png").convert("RGB")
-        except Exception:
-            return None
-        source = ImageOps.fit(
-            source,
-            (size, size),
-            method=Image.Resampling.LANCZOS,
-            centering=(0.5, 0.42),
-        )
-        mask = Image.new("L", (size, size), 0)
-        ImageDraw.Draw(mask).ellipse((0, 0, size - 1, size - 1), fill=255)
-        result = Image.new("RGBA", (size + 12, size + 12), (0, 0, 0, 0))
-        ImageDraw.Draw(result).ellipse((0, 0, size + 11, size + 11), fill=border)
-        result.paste(source, (6, 6), mask)
-        return result
-
-    @staticmethod
-    def _rounded(draw, box, radius, fill, outline=None, width=1):
-        draw.rounded_rectangle(
-            box, radius=radius, fill=fill, outline=outline, width=width
-        )
-
-    @staticmethod
-    def _shadow(image, box, radius=28, blur=18, offset=(0, 8)):
-        layer = Image.new("RGBA", image.size, (0, 0, 0, 0))
-        draw = ImageDraw.Draw(layer)
-        x1, y1, x2, y2 = box
-        ox, oy = offset
-        draw.rounded_rectangle(
-            (x1 + ox, y1 + oy, x2 + ox, y2 + oy),
-            radius=radius,
-            fill=(30, 40, 60, 28),
-        )
-        image.alpha_composite(layer.filter(ImageFilter.GaussianBlur(blur)))
-
-    @staticmethod
-    def _text_width(draw, text, font):
-        return draw.textbbox((0, 0), text, font=font)[2]
-
-    def _ellipsize(self, draw, text: str, font, max_width: int) -> str:
-        """Keep user-defined observance names inside the image header."""
-        if self._text_width(draw, text, font) <= max_width:
-            return text
-        suffix = "…"
-        shortened = text
-        while (
-            shortened and self._text_width(draw, shortened + suffix, font) > max_width
-        ):
-            shortened = shortened[:-1]
-        return shortened + suffix
-
-    @staticmethod
-    def _calendar_observance(calendar_context: dict[str, str] | None) -> str:
-        if not calendar_context:
-            return ""
-        labels: list[str] = []
-        holiday = str(calendar_context.get("holiday", "")).strip()
-        if holiday and holiday != "无已知节日":
-            labels.append(holiday)
-        custom_text = str(calendar_context.get("special_days", "")).strip()
-        if custom_text and custom_text != "无自定义特别日":
-            for line in custom_text.splitlines():
-                label = line.removeprefix("- ").strip()
-                if label and label not in labels:
-                    labels.append(label)
-        return " / ".join(labels) if labels else "无已知节日"
-
-    @staticmethod
-    def _centered_text_xy(draw, box, text, font):
-        left, top, right, bottom = box
-        bounds = draw.textbbox((0, 0), text, font=font)
-        width = bounds[2] - bounds[0]
-        height = bounds[3] - bounds[1]
-        return (
-            left + (right - left - width) / 2 - bounds[0],
-            top + (bottom - top - height) / 2 - bounds[1],
-        )
-
-    def _wrap(self, draw, text: str, font, max_width: int) -> list[str]:
-        lines = []
-        for paragraph in str(text).splitlines() or [""]:
-            if not paragraph:
-                lines.append("")
-                continue
-            line = ""
-            for char in paragraph:
-                candidate = line + char
-                if line and self._text_width(draw, candidate, font) > max_width:
-                    lines.append(line)
-                    line = char
-                else:
-                    line = candidate
-            if line:
-                lines.append(line)
-        return lines or [""]
-
-    @staticmethod
-    def _multiline(draw, xy, lines, font, fill, spacing=10):
-        x, y = xy
-        for line in lines:
-            draw.text((x, y), line, font=font, fill=fill)
-            y += font.size + spacing
-        return y
-
-    def _note_lines(self, draw, text: str, font, max_width: int, max_lines: int = 2):
-        """Compact the precipitation note and wrap it at range boundaries.
-
-        Args:
-            draw: Probe drawing context used for measuring text.
-            text: Raw weather summary, e.g. ``主要降水时段 07:00~09:00``.
-            font: Font the note will be drawn with.
-            max_width: Maximum pixel width of a single line.
-            max_lines: Maximum number of lines to keep.
-
-        Returns:
-            At most ``max_lines`` strings; dropped or over-wide content is
-            ellipsized.
-        """
-        parts = str(text).replace("主要降水时段 ", "降水 ").split("、")
-        lines = [parts[0]] if parts else []
-        for part in parts[1:]:
-            if (
-                lines
-                and self._text_width(draw, lines[-1] + "、" + part, font) <= max_width
-            ):
-                lines[-1] += "、" + part
-            else:
-                lines.append(part)
-        if len(lines) > max_lines:
-            lines = lines[:max_lines]
-            lines[-1] = lines[-1].rstrip("、") + "…"
-        return [
-            self._ellipsize(draw, line, font, max_width)
-            if self._text_width(draw, line, font) > max_width
-            else line
-            for line in lines
-        ]
-
+    # -- shared data helpers (kept from the previous renderer) ---------------
     @staticmethod
     def _at_cycle_time(
         owner_date: date, value: str | None, reference: datetime | None
@@ -356,36 +205,20 @@ class BusyScheduleImageRenderer:
             )
         return entries
 
-    def _measure_rows(
-        self,
-        draw,
-        entries,
-        width,
-        font,
-        base,
-        line_step,
-        text_top,
-        bottom_padding,
-    ):
-        measured = []
-        for entry in entries:
-            lines = self._wrap(draw, entry["activity"], font, width)
-            text_height = (len(lines) - 1) * line_step + font.size
-            height = max(base, text_top + text_height + bottom_padding)
-            measured.append((entry, lines, height))
-        return measured
-
     @staticmethod
-    def _outfit_items(data: Any) -> list[str]:
-        items = [
-            line.strip()
-            for line in str(getattr(data, "outfit", "")).splitlines()
-            if line.strip()
-        ]
+    def _outfit_items(data: Any) -> list[tuple[str, str]]:
+        """Parse outfit lines into ``(key, value)`` pairs for two columns."""
+        pairs: list[tuple[str, str]] = []
+        for line in str(getattr(data, "outfit", "")).splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            key, sep, value = line.partition("：")
+            pairs.append((key if sep else "", value if sep else line))
         hairstyle = str(getattr(data, "hairstyle", "") or "").strip()
         if hairstyle:
-            items.append(f"发型：{hairstyle}")
-        return items or ["今日穿搭暂未设置"]
+            pairs.append(("发型", hairstyle))
+        return pairs or [("", "今日穿搭暂未设置")]
 
     @staticmethod
     def _weather(data: Any) -> tuple[str, str, str]:
@@ -396,9 +229,9 @@ class BusyScheduleImageRenderer:
         minimum = getattr(weather, "temperature_min_c", None)
         maximum = getattr(weather, "temperature_max_c", None)
         temperature = (
-            f"{minimum:g}~{maximum:g}℃"
+            f"{minimum:g}~{maximum:g}°C"
             if minimum is not None and maximum is not None
-            else "--℃"
+            else "--°C"
         )
         note = str(getattr(weather, "summary", "") or "无明显降水时段")
         return location, temperature, note
@@ -407,556 +240,395 @@ class BusyScheduleImageRenderer:
     def _weekday(value: date) -> str:
         return ("一", "二", "三", "四", "五", "六", "日")[value.weekday()]
 
-    def _render_day_schedule(
-        self, data, now, is_busy, entries, source_note, calendar_context=None
-    ):
-        fonts = self._fonts()
-        probe = ImageDraw.Draw(Image.new("RGB", (self.width, 100)))
+    @staticmethod
+    def _calendar_observance(calendar_context: dict[str, str] | None) -> str:
+        if not calendar_context:
+            return ""
+        labels: list[str] = []
+        holiday = str(calendar_context.get("holiday", "")).strip()
+        if holiday and holiday != "无已知节日":
+            labels.append(holiday)
+        custom_text = str(calendar_context.get("special_days", "")).strip()
+        if custom_text and custom_text != "无自定义特别日":
+            for line in custom_text.splitlines():
+                label = line.removeprefix("- ").strip()
+                if label and label not in labels:
+                    labels.append(label)
+        return " / ".join(labels) if labels else "无已知节日"
+
+    # -- drawing helpers ------------------------------------------------------
+    def _card(self, cv: Canvas, box, pal, radius=30):
+        cv.shadow(box, radius, 22, 12, alpha=pal["shadow_a"])
+        cv.glass(
+            box,
+            radius=radius,
+            tint=pal["tint"],
+            alpha=pal["talpha"],
+            outline=pal["line"],
+            owidth=1.5,
+        )
+
+    def _ellipsize(self, probe: Canvas, text: str, f, max_width: float) -> str:
+        """Trim ``text`` with an ellipsis so it fits ``max_width``."""
+        if probe.tlen(text, f) <= max_width:
+            return text
+        suffix = "…"
+        while text and probe.tlen(text + suffix, f) > max_width:
+            text = text[:-1]
+        return text + suffix
+
+    def _note_lines(
+        self, probe: Canvas, text: str, f, max_width: float, max_lines: int = 2
+    ) -> list[str]:
+        """Compact the precipitation note, wrapping at range boundaries."""
+        parts = str(text).replace("主要降水时段 ", "降水 ").split("、")
+        lines = [parts[0]] if parts else []
+        for part in parts[1:]:
+            if lines and probe.tlen(lines[-1] + "、" + part, f) <= max_width:
+                lines[-1] += "、" + part
+            else:
+                lines.append(part)
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            lines[-1] = lines[-1].rstrip("、") + "…"
+        return [
+            self._ellipsize(probe, line, f, max_width)
+            if probe.tlen(line, f) > max_width
+            else line
+            for line in lines
+        ]
+
+    def _header(self, cv: Canvas, pal, title: str, date_line: str, en: str):
+        self._card(cv, (58, 52, 1022, 236), pal)
+        cv.avatar(self.plugin_dir / "logo.png", 926, 144, 104, pal["line"], 3)
+        cv.spaced(92, 84, en, font(17, 500), pal["accent"], 5)
+        cv.text(92, 114, title, font(40, 800), pal["ink"])
+        cv.text(92, 178, date_line, font(20, 450), pal["sub"])
+
+    # -- schedule image ---------------------------------------------------
+    def _render_schedule(
+        self,
+        data: Any,
+        now: datetime,
+        is_busy: bool,
+        entries: list[dict[str, Any]],
+        source_note: str,
+        calendar_context: dict[str, str] | None,
+        theme: str,
+    ) -> bytes:
+        pal = self._palette(theme)
+        ink, sub = pal["ink"], pal["sub"]
+        accent, coral, gold = pal["accent"], pal["coral"], pal["gold"]
+
+        probe = Canvas(height=8)
+        af = font(26, 500)
         outfit = self._outfit_items(data)
-        midpoint = (len(outfit) + 1) // 2
-        columns = (outfit[:midpoint], outfit[midpoint:])
-        outfit_columns = []
-        for column in columns:
-            measured_column = []
-            for value in column:
-                lines = self._wrap(probe, value, fonts["small"], 380)
-                text_height = (len(lines) - 1) * 34 + fonts["small"].size
-                measured_column.append((lines, max(46, text_height + 10)))
-            outfit_columns.append(measured_column)
-        rows = self._measure_rows(
-            probe,
-            entries,
-            700,
-            fonts["body"],
-            base=103,
-            line_step=40,
-            text_top=51,
-            bottom_padding=24,
-        )
-        source_height = 48 if source_note else 0
-        outfit_content_height = max(
-            (sum(item[1] for item in column) for column in outfit_columns),
-            default=0,
-        )
-        outfit_height = 112 + outfit_content_height + 44
-        timeline_height = 126 + sum(row[2] for row in rows) + 30
-        card_gap = 34
-        height = 300 + source_height + outfit_height + card_gap + timeline_height + 100
+        outfit_rows = (len(outfit) + 1) // 2
+        outfit_lines = [probe.wrap(value, font(22, 500), 310) for _, value in outfit]
+        outfit_row_hs = [max(54, 30 + len(ls) * 28) for ls in outfit_lines]
+        col_heights = [0, 0]
+        for i, hh in enumerate(outfit_row_hs):
+            col_heights[i // outfit_rows] += hh
+        plan_lines = [probe.wrap(e["activity"], af, 555) for e in entries]
+        row_hs = [max(84, 48 + len(ls) * 36) for ls in plan_lines]
+        location, temperature, weather_note = self._weather(data)
+        note_lines = self._note_lines(probe, weather_note, font(15, 450), 270)
 
-        image = Image.new("RGBA", (self.width, height), "#F5F7FB")
-        draw = ImageDraw.Draw(image)
-        for y in range(0, height, 32):
-            draw.line((0, y, self.width, y), fill="#E9EDF5", width=1)
-        draw.rectangle((0, 0, 18, height), fill="#FF8E88")
-        draw.rectangle((18, 0, 28, height), fill="#87BDE8")
-        self._rounded(draw, (58, 46, 1022, 265), 34, "#FFFFFF")
-        avatar = self._load_avatar(140, (135, 189, 232, 255))
-        if avatar:
-            image.alpha_composite(avatar, (82, 78))
+        s_top = 264
+        banner_h = 0
+        banner_top = s_top + 128 + 24
+        if source_note:
+            banner_lines = probe.wrap(source_note, font(18, 500), 850)
+            banner_h = 28 + len(banner_lines) * 28
+        outfit_top = s_top + 128 + (banner_h + 24 if source_note else 32)
+        oh = 100 + max(col_heights) + 24
+        p_top = outfit_top + oh + 32
+        p_h = 104 + sum(row_hs) + 20
+        yf = p_top + p_h + 40
+
+        cv = Canvas(
+            height=int(yf + 46) + 40, bg="#F0E6F8" if theme == "day" else "#171331"
+        )
+        cv.bg_gradient(pal["stops"])
+        for col, gx, gy, gr, ga in pal["glows"]:
+            cv.glow(gx, gy, gr, c(col), ga)
+
+        # header
         display_date = date.fromisoformat(str(data.date))
-        draw.text((264, 67), "小怡的今日行程", font=fonts["hero"], fill="#27324A")
-        date_line = (
-            f"{display_date:%Y.%m.%d}  ·  星期{self._weekday(display_date)}"
-            f"  ·  {self._calendar_observance(calendar_context)}"
+        observance = self._calendar_observance(calendar_context)
+        date_text = (
+            f"{display_date:%Y.%m.%d} · 星期{self._weekday(display_date)}"
+            + (f" · {observance}" if observance else "")
+            + f" · {now:%H:%M}"
         )
-        draw.text(
-            (267, 137),
-            self._ellipsize(draw, date_line, fonts["small"], 455),
-            font=fonts["small"],
-            fill="#69748B",
+        self._header(
+            cv,
+            pal,
+            "小怡的今日行程",
+            self._ellipsize(probe, date_text, font(20, 450), 620),
+            "VIOLET · DAILY SCHEDULE",
         )
-        status_fill = "#FFEAE8" if is_busy else "#E7F4FF"
-        status_color = "#D85B52" if is_busy else "#236FA8"
         status_text = "忙碌中 · 暂缓回复" if is_busy else "在线 · 可回消息"
-        status_box = (267, 184, 485, 222)
-        self._rounded(draw, status_box, 19, status_fill)
-        text_bounds = draw.textbbox((0, 0), status_text, font=fonts["tiny"])
-        text_width = text_bounds[2] - text_bounds[0]
-        dot_size = 10
-        dot_gap = 12
-        group_width = dot_size + dot_gap + text_width
-        group_left = status_box[0] + (status_box[2] - status_box[0] - group_width) / 2
-        group_center_y = (status_box[1] + status_box[3]) / 2
-        draw.ellipse(
-            (
-                group_left,
-                group_center_y - dot_size / 2,
-                group_left + dot_size,
-                group_center_y + dot_size / 2,
-            ),
-            fill=status_color,
-        )
-        text_x = group_left + dot_size + dot_gap
-        text_y = group_center_y - (text_bounds[3] - text_bounds[1]) / 2 - text_bounds[1]
-        draw.text(
-            (text_x, text_y),
+        status_col = coral if is_busy else accent
+        cv.pill(
+            826,
+            182,
             status_text,
-            font=fonts["tiny"],
-            fill=status_color,
-        )
-        location, temperature, weather_note = self._weather(data)
-        self._rounded(draw, (760, 79, 978, 236), 28, "#FFF4C9")
-        label_text = f"{location} · 今日天气"
-        note_lines = self._note_lines(probe, weather_note, fonts["tiny"], 162)
-        label_bounds = probe.textbbox((0, 0), label_text, font=fonts["tiny"])
-        temp_bounds = probe.textbbox((0, 0), temperature, font=fonts["section"])
-        note_bounds = probe.textbbox((0, 0), note_lines[0], font=fonts["tiny"])
-        note_height = (len(note_lines) - 1) * (fonts["tiny"].size + 5) + (
-            note_bounds[3] - note_bounds[1]
-        )
-        content_height = (
-            label_bounds[3]
-            - label_bounds[1]
-            + 16
-            + temp_bounds[3]
-            - temp_bounds[1]
-            + 10
-            + note_height
-        )
-        content_y = 79 + (236 - 79 - content_height) / 2
-        draw.text(
-            (788, content_y - label_bounds[1]),
-            label_text,
-            font=fonts["tiny"],
-            fill="#806A27",
-        )
-        content_y += label_bounds[3] - label_bounds[1] + 16
-        draw.text(
-            (788, content_y - temp_bounds[1]),
-            temperature,
-            font=fonts["section"],
-            fill="#4E4324",
-        )
-        content_y += temp_bounds[3] - temp_bounds[1] + 10
-        self._multiline(
-            draw,
-            (788, content_y - note_bounds[1]),
-            note_lines,
-            fonts["tiny"],
-            "#806A27",
-            spacing=5,
+            font(17, 600),
+            c(status_col),
+            c(status_col, 34),
+            padx=16,
+            pady=8,
+            anchor="ra",
         )
 
-        top = 300
-        if source_note:
-            self._rounded(draw, (58, top, 1022, top + 38), 12, "#FFF4C9")
-            draw.text((82, top + 6), source_note, font=fonts["tiny"], fill="#806A27")
-            top += source_height
-        outfit_bottom = top + outfit_height
-        self._shadow(image, (58, top, 1022, outfit_bottom))
-        draw = ImageDraw.Draw(image)
-        self._rounded(draw, (58, top, 1022, outfit_bottom), 28, "#FFFFFF")
-        draw.text((92, top + 28), "TODAY'S LOOK", font=fonts["tiny"], fill="#E06A65")
-        draw.text((92, top + 62), "今日穿搭", font=fonts["section"], fill="#27324A")
-        for column_index, column in enumerate(outfit_columns):
-            y = top + 112
-            x = 92 + column_index * 458
-            for lines, row_height in column:
-                draw.ellipse((x + 6, y + 9, x + 16, y + 19), fill="#87BDE8")
-                self._multiline(
-                    draw, (x + 34, y), lines, fonts["small"], "#4D576D", spacing=11
+        # summary strip: dynamic counts + weather
+        self._card(cv, (58, s_top, 1022, s_top + 128), pal, radius=26)
+        n_busy = sum(1 for e in entries if e["busy"])
+        stats = [
+            ("时段", str(len(entries)), ""),
+            ("忙碌", str(n_busy), " 段"),
+            ("空闲", str(len(entries) - n_busy), " 段"),
+        ]
+        nf, uf = font(34, 700, "num"), font(18, 600)
+        base = s_top + 62
+        for i, (label, value, unit) in enumerate(stats):
+            x = 92 + i * 196
+            cv.text(x, base, value, nf, accent if i else ink, anchor="ls")
+            if unit:
+                cv.text(x + cv.tlen(value, nf) + 4, base, unit, uf, ink, anchor="ls")
+            cv.text(x, s_top + 86, label, font(17, 500), sub)
+        cv.vline(668, s_top + 24, s_top + 104, c(ink, 40), 1.5)
+        cv.text(700, s_top + 26, f"{location} · {temperature}", font(22, 700), ink)
+        ny = s_top + 66
+        for line in note_lines:
+            cv.text(700, ny, line, font(15, 450), sub)
+            ny += 22
+
+        # optional fallback-data notice
+        if source_note and banner_h:
+            self._card(
+                cv, (58, banner_top, 1022, banner_top + banner_h), pal, radius=20
+            )
+            cv.rrect(
+                (58, banner_top, 1022, banner_top + banner_h), 20, fill=c(gold, 36)
+            )
+            by = banner_top + 14
+            for line in probe.wrap(source_note, font(18, 500), 850):
+                cv.text(92, by, line, font(18, 500), gold)
+                by += 28
+
+        # outfit card (height adapts to the item count)
+        self._card(cv, (58, outfit_top, 1022, outfit_top + oh), pal)
+        cv.text(92, outfit_top + 32, "今日穿搭", font(28, 800), ink)
+        cv.spaced(
+            988, outfit_top + 40, "TODAY'S LOOK", font(16, 500), accent, 4, anchor="ra"
+        )
+        kf, vf = font(21, 400), font(22, 500)
+        dot_colors = [accent, coral, gold]
+        col_offsets = [0, 0]
+        for i, (key, value) in enumerate(outfit):
+            col_index = i // outfit_rows
+            x = 92 + col_index * 456
+            ry = outfit_top + 100 + col_offsets[col_index]
+            col_offsets[col_index] += outfit_row_hs[i]
+            cv.dot(x + 6, ry + 16, 4.5, c(dot_colors[i % 3], 220))
+            if key:
+                cv.text(x + 24, ry + 2, key, kf, sub)
+            lines = outfit_lines[i]
+            ly = ry + 1
+            for line in lines[:2]:
+                tx = x + 24 + (cv.tlen(key, kf) + 12 if key else 0)
+                cv.text(tx, ly, line, vf, ink)
+                ly += 28
+
+        # plan card: rows adapt to wrapped text and center on their own axis
+        self._card(cv, (58, p_top, 1022, p_top + p_h), pal)
+        cv.text(92, p_top + 32, "今天要做的事", font(28, 800), ink)
+        cv.spaced(988, p_top + 40, "DAY PLAN", font(16, 500), coral, 4, anchor="ra")
+        tf, te = font(23, 700, "num"), font(16, 450, "num")
+        tagf = font(17, 600)
+        pill_cx = 988 - (cv.tlen("可回复", tagf) + 26) / 2
+        yy = p_top + 108
+        centers = []
+        row_y = yy
+        for rh in row_hs:
+            centers.append(row_y + rh // 2)
+            row_y += rh
+        current_index = next((i for i, e in enumerate(entries) if e["current"]), None)
+        if entries:
+            cv.vline(140, centers[0], centers[-1], c(ink, 55), 2.5)
+            if current_index is not None:
+                cv.vline(140, centers[0], centers[current_index], c(accent, 220), 2.5)
+        row_y = yy
+        for i, e in enumerate(entries):
+            rh = row_hs[i]
+            cy = centers[i]
+            current = bool(e["current"])
+            if current:
+                cv.rrect(
+                    (76, row_y - 2, 1004, row_y + rh + 2),
+                    16,
+                    fill=c(accent, 40),
+                    outline=c(accent, 140),
+                    width=1.5,
                 )
-                y += row_height
-
-        timeline_top = outfit_bottom + card_gap
-        self._rounded(
-            draw,
-            (58, timeline_top, 1022, timeline_top + timeline_height),
-            30,
-            "#FFFFFF",
-        )
-        draw.text(
-            (92, timeline_top + 30), "DAY PLAN", font=fonts["tiny"], fill="#2D8CD5"
-        )
-        draw.text(
-            (92, timeline_top + 66),
-            "今天要做的事",
-            font=fonts["section"],
-            fill="#27324A",
-        )
-        y = timeline_top + 126
-        rail_x = 256
-        draw.line(
-            (rail_x, y, rail_x, timeline_top + timeline_height - 38),
-            fill="#DDE4F0",
-            width=5,
-        )
-        for entry, lines, row_height in rows:
-            color = "#E76E68" if entry["busy"] else "#3C98D4"
-            if entry["current"]:
-                self._rounded(
-                    draw,
-                    (80, y - 8, 994, y + row_height - 8),
-                    22,
-                    "#EEF7FF",
-                    outline="#87BDE8",
-                    width=3,
+            if e["busy"]:
+                cv.dot(140, cy, 8, c(coral))
+                cv.ring(140, cy, 11, pal["tint"], 2.5)
+            else:
+                cv.ring(140, cy, 7, c(accent), 3)
+            cv.text(176, cy - 26, e["start"], tf, accent if current else ink)
+            if e["end"] and e["end"] != "—":
+                cv.text(176, cy + 7, e["end"], te, sub)
+            ly = cy - (len(plan_lines[i]) * 36) // 2 + 2
+            for line in plan_lines[i]:
+                cv.text(300, ly, line, af, ink)
+                ly += 36
+            if current:
+                cv.pill(
+                    pill_cx,
+                    cy,
+                    "当前",
+                    tagf,
+                    "#FFFFFF",
+                    c(accent),
+                    padx=14,
+                    pady=7,
+                    anchor="ma",
                 )
-                draw.text((844, y + 14), "当前", font=fonts["tiny"], fill="#2878B5")
-            draw.text((98, y + 10), entry["start"], font=fonts["time"], fill="#27324A")
-            draw.text((98, y + 43), entry["end"], font=fonts["tiny"], fill="#8A93A5")
-            draw.ellipse((rail_x - 11, y + 24, rail_x + 11, y + 46), fill=color)
-            tag_box = (294, y + 8, 400, y + 42)
-            self._rounded(
-                draw,
-                tag_box,
-                17,
-                "#FFEAE8" if entry["busy"] else "#E7F4FF",
-            )
-            tag_text = "忙碌" if entry["busy"] else "可回复"
-            draw.text(
-                self._centered_text_xy(draw, tag_box, tag_text, fonts["tiny"]),
-                tag_text,
-                font=fonts["tiny"],
-                fill=color,
-            )
-            self._multiline(
-                draw, (294, y + 51), lines, fonts["body"], "#333C50", spacing=12
-            )
-            y += row_height
-        footer_y = timeline_top + timeline_height + 30
-        draw.text(
-            (58, footer_y),
-            "LINGXI  ·  BUSY SCHEDULE",
-            font=fonts["tiny"],
-            fill="#8A93A5",
-        )
-        draw.text(
-            (856, footer_y), f"{now:%H:%M} 更新", font=fonts["tiny"], fill="#8A93A5"
-        )
-        return image.convert("RGB")
-
-    def _render_night_schedule(
-        self, data, now, is_busy, entries, source_note, calendar_context=None
-    ):
-        fonts = self._fonts()
-        probe = ImageDraw.Draw(Image.new("RGB", (self.width, 100)))
-        outfit_text = " / ".join(
-            line.split("：", 1)[-1] for line in self._outfit_items(data)
-        )
-        outfit_lines = self._wrap(probe, outfit_text, fonts["small"], 760)
-        rows = self._measure_rows(
-            probe,
-            entries,
-            650,
-            fonts["body"],
-            base=98,
-            line_step=40,
-            text_top=13,
-            bottom_padding=44,
-        )
-        source_height = 48 if source_note else 0
-        header_height = 390 + source_height
-        outfit_text_height = (len(outfit_lines) - 1) * 34 + fonts["small"].size
-        outfit_card_height = max(72, 20 + outfit_text_height + 26)
-        outfit_gap = 28
-        outfit_height = outfit_card_height + outfit_gap
-        timeline_height = 135 + sum(row[2] for row in rows)
-        height = header_height + outfit_height + timeline_height + 100
-
-        image = Image.new("RGBA", (self.width, height), "#17191D")
-        draw = ImageDraw.Draw(image)
-        for y in range(0, height, 64):
-            draw.line((0, y, self.width, y), fill="#202329", width=1)
-        draw.rectangle((0, 0, self.width, 18), fill="#F06F61")
-        draw.text((58, 61), "DAILY", font=fonts["tiny"], fill="#80D7C5")
-        draw.text((58, 92), "小怡的今日片单", font=fonts["hero"], fill="#F4F1EA")
-        display_date = date.fromisoformat(str(data.date))
-        date_line = (
-            f"{display_date:%Y / %m / %d}  ·  星期{self._weekday(display_date)}"
-            f"  ·  {self._calendar_observance(calendar_context)}"
-        )
-        draw.text(
-            (61, 164),
-            self._ellipsize(draw, date_line, fonts["small"], 720),
-            font=fonts["small"],
-            fill="#A7ABB3",
-        )
-        status_color = "#F06F61" if is_busy else "#80D7C5"
-        status_fill = "#442B2B" if is_busy else "#263F3A"
-        self._rounded(
-            draw, (58, 214, 330, 260), 8, status_fill, outline=status_color, width=2
-        )
-        draw.ellipse((80, 230, 92, 242), fill=status_color)
-        draw.text(
-            (107, 223),
-            "BUSY · 暂缓回复" if is_busy else "ONLINE · 可回消息",
-            font=fonts["tiny"],
-            fill=status_color,
-        )
-        avatar = self._load_avatar(150, (240, 111, 97, 255))
-        if avatar:
-            image.alpha_composite(avatar, (844, 56))
-        location, temperature, weather_note = self._weather(data)
-        self._rounded(draw, (58, 292, 1022, 364), 14, "#22252B")
-        draw.text(
-            (86, 309),
-            f"{location}  {temperature}",
-            font=fonts["body_bold"],
-            fill="#F4C866",
-        )
-        note_lines = self._note_lines(probe, weather_note, fonts["small"], 440)
-        note_bounds = probe.textbbox((0, 0), note_lines[0], font=fonts["small"])
-        note_height = (len(note_lines) - 1) * (fonts["small"].size + 4) + (
-            note_bounds[3] - note_bounds[1]
-        )
-        note_y = 292 + (364 - 292 - note_height) / 2 - note_bounds[1]
-        self._multiline(
-            draw, (558, note_y), note_lines, fonts["small"], "#A7ABB3", spacing=4
-        )
-        top = 390
-        if source_note:
-            self._rounded(draw, (58, top, 1022, top + 38), 10, "#453D27")
-            draw.text((82, top + 6), source_note, font=fonts["tiny"], fill="#F4C866")
-            top += source_height
-        outfit_bottom = top + outfit_card_height
-        self._rounded(
-            draw,
-            (58, top, 1022, outfit_bottom),
-            18,
-            "#22252B",
-            outline="#343840",
-            width=2,
-        )
-        draw.text((86, top + 24), "COSTUME", font=fonts["tiny"], fill="#F06F61")
-        self._multiline(
-            draw, (218, top + 20), outfit_lines, fonts["small"], "#D8D5CE", spacing=11
-        )
-        timeline_top = outfit_bottom + outfit_gap
-        draw.text(
-            (58, timeline_top + 8),
-            "TODAY'S SCENES",
-            font=fonts["title"],
-            fill="#F4F1EA",
-        )
-        draw.text((786, timeline_top + 26), "BUSY", font=fonts["tiny"], fill="#F06F61")
-        draw.text((903, timeline_top + 26), "OPEN", font=fonts["tiny"], fill="#80D7C5")
-        y = timeline_top + 92
-        for entry, lines, row_height in rows:
-            color = "#F06F61" if entry["busy"] else "#80D7C5"
-            fill = "#25292F" if entry["current"] else "#1D2025"
-            self._rounded(
-                draw,
-                (58, y, 1022, y + row_height - 10),
-                14,
-                fill,
-                outline=color if entry["current"] else "#30343B",
-                width=3 if entry["current"] else 1,
-            )
-            draw.text(
-                (80, y + 17),
-                f"{entry['index']:02d}",
-                font=fonts["tiny"],
-                fill="#777D87",
-            )
-            draw.text((130, y + 14), entry["start"], font=fonts["time"], fill="#F4F1EA")
-            draw.text((222, y + 17), entry["end"], font=fonts["tiny"], fill="#777D87")
-            draw.rectangle((304, y + 18, 312, y + row_height - 28), fill=color)
-            self._multiline(
-                draw, (344, y + 13), lines, fonts["body"], "#E4E1DA", spacing=12
-            )
-            state = "BUSY" if entry["busy"] else "OPEN"
-            draw.text((936, y + row_height - 43), state, font=fonts["tiny"], fill=color)
-            if entry["current"]:
-                draw.text(
-                    (768, y + row_height - 43),
-                    "NOW PLAYING",
-                    font=fonts["tiny"],
-                    fill="#F4C866",
+            else:
+                label = "忙碌" if e["busy"] else "可回复"
+                cv.pill(
+                    pill_cx,
+                    cy,
+                    label,
+                    tagf,
+                    c(coral if e["busy"] else accent),
+                    c(coral if e["busy"] else accent, 30),
+                    padx=13,
+                    pady=6,
+                    anchor="ma",
                 )
-            y += row_height
-        footer_y = timeline_top + timeline_height + 20
-        draw.text(
-            (58, footer_y), "LINGXI BUSY SCHEDULE", font=fonts["tiny"], fill="#777D87"
-        )
-        draw.text(
-            (850, footer_y), f"UPDATED {now:%H:%M}", font=fonts["tiny"], fill="#777D87"
-        )
-        return image.convert("RGB")
+            row_y += rh
 
-    def _render_day_status(self, status: BusyStatusImageData, now: datetime):
-        fonts = self._fonts()
-        image = Image.new("RGBA", (self.width, 1050), "#F5F7FB")
-        draw = ImageDraw.Draw(image)
-        for y in range(0, 1050, 32):
-            draw.line((0, y, self.width, y), fill="#E9EDF5", width=1)
-        draw.rectangle((0, 0, 18, 1050), fill="#FF8E88")
-        draw.rectangle((18, 0, 28, 1050), fill="#87BDE8")
-        avatar = self._load_avatar(132, (135, 189, 232, 255))
-        if avatar:
-            image.alpha_composite(avatar, (78, 58))
-        draw.text((250, 66), "忙碌状态", font=fonts["hero"], fill="#27324A")
-        draw.text(
-            (253, 139),
-            f"{now:%Y.%m.%d  %H:%M}",
-            font=fonts["small"],
-            fill="#69748B",
-        )
-        color = "#E76E68" if status.is_busy else "#3C98D4"
-        pale = "#FFF0EE" if status.is_busy else "#EAF5FC"
-        self._shadow(image, (58, 238, 1022, 526), radius=30)
-        draw = ImageDraw.Draw(image)
-        self._rounded(draw, (58, 238, 1022, 526), 30, "#FFFFFF")
-        draw.ellipse((92, 278, 122, 308), fill=color)
-        draw.text(
-            (146, 258),
-            "当前忙碌" if status.is_busy else "当前在线",
-            font=fonts["title"],
-            fill="#27324A",
-        )
-        self._rounded(draw, (790, 265, 970, 313), 24, pale)
-        draw.text(
-            (832, 274),
-            "BUSY" if status.is_busy else "ONLINE",
-            font=fonts["small_bold"],
-            fill=color,
-        )
+        cv.spaced(84, yf, "LINGXI · BUSY SCHEDULE", font(16, 500), sub, 5)
+        cv.text(996, yf - 2, f"{now:%H:%M} 更新", font(19, 450), sub, anchor="ra")
+        return cv.finish(int(yf + 46))
+
+    # -- status image -------------------------------------------------------
+    def _render_status(
+        self, status: BusyStatusImageData, now: datetime, theme: str
+    ) -> bytes:
+        pal = self._palette(theme)
+        ink, sub = pal["ink"], pal["sub"]
+        accent, coral, gold = pal["accent"], pal["coral"], pal["gold"]
+
+        probe = Canvas(height=8)
         activity = status.activity or (
             "暂时无法回复" if status.is_busy else "现在可以正常回复消息"
         )
-        activity_lines = self._wrap(draw, activity, fonts["body"], 820)
-        self._multiline(
-            draw, (94, 337), activity_lines[:3], fonts["body"], "#4D576D", spacing=12
-        )
+        act_lines = probe.wrap(activity, font(24, 450), 860)[:4]
+        meta = []
         if status.remaining_minutes is not None:
-            draw.text(
-                (94, 454),
-                f"预计还需 {status.remaining_minutes} 分钟",
-                font=fonts["small_bold"],
-                fill=color,
-            )
-            if status.current_start and status.current_end:
-                draw.text(
-                    (742, 454),
-                    f"{status.current_start} - {status.current_end}",
-                    font=fonts["small"],
-                    fill="#69748B",
-                )
-        self._draw_day_status_detail(
-            image,
-            draw,
-            58,
-            566,
-            "下一忙碌时段",
-            status.next_busy or "本周期内暂无后续忙碌时段",
-            "#F4C866",
-            fonts,
-        )
-        self._draw_day_status_detail(
-            image,
-            draw,
-            58,
-            708,
-            "聊天保护",
-            status.chat_protection or "当前未启用保护倒计时",
-            "#87BDE8",
-            fonts,
-        )
-        queue_text = (
-            f"{status.queued_messages} 条消息 · {status.queued_users} 个会话"
-            if status.queued_messages
-            else "当前没有待处理消息"
-        )
-        self._draw_day_status_detail(
-            image, draw, 58, 850, "消息队列", queue_text, "#FF8E88", fonts
-        )
-        draw.text(
-            (58, 1012), "LINGXI  ·  BUSY STATUS", font=fonts["tiny"], fill="#8A93A5"
-        )
-        return image.convert("RGB")
-
-    def _draw_day_status_detail(self, image, draw, x, y, label, value, color, fonts):
-        self._shadow(image, (x, y, 1022, y + 118), radius=22, blur=12, offset=(0, 5))
-        draw = ImageDraw.Draw(image)
-        self._rounded(draw, (x, y, 1022, y + 118), 22, "#FFFFFF")
-        draw.rectangle((x, y, x + 10, y + 118), fill=color)
-        draw.text((x + 34, y + 20), label, font=fonts["small"], fill="#69748B")
-        lines = self._wrap(draw, value, fonts["body_bold"], 680)
-        self._multiline(
-            draw, (x + 245, y + 18), lines[:2], fonts["body_bold"], "#27324A", spacing=8
-        )
-
-    def _render_night_status(self, status: BusyStatusImageData, now: datetime):
-        fonts = self._fonts()
-        image = Image.new("RGBA", (self.width, 1050), "#17191D")
-        draw = ImageDraw.Draw(image)
-        for y in range(0, 1050, 64):
-            draw.line((0, y, self.width, y), fill="#202329", width=1)
-        draw.rectangle((0, 0, self.width, 18), fill="#F06F61")
-        draw.text((58, 60), "CURRENT STATUS", font=fonts["tiny"], fill="#80D7C5")
-        draw.text((58, 96), "忙碌状态", font=fonts["hero"], fill="#F4F1EA")
-        draw.text(
-            (61, 169),
-            f"{now:%Y / %m / %d  ·  %H:%M}",
-            font=fonts["small"],
-            fill="#A7ABB3",
-        )
-        avatar = self._load_avatar(146, (240, 111, 97, 255))
-        if avatar:
-            image.alpha_composite(avatar, (844, 54))
-        color = "#F06F61" if status.is_busy else "#80D7C5"
-        fill = "#442B2B" if status.is_busy else "#263F3A"
-        self._rounded(draw, (58, 236, 1022, 508), 24, "#22252B", outline=color, width=3)
-        self._rounded(draw, (86, 268, 306, 316), 8, fill)
-        draw.text(
-            (118, 277),
-            "BUSY · 忙碌中" if status.is_busy else "ONLINE · 可回复",
-            font=fonts["small_bold"],
-            fill=color,
-        )
-        activity = status.activity or (
-            "暂时无法回复" if status.is_busy else "现在可以正常回复消息"
-        )
-        lines = self._wrap(draw, activity, fonts["body"], 840)
-        self._multiline(
-            draw, (86, 355), lines[:3], fonts["body"], "#E4E1DA", spacing=12
-        )
-        if status.remaining_minutes is not None:
-            draw.text(
-                (86, 451),
-                f"REMAINING  {status.remaining_minutes} MIN",
-                font=fonts["small_bold"],
-                fill="#F4C866",
-            )
-            draw.text(
-                (760, 451),
-                f"{status.current_start} - {status.current_end}",
-                font=fonts["small"],
-                fill="#777D87",
-            )
+            meta.append(f"预计还需 {status.remaining_minutes} 分钟")
+        if status.current_start and status.current_end:
+            meta.append(f"{status.current_start} - {status.current_end}")
         details = [
-            ("NEXT BUSY", status.next_busy or "本周期内暂无后续忙碌时段", "#F4C866"),
-            ("CHAT GUARD", status.chat_protection or "当前未启用保护倒计时", "#80D7C5"),
+            ("下一忙碌时段", status.next_busy or "本周期内暂无后续忙碌时段", gold),
             (
-                "MESSAGE QUEUE",
-                f"{status.queued_messages} 条消息 · {status.queued_users} 个会话"
-                if status.queued_messages
-                else "当前没有待处理消息",
-                "#F06F61",
+                "聊天保护",
+                status.chat_protection or "当前未启用保护倒计时",
+                pal["accent"],
+            ),
+            (
+                "消息队列",
+                (
+                    f"{status.queued_messages} 条消息 · {status.queued_users} 个会话"
+                    if status.queued_messages
+                    else "当前没有待处理消息"
+                ),
+                coral,
             ),
         ]
-        y = 548
-        for label, value, accent in details:
-            self._rounded(
-                draw, (58, y, 1022, y + 118), 16, "#1D2025", outline="#30343B"
-            )
-            draw.rectangle((58, y + 18, 66, y + 100), fill=accent)
-            draw.text((90, y + 20), label, font=fonts["tiny"], fill=accent)
-            value_lines = self._wrap(draw, value, fonts["body_bold"], 680)
-            self._multiline(
-                draw,
-                (302, y + 18),
-                value_lines[:2],
-                fonts["body_bold"],
-                "#E4E1DA",
-                spacing=8,
-            )
-            y += 142
-        draw.text((58, 1008), "LINGXI BUSY STATUS", font=fonts["tiny"], fill="#777D87")
-        return image.convert("RGB")
+        value_f = font(23, 600)
+        detail_rows = []
+        for label, value, col in details:
+            lines = probe.wrap(value, value_f, 620)
+            detail_rows.append((label, lines, col, len(lines) * 35 + 56))
 
-    @staticmethod
-    def _encode_png(image: Image.Image) -> bytes:
-        buffer = BytesIO()
-        image.save(buffer, format="PNG", optimize=True)
-        return buffer.getvalue()
+        state_h = 132 + len(act_lines) * 36 + (64 if meta else 24)
+        s_top = 264
+        d_top = s_top + state_h + 24
+        total_h = sum(r[3] for r in detail_rows) + 24 * (len(detail_rows) - 1)
+        yf = d_top + total_h + 40
+
+        cv = Canvas(
+            height=int(yf + 46) + 40, bg="#F0E6F8" if theme == "day" else "#171331"
+        )
+        cv.bg_gradient(pal["stops"])
+        for col, gx, gy, gr, ga in pal["glows"]:
+            cv.glow(gx, gy, gr, c(col), ga)
+
+        self._header(
+            cv,
+            pal,
+            "忙碌状态",
+            f"{now:%Y.%m.%d · %H:%M}",
+            "VIOLET · BUSY STATUS",
+        )
+
+        # current state card
+        state_col = coral if status.is_busy else accent
+        self._card(cv, (58, s_top, 1022, s_top + state_h), pal)
+        cv.dot(104, s_top + 56, 8, c(state_col))
+        cv.text(
+            132,
+            s_top + 34,
+            "当前忙碌" if status.is_busy else "当前在线",
+            font(30, 700),
+            ink,
+        )
+        chip_text = "BUSY" if status.is_busy else "ONLINE"
+        cv.pill(
+            988,
+            s_top + 30,
+            chip_text,
+            font(17, 700, "num"),
+            c(state_col),
+            c(state_col, 30),
+            padx=16,
+            pady=8,
+            anchor="ra",
+        )
+        ay = s_top + 98
+        for line in act_lines:
+            cv.text(100, ay, line, font(24, 450), ink)
+            ay += 36
+        if meta:
+            my = ay + 10
+            mx = 100
+            for text in meta:
+                f = font(18, 600)
+                w = cv.tlen(text, f) + 32
+                cv.rrect((mx, my, mx + w, my + 40), 20, fill=c(gold, 34))
+                cv.text(mx + 16, my + 9, text, f, c(gold))
+                mx += w + 14
+
+        # detail rows (content vertically centered in each card)
+        y = d_top
+        label_f = font(20, 450)
+        for label, lines, col, rh in detail_rows:
+            self._card(cv, (58, y, 1022, y + rh), pal, radius=24)
+            cy = y + rh / 2
+            cv.rrect((92, cy - 10, 102, cy + 10), 3, fill=c(col))
+            cv.text(116, cy, label, label_f, sub, anchor="lm")
+            ly = cy - (len(lines) * 35) / 2 + 4
+            for line in lines:
+                cv.text(320, ly, line, value_f, ink)
+                ly += 35
+            y += rh + 24
+
+        cv.spaced(84, yf, "LINGXI · BUSY STATUS", font(16, 500), sub, 5)
+        cv.text(996, yf - 2, f"{now:%H:%M} 更新", font(19, 450), sub, anchor="ra")
+        return cv.finish(int(yf + 46))
