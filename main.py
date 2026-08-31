@@ -152,7 +152,7 @@ def _rebuild_system_prompt(prompt: str, blocks: dict[str, str]) -> str:
     "astrbot_plugin_busy_schedule",
     "灵犀 · AI忙碌时段管理",
     "让AI拥有真实的生活节奏！自动计算忙碌时段、智能拦截合并消息、特殊关键词唤醒",
-    "v2.9.5",
+    "v2.12.1",
     "https://github.com/gongzhudeng/astrbot_plugin_busy_schedule",
 )
 class BusySchedulePlugin(Star):
@@ -1451,31 +1451,13 @@ class BusySchedulePlugin(Star):
         reason: str = "",
         confirmed_important: bool = False,
     ) -> str:
-        """编辑当前日程周期尚未结束的活动。
-
-        只有在结合完整对话、自身意愿和当前日程，确实决定调整今天安排后才使用。
-        用户明确提出调整，或双方已形成因天气变化、降雨时段、温度变化等原因调整
-        安排的意图，属于合理触发条件；不能仅因日程中存在天气描述就擅自调整。
-        过去活动不可修改；当前普通活动只能修改 end_time；未来普通活动可以新增、
-        更新或删除。用户要求调整今日穿搭时，无论是整体更换还是只改上衣、下装、
-        发型等某一处，都用 set_outfit 完成。调整穿搭后须检查后续活动是否仍引用
-        旧穿搭（如"在镜子面前自拍小裙子"这类造型活动），如有应在同一次
-        operations_json 中一并更新对应活动；通常还应新增未来的换衣服活动。
-        删除重要活动可能需要询问用户时，先使用 mode=check 检查；不要向用户展示
-        原始操作 JSON、机械预览或表格。
-
-        operations_json 是原子操作组成的 JSON 数组：
-        - add 使用 start_time、end_time、activity、is_busy。
-        - update/remove 使用 target_start_time 和可选的 target_activity 定位。
-        - update 可设置 start_time、end_time、activity、is_busy。
-        - set_outfit 使用 outfit 和可选的 outfit_style、hairstyle；不传 hairstyle
-          表示保留当前发型，用户要求去掉发型时必须显式传 "hairstyle": ""。
+        """确实决定调整今天安排时，编辑当前日程周期尚未结束的活动。用户明确提出调整，或双方已形成因天气变化而调整的意图时可用；不能仅因日程含天气描述就擅自调整。
 
         Args:
-            operations_json(string): action 为 add、update、remove 或 set_outfit 的 JSON 数组。
-            mode(string): commit 表示验证通过后立即保存；check 表示只验证、不保存。
-            reason(string): 本次调整的简短对话原因。
-            confirmed_important(boolean): 仅在用户确认删除未来重要活动后设为 true。
+            operations_json(string): 原子操作 JSON 数组。过去活动不可修改；当前普通活动只能改 end_time；未来普通活动可新增、更新或删除。add 使用 start_time、end_time、activity、is_busy；update/remove 用 target_start_time 和可选 target_activity 定位，update 可设置 start_time、end_time、activity、is_busy。调整今日整体或局部穿搭一律用 set_outfit，传 outfit 和可选 outfit_style、hairstyle；不传 hairstyle 表示保留，用户要求去掉发型时显式传空字符串。穿搭变化后检查后续活动是否引用旧穿搭，在同一数组中同步更新，并通常新增未来换衣活动。
+            mode(string): commit 验证后立即保存；check 只验证不保存。删除重要活动可能需要确认时先用 check；不要向用户展示原始 JSON、机械预览或表格。
+            reason(string): 本次调整的简短对话原因，应基于完整对话、自身意愿和当前日程。
+            confirmed_important(boolean): 仅在用户已经确认删除未来重要活动后设为 true，否则保持 false。
         """
         if not self._get_config("enabled", True):
             return json.dumps(
