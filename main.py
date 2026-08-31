@@ -152,7 +152,7 @@ def _rebuild_system_prompt(prompt: str, blocks: dict[str, str]) -> str:
     "astrbot_plugin_busy_schedule",
     "灵犀 · AI忙碌时段管理",
     "让AI拥有真实的生活节奏！自动计算忙碌时段、智能拦截合并消息、特殊关键词唤醒",
-    "v2.12.1",
+    "v2.12.2",
     "https://github.com/gongzhudeng/astrbot_plugin_busy_schedule",
 )
 class BusySchedulePlugin(Star):
@@ -1451,10 +1451,10 @@ class BusySchedulePlugin(Star):
         reason: str = "",
         confirmed_important: bool = False,
     ) -> str:
-        """确实决定调整今天安排时，编辑当前日程周期尚未结束的活动。用户明确提出调整，或双方已形成因天气变化而调整的意图时可用；不能仅因日程含天气描述就擅自调整。
+        """当用户明确提出需要修改日程或修改穿搭时，使用此工具编辑当前日程周期中尚未结束的安排。过去的活动不可修改。
 
         Args:
-            operations_json(string): 原子操作 JSON 数组。过去活动不可修改；当前普通活动只能改 end_time；未来普通活动可新增、更新或删除。add 使用 start_time、end_time、activity、is_busy；update/remove 用 target_start_time 和可选 target_activity 定位，update 可设置 start_time、end_time、activity、is_busy。调整今日整体或局部穿搭一律用 set_outfit，传 outfit 和可选 outfit_style、hairstyle；不传 hairstyle 表示保留，用户要求去掉发型时显式传空字符串。穿搭变化后检查后续活动是否引用旧穿搭，在同一数组中同步更新，并通常新增未来换衣活动。
+            operations_json(string): 原子操作 JSON 数组。过去活动不可修改；当前普通活动只能改 end_time；未来普通活动可新增、更新或删除。add 使用 start_time、end_time、activity、is_busy；update/remove 用 target_start_time 和可选 target_activity 定位，update 可设置 start_time、end_time、activity、is_busy。修改日程时，应注意查看今天的降雨时段；如果新增或修改后的活动落在降雨时段内，需要在调整结果中说明天气影响，并给出必要提醒，例如携带或使用雨伞、为户外活动预留避雨时间，或在合理情况下调整活动安排。调整今日整体或局部穿搭一律用 set_outfit，传 outfit 和可选 outfit_style、hairstyle；不传 hairstyle 表示保留，用户要求去掉发型时显式传空字符串。穿搭变化后检查后续活动是否引用旧穿搭，在同一数组中同步更新，并通常新增未来换衣活动。
             mode(string): commit 验证后立即保存；check 只验证不保存。删除重要活动可能需要确认时先用 check；不要向用户展示原始 JSON、机械预览或表格。
             reason(string): 本次调整的简短对话原因，应基于完整对话、自身意愿和当前日程。
             confirmed_important(boolean): 仅在用户已经确认删除未来重要活动后设为 true，否则保持 false。
