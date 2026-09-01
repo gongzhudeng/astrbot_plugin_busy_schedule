@@ -26,5 +26,5 @@ def test_schedule_tool_version_is_current() -> None:
     root = Path(__file__).parent
     metadata = (root / "metadata.yaml").read_text(encoding="utf-8")
     source = (root / "main.py").read_text(encoding="utf-8")
-    assert "version: v2.12.1" in metadata
-    assert '"v2.12.1"' in source
+    assert "version: v2.12.3" in metadata
+    assert '"v2.12.3"' in source

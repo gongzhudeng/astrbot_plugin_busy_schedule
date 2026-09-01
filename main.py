@@ -152,7 +152,7 @@ def _rebuild_system_prompt(prompt: str, blocks: dict[str, str]) -> str:
     "astrbot_plugin_busy_schedule",
     "灵犀 · AI忙碌时段管理",
     "让AI拥有真实的生活节奏！自动计算忙碌时段、智能拦截合并消息、特殊关键词唤醒",
-    "v2.12.2",
+    "v2.12.3",
     "https://github.com/gongzhudeng/astrbot_plugin_busy_schedule",
 )
 class BusySchedulePlugin(Star):
@@ -479,6 +479,8 @@ class BusySchedulePlugin(Star):
                 "owner_date": "",
                 "current_activity": "",
                 "next_activity": "",
+                "outfit": "",
+                "hairstyle": "",
                 "is_busy": False,
                 "is_sleeping": False,
                 "weather": "",
@@ -491,6 +493,8 @@ class BusySchedulePlugin(Star):
             "owner_date": active.owner_date.isoformat(),
             "current_activity": current.period.activity if current else "",
             "next_activity": next_period.period.activity if next_period else "",
+            "outfit": str(getattr(active.data, "outfit", "") or ""),
+            "hairstyle": str(getattr(active.data, "hairstyle", "") or ""),
             "is_busy": bool(self.busy_mgr and self.busy_mgr.is_busy),
             "is_sleeping": bool(current and current.period.is_sleep),
             "weather": weather.format_summary() if weather else "",

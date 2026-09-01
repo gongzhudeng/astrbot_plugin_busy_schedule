@@ -3,10 +3,11 @@ display_name: 灵犀 · AI忙碌时段管理
 desc: >
   让AI拥有真实的生活节奏！自动计算忙碌时段、智能拦截合并消息、
   提前通知、特殊关键词唤醒，打造拟人化聊天体验。
-version: v2.12.2
+version: v2.12.3
 author: 灵犀
 repo: https://github.com/gongzhudeng/astrbot_plugin_busy_schedule
 help: |
+  v2.12.3：向下游插件正式导出今日穿搭与发型 facts，支持 AI 生图联动；
   v2.12.2：补充日程编辑工具对降雨时段影响的提醒；
   v2.12.1：为 skills_like 模式分层日程编辑工具说明，执行与确认规则延迟到参数 schema；
   v2.12.0：日程与状态图片全新“暮紫玻璃”设计（明暗双主题、毛玻璃质感）；日程卡按内容自适应高度、长活动自动换行，穿搭卡片随条目数量伸缩，统计条实时汇总时段数据；
