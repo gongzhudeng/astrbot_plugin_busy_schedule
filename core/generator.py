@@ -826,13 +826,7 @@ class ScheduleGenerator:
             raise RuntimeError("prompt_template is empty")
 
         creative = creative_context or self._select_creative_context(target_date)
-        settled_emotion = await self._get_emotion_context(umo, target_date)
-        emotion_context = settled_emotion
-        if "{mood_color}" not in template:
-            emotion_context = (
-                f"随机心情色彩：{creative['mood_color']}\n"
-                f"内心世界已结算参考：{settled_emotion}"
-            )
+        emotion_context = await self._get_emotion_context(umo, target_date)
 
         ctx = {
             **build_calendar_context(target_date, self.config),
@@ -1259,16 +1253,18 @@ class ScheduleGenerator:
                 )
 
             # Commit only after the complete result has passed validation.
-            returned_style = str(result.get("outfit_style", "")).strip()
             selected_style = creative_context["outfit_style"]
-            if returned_style and returned_style != selected_style:
-                logger.warning(
-                    f"[BusySchedule] Model returned outfit_style {returned_style!r}; "
-                    f"using selected style {selected_style!r}"
+            returned_style = str(result.get("outfit_style", "")).strip()
+            # Chat agreements may override the pool-selected outfit style.
+            outfit_style = returned_style or selected_style
+            if outfit_style != selected_style:
+                logger.info(
+                    f"[BusySchedule] Using chat-driven outfit_style {outfit_style!r} "
+                    f"(pool default {selected_style!r})"
                 )
             data = ScheduleData(
                 date=target_date.strftime("%Y-%m-%d"),
-                outfit_style=selected_style,
+                outfit_style=outfit_style,
                 daily_theme=creative_context["daily_theme"],
                 mood_color=creative_context["mood_color"],
                 schedule_type=creative_context["schedule_type"],
