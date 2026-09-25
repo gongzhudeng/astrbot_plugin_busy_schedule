@@ -11,7 +11,7 @@ def test_schedule_tool_description_is_layered_for_skills_like() -> None:
     parsed = docstring_parser.parse(BusySchedulePlugin.edit_current_schedule.__doc__ or "")
     assert parsed.description is not None
     assert len(parsed.description.strip()) < 150
-    assert "不能仅因日程含天气描述" in parsed.description
+    assert "过去的活动不可修改" in parsed.description
     assert "set_outfit" not in parsed.description
 
     parameters = {item.arg_name: item.description or "" for item in parsed.params}
@@ -26,5 +26,5 @@ def test_schedule_tool_version_is_current() -> None:
     root = Path(__file__).parent
     metadata = (root / "metadata.yaml").read_text(encoding="utf-8")
     source = (root / "main.py").read_text(encoding="utf-8")
-    assert "version: v2.12.3" in metadata
-    assert '"v2.12.3"' in source
+    assert "version: v2.12.5" in metadata
+    assert '"v2.12.5"' in source

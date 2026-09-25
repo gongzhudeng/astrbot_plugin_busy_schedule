@@ -1,7 +1,9 @@
 """Calendar context for schedule generation and chat prompt injection."""
 
+import json
 import logging
 from datetime import date, timedelta
+from pathlib import Path
 
 try:
     from astrbot.api import logger
@@ -410,12 +412,84 @@ def _is_big_week_saturday_work(date_obj: date, config: object | None = None) -> 
     return same_as_base if base_is_work else not same_as_base
 
 
+_LEGAL_HOLIDAY_CACHE: dict[str, dict[str, dict[date, str]] | None] = {}
+
+
+def _load_legal_holidays() -> dict[str, dict[date, str]] | None:
+    """Load statutory holiday data shared with the Companion Rhythm Assistant.
+
+    Reads only data files (no cross-plugin imports): the public copy under
+    ``data/plugins/legal_holidays.json`` wins, and the copy bundled with
+    astrbot_plugin_time_period_prompt serves as a fallback. Returns None when
+    neither file is available so callers fall back to the work-mode rules.
+
+    Returns:
+        Mapping with "rest" (off days) and "work" (makeup workdays) dicts, or
+        None when no data file could be loaded.
+    """
+    if "data" in _LEGAL_HOLIDAY_CACHE:
+        return _LEGAL_HOLIDAY_CACHE["data"]
+
+    plugins_dir = Path(__file__).resolve().parent.parent.parent
+    candidates = (
+        plugins_dir / "legal_holidays.json",
+        plugins_dir / "astrbot_plugin_time_period_prompt" / "legal_holidays.json",
+    )
+    loaded: dict[str, dict[date, str]] | None = None
+    for path in candidates:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except FileNotFoundError:
+            continue
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[BusySchedule] Legal holiday file unreadable: %s", exc)
+            continue
+
+        days = payload.get("days") if isinstance(payload, dict) else None
+        if not isinstance(days, list):
+            continue
+        offdays: dict[date, str] = {}
+        workdays: dict[date, str] = {}
+        for item in days:
+            if not isinstance(item, dict):
+                continue
+            try:
+                day = date.fromisoformat(str(item.get("date", "")).strip())
+            except ValueError:
+                continue
+            name = str(item.get("name") or "").strip()
+            if bool(item.get("isOffday", True)):
+                offdays[day] = name or "法定节假日"
+            else:
+                workdays[day] = name or "调休补班"
+        if offdays or workdays:
+            loaded = {"rest": offdays, "work": workdays}
+            break
+
+    _LEGAL_HOLIDAY_CACHE["data"] = loaded
+    return loaded
+
+
+def _legal_holiday_status(date_obj: date) -> str | None:
+    """Return "rest"/"work" from the statutory holiday table, or None."""
+    data = _load_legal_holidays()
+    if not data:
+        return None
+    if date_obj in data["rest"]:
+        return "rest"
+    if date_obj in data["work"]:
+        return "work"
+    return None
+
+
 def get_work_status(date_obj: date, config: object | None = None) -> str:
     """Return the user's work/rest status line for the schedule prompt.
 
     The status belongs to the user (not the AI persona), so the configured
     label prefix keeps it unambiguous inside the generated schedule. Temporary
-    rest/work dates take priority over the configured work mode.
+    rest/work dates take priority, then the shared statutory holiday table,
+    then the configured work mode.
 
     Args:
         date_obj: Local calendar date to evaluate.
@@ -439,6 +513,12 @@ def get_work_status(date_obj: date, config: object | None = None) -> str:
         return line("今天休息（临时休息日）")
     if date_obj in _parse_date_list(_cfg_lookup(config, "temp_work_dates", [])):
         return line("今天上班（临时工作日）")
+
+    legal_status = _legal_holiday_status(date_obj)
+    if legal_status == "rest":
+        return line("今天休息（法定节假日）")
+    if legal_status == "work":
+        return line("今天上班（调休补班）")
 
     weekday_index = date_obj.weekday()
     if work_mode == "双休":
