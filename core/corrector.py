@@ -208,6 +208,29 @@ class ScheduleCorrector:
         except (TypeError, ValueError):
             return 5
 
+    async def _attention_is_empty(self, umo: str | None) -> bool:
+        """True only when emotion_state reports an empty attention list.
+
+        Without the callback (plugin absent) this returns False so the
+        correction still runs — never skip on missing information.
+        """
+        live_callback = getattr(
+            self.context, "_emotion_state_get_live_context", None
+        )
+        if not callable(live_callback) or not umo:
+            return False
+        try:
+            live = await live_callback(umo, self._attention_limit())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"[BusySchedule] Attention skip-check unavailable: {exc}"
+            )
+            return False
+        if not isinstance(live, dict):
+            return False
+        attention = str(live.get("attention") or "").strip()
+        return attention in ("", "暂无待关注事项", "暂无待关注事项。")
+
     def _memory_limits(self) -> tuple[int, int]:
         try:
             items = max(0, min(10, int(self._cfg("correction_memory_max_items", 2))))
@@ -485,6 +508,7 @@ class ScheduleCorrector:
         memory_since: str = "",
         now: datetime | None = None,
         manual_instruction: str | None = None,
+        skip_without_attention: bool = True,
     ) -> CorrectionOutcome:
         now = now or datetime.now()
         schedule_time = parse_schedule_time(self._cfg("schedule_time", "07:00"))
@@ -492,6 +516,17 @@ class ScheduleCorrector:
         if active is None or active.data.status != "completed":
             return CorrectionOutcome(
                 triggered=False, note="当前周期没有已完成的日程"
+            )
+
+        if (
+            skip_without_attention
+            and self._cfg("correction_skip_without_attention", True)
+            and not (manual_instruction or "").strip()
+            and await self._attention_is_empty(umo)
+        ):
+            logger.info("[BusySchedule] Correction skipped: no attention items")
+            return CorrectionOutcome(
+                triggered=False, note="无待关注事项，跳过修正"
             )
 
         try:

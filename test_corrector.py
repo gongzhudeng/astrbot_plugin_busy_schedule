@@ -63,11 +63,11 @@ def make_schedule():
     )
 
 
-def make_corrector(tmp_path, config=None, generator=None, after_apply=None):
+def make_corrector(tmp_path, config=None, generator=None, after_apply=None, context=None):
     mgr = ScheduleDataManager(tmp_path / "schedule_data.json")
     mgr.set(OWNER_DATE, make_schedule())
     corrector = ScheduleCorrector(
-        SimpleNamespace(),
+        context or SimpleNamespace(),
         config or {},
         mgr,
         generator or GeneratorStub(""),
@@ -552,6 +552,70 @@ def test_render_remaining_strips_status_markers(tmp_path):
     assert "【忙碌】【忙碌】" not in text
     assert text.count("【忙碌】") == 1
     assert "【外出】" in text  # classification tag kept
+
+
+def test_skips_when_attention_empty(tmp_path):
+    async def live_cb(umo, limit):
+        return {"mood": "平静", "attention": ""}
+
+    gen = GeneratorStub(llm_json({"changed": False, "reason": "ok", "operations": []}))
+    context = SimpleNamespace(_emotion_state_get_live_context=live_cb)
+    corrector, _mgr = make_corrector(tmp_path, generator=gen, context=context)
+
+    outcome = asyncio.run(corrector.run_correction(OWNER_DATE, "umo", now=NOW))
+
+    assert outcome.triggered is False
+    assert "无待关注事项" in outcome.note
+    assert gen.prompts == []  # LLM never called
+
+
+def test_runs_when_attention_present(tmp_path):
+    async def live_cb(umo, limit):
+        return {"mood": "开心", "attention": "1. 下午陪Mando拍街景"}
+
+    gen = GeneratorStub(llm_json({"changed": False, "reason": "ok", "operations": []}))
+    context = SimpleNamespace(_emotion_state_get_live_context=live_cb)
+    corrector, _mgr = make_corrector(tmp_path, generator=gen, context=context)
+
+    outcome = asyncio.run(corrector.run_correction(OWNER_DATE, "umo", now=NOW))
+
+    assert outcome.triggered is True
+    assert gen.prompts, "attention present should still run the correction"
+
+
+def test_manual_instruction_bypasses_attention_skip(tmp_path):
+    async def live_cb(umo, limit):
+        return {"mood": "平静", "attention": ""}
+
+    gen = GeneratorStub(llm_json({"changed": False, "reason": "ok", "operations": []}))
+    context = SimpleNamespace(_emotion_state_get_live_context=live_cb)
+    corrector, _mgr = make_corrector(tmp_path, generator=gen, context=context)
+
+    outcome = asyncio.run(
+        corrector.run_correction(
+            OWNER_DATE, "umo", now=NOW, manual_instruction="下午出去走走"
+        )
+    )
+
+    assert outcome.triggered is True
+    assert gen.prompts, "explicit manual instruction must not be skipped"
+
+
+def test_attention_skip_disabled_by_config(tmp_path):
+    async def live_cb(umo, limit):
+        return {"mood": "平静", "attention": "暂无待关注事项。"}
+
+    gen = GeneratorStub(llm_json({"changed": False, "reason": "ok", "operations": []}))
+    context = SimpleNamespace(_emotion_state_get_live_context=live_cb)
+    config = {"日程修正": {"correction_skip_without_attention": False}}
+    corrector, _mgr = make_corrector(
+        tmp_path, config=config, generator=gen, context=context
+    )
+
+    outcome = asyncio.run(corrector.run_correction(OWNER_DATE, "umo", now=NOW))
+
+    assert outcome.triggered is True
+    assert gen.prompts, "switch off should keep the correction running"
 
 
 def test_parse_correction_times_normalizes_and_dedups():

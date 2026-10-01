@@ -898,6 +898,12 @@
         },
         "default": 1
       },
+      "correction_skip_without_attention": {
+        "description": "无待关注事项时跳过修正",
+        "hint": "自动修正到点先检查内心世界待关注事项，为空则直接跳过本次（省一次模型调用）；手动「忙碌修正」不受影响；未装/未提供内心世界数据时不跳过，照常修正",
+        "type": "bool",
+        "default": true
+      },
       "correction_recent_chat_rounds": {
         "description": "注入近期聊天记录轮数",
         "hint": "修正时兜底参考最近几轮对话原文，防关注事项漏记、防记忆尚未沉淀；0 表示不注入",

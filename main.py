@@ -157,7 +157,7 @@ def _rebuild_system_prompt(prompt: str, blocks: dict[str, str]) -> str:
     "astrbot_plugin_busy_schedule",
     "灵犀 · AI忙碌时段管理",
     "让AI拥有真实的生活节奏！自动计算忙碌时段、智能拦截合并消息、特殊关键词唤醒",
-    "v2.14.8",
+    "v2.14.10",
     "https://github.com/gongzhudeng/astrbot_plugin_busy_schedule",
 )
 class BusySchedulePlugin(Star):
@@ -726,6 +726,7 @@ class BusySchedulePlugin(Star):
         umo: str | None = None,
         *,
         manual_instruction: str | None = None,
+        skip_without_attention: bool = True,
     ) -> CorrectionOutcome | None:
         """Run one correction cycle under the schedule edit lock."""
         try:
@@ -746,6 +747,7 @@ class BusySchedulePlugin(Star):
                     umo,
                     memory_since=memory_since,
                     manual_instruction=manual_instruction,
+                    skip_without_attention=skip_without_attention,
                 )
             self._last_context_time = now.strftime("%Y-%m-%dT%H:%M:%S")
             entry = {
@@ -1921,6 +1923,7 @@ class BusySchedulePlugin(Star):
             "manual",
             umo=event.unified_msg_origin,
             manual_instruction=extra or None,
+            skip_without_attention=False,
         )
         if outcome is None:
             yield event.plain_result("修正运行失败，详见后台日志")
