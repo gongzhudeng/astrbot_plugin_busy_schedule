@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -108,10 +109,29 @@ def _find_period(periods: list[BusyPeriod], operation: dict[str, Any]) -> int:
     return matches[0]
 
 
+_STATUS_MARKER_TAIL_RE = re.compile(r"\s*【(?:忙碌|可回消息)】$")
+
+
+def strip_status_markers(activity: str) -> str:
+    """Strip trailing 【忙碌】/【可回消息】 markers from an activity description.
+
+    Whether an activity is busy lives in the ``is_busy`` field; the render
+    layers append the status marker themselves, so a marker stored inside the
+    description would be duplicated on display (v2.14.8 regression fix).
+    Classification tags such as 【外出】 are kept.
+    """
+    text = str(activity or "").strip()
+    while True:
+        stripped = _STATUS_MARKER_TAIL_RE.sub("", text).rstrip()
+        if stripped == text:
+            return text
+        text = stripped
+
+
 def _new_activity(operation: dict[str, Any]) -> BusyPeriod:
     start_time = str(operation.get("start_time", "")).strip()
     end_time = str(operation.get("end_time", "")).strip()
-    activity = str(operation.get("activity", "")).strip()
+    activity = strip_status_markers(str(operation.get("activity", "")).strip())
     if not start_time or not end_time or not activity:
         raise ScheduleEditError("add requires start_time, end_time and activity")
     parse_clock_time(start_time)
@@ -129,11 +149,12 @@ def _render_schedule(periods: list[BusyPeriod]) -> str:
     lines = []
     for period in periods:
         marker = "忙碌" if period.is_busy else "可回消息"
+        activity = strip_status_markers(period.activity)
         if period.is_open_sleep:
-            lines.append(f"{period.start_time} {period.activity}【{marker}】")
+            lines.append(f"{period.start_time} {activity}【{marker}】")
         else:
             lines.append(
-                f"{period.start_time}-{period.end_time} {period.activity}【{marker}】"
+                f"{period.start_time}-{period.end_time} {activity}【{marker}】"
             )
     return "\n".join(lines)
 
@@ -276,7 +297,9 @@ class ScheduleEditor:
                 if end_time:
                     candidate.end_time = end_time
                 if "activity" in operation:
-                    activity = str(operation["activity"]).strip()
+                    activity = strip_status_markers(
+                        str(operation["activity"]).strip()
+                    )
                     if not activity:
                         raise ScheduleEditError("activity must not be empty")
                     candidate.activity = activity
@@ -313,7 +336,9 @@ class ScheduleEditor:
                     period.end_time = str(operation["end_time"]).strip()
                     parse_clock_time(period.end_time)
                 if "activity" in operation:
-                    activity = str(operation["activity"]).strip()
+                    activity = strip_status_markers(
+                        str(operation["activity"]).strip()
+                    )
                     if not activity:
                         raise ScheduleEditError("activity must not be empty")
                     period.activity = activity

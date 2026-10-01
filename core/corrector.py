@@ -31,6 +31,7 @@ from .schedule_editor import (
     ScheduleEditError,
     ScheduleEditNeedsConfirmation,
     ScheduleEditor,
+    strip_status_markers,
 )
 
 _MAX_OPERATIONS_PER_RUN = 12
@@ -63,8 +64,10 @@ _CORRECTION_RULES_SUFFIX = (
     "最后一条睡觉活动不可删除、不可改成普通活动。\n"
     "   活动之间保持首尾相接、不留新的时间空档：顺延或提前某个活动时，"
     "把受影响的后续活动逐个 update 顺延/提前，保持整体衔接；原有空档保持原样。\n"
-    "7. 分类标签照原格式写在活动描述末尾、状态标记之前，固定顺序"
-    "【外出】→【用餐】→【主动分享】；涉及降雨的活动要带上天气提醒。\n"
+    "7. 分类标签照原格式写在活动描述末尾，固定顺序"
+    "【外出】→【用餐】→【主动分享】；活动描述里不要写状态标记【忙碌】/【可回消息】——"
+    "是否忙碌用 is_busy 字段表达，系统展示时会自动追加状态标记，写进描述会导致标记重复；"
+    "涉及降雨的活动要带上天气提醒。\n"
     "8. 只输出一个 JSON 对象，不要输出任何解释文字：\n"
     '{{"changed": true, "reason": "一句话中文说明", '
     '"operations": [{{"action": "add", "start_time": "15:00", '
@@ -327,13 +330,14 @@ class ScheduleCorrector:
                 continue
             period = item.period
             marker = "忙碌" if period.is_busy else "可回消息"
+            activity = strip_status_markers(period.activity)
             if period.is_open_sleep:
-                lines.append(f"{period.start_time} {period.activity}【{marker}】")
+                lines.append(f"{period.start_time} {activity}【{marker}】")
                 continue
             suffix = "（当前正在进行）" if item.contains(now) else ""
             lines.append(
                 f"{period.start_time}-{period.end_time} "
-                f"{period.activity}【{marker}】{suffix}"
+                f"{activity}【{marker}】{suffix}"
             )
         return "\n".join(lines) or "（今日已无剩余活动）"
 

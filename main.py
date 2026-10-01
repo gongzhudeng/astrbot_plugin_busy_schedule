@@ -157,7 +157,7 @@ def _rebuild_system_prompt(prompt: str, blocks: dict[str, str]) -> str:
     "astrbot_plugin_busy_schedule",
     "灵犀 · AI忙碌时段管理",
     "让AI拥有真实的生活节奏！自动计算忙碌时段、智能拦截合并消息、特殊关键词唤醒",
-    "v2.14.7",
+    "v2.14.8",
     "https://github.com/gongzhudeng/astrbot_plugin_busy_schedule",
 )
 class BusySchedulePlugin(Star):
@@ -661,7 +661,8 @@ class BusySchedulePlugin(Star):
                 if self.busy_mgr.is_busy:
                     logger.info(
                         f"[BusySchedule] State sync: is_busy=True, "
-                        f"manual_period={self.busy_mgr._current_busy_period is not None}, "
+                        f"has_period={self.busy_mgr._current_busy_period is not None}, "
+                        f"manual_flag={self.busy_mgr._is_manual_period}, "
                         f"cooldown={self.busy_mgr._is_in_wakeup_cooldown(datetime.now())}"
                     )
 

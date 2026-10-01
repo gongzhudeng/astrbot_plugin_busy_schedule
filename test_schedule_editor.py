@@ -166,3 +166,46 @@ def test_update_current_activity_start_time_still_rejected():
                 "start_time": "18:30",
             }
         )
+
+
+def test_update_activity_strips_trailing_status_markers():
+    result = apply_operation(
+        {
+            "action": "update",
+            "target_start_time": "19:00",
+            "activity": "在街区逛拍街景【外出】【忙碌】",
+            "is_busy": True,
+        }
+    )
+
+    period = result.data.busy_periods[0]
+    assert period.activity == "在街区逛拍街景【外出】"
+    assert "【忙碌】【忙碌】" not in result.data.schedule
+    assert "在街区逛拍街景【外出】【忙碌】" in result.data.schedule
+
+
+def test_add_activity_strips_trailing_status_markers():
+    result = apply_operation(
+        {
+            "action": "add",
+            "start_time": "21:00",
+            "end_time": "22:00",
+            "activity": "敷面膜刷手机【可回消息】",
+        }
+    )
+
+    period = next(
+        p for p in result.data.busy_periods if p.start_time == "21:00"
+    )
+    assert period.activity == "敷面膜刷手机"
+    assert result.data.schedule.count("【可回消息】") == 2
+
+
+def test_render_schedule_heals_dirty_activity_markers():
+    dirty = make_schedule()
+    dirty.busy_periods[0].activity = "自拍小裙子【可回消息】"
+
+    text = schedule_editor_module._render_schedule(dirty.busy_periods)
+
+    assert "【可回消息】【可回消息】" not in text
+    assert text.count("【可回消息】") == 1

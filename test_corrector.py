@@ -15,6 +15,7 @@ from astrbot_plugin_busy_schedule.core.corrector import (
 )
 from astrbot_plugin_busy_schedule.core.data import (
     BusyPeriod,
+    ResolvedPeriod,
     ScheduleData,
     ScheduleDataManager,
 )
@@ -534,6 +535,25 @@ def test_template_unknown_placeholder_tolerated(tmp_path):
     assert ctx["emotion_context"]  # default text present
 
 
+def test_render_remaining_strips_status_markers(tmp_path):
+    corrector, _mgr = make_corrector(tmp_path)
+    period = BusyPeriod(
+        start_time="14:00",
+        end_time="16:00",
+        activity="在外面逛拍街景【外出】【忙碌】",
+        is_busy=True,
+    )
+    resolved = ResolvedPeriod(
+        OWNER_DATE, period, NOW, NOW.replace(hour=16)
+    )
+
+    text = corrector._render_remaining([resolved], "", NOW)
+
+    assert "【忙碌】【忙碌】" not in text
+    assert text.count("【忙碌】") == 1
+    assert "【外出】" in text  # classification tag kept
+
+
 def test_parse_correction_times_normalizes_and_dedups():
     assert parse_correction_times(["9:5", "12:00", "9:05", "bad", "", 25, None]) == [
         "09:05",
@@ -565,6 +585,7 @@ def test_rules_mention_chaining_outfit_format_and_future_freedom():
     assert "首尾相接" in _CORRECTION_RULES_SUFFIX
     assert "cos装格式" in _CORRECTION_RULES_SUFFIX
     assert "未来的活动可以自由调整" in _CORRECTION_RULES_SUFFIX
+    assert "不要写状态标记【忙碌】/【可回消息】" in _CORRECTION_RULES_SUFFIX
 
 
 # ----------------------------------------------------------------------
