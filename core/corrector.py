@@ -19,6 +19,7 @@ from astrbot.api import logger
 from .calendar_context import build_calendar_context
 from .data import (
     ResolvedPeriod,
+    ScheduleData,
     ScheduleDataManager,
     parse_clock_time,
     parse_schedule_time,
@@ -511,33 +512,79 @@ class ScheduleCorrector:
             return CorrectionOutcome(triggered=True, changed=False, reason=reason)
 
         editor = ScheduleEditor()
-        current = active.data
         applied_changes: list[str] = []
         applied = 0
         skipped = 0
-        for operation in operations:
-            try:
-                result = editor.apply(
-                    current,
-                    [operation],
-                    owner_date=owner_date,
-                    schedule_time=schedule_time,
-                    now=now,
-                    confirmed_important=False,
-                )
-            except ScheduleEditNeedsConfirmation as exc:
-                skipped += 1
-                logger.info(
-                    f"[BusySchedule] Correction skipped op needing confirmation: {exc}"
-                )
-                continue
-            except (ScheduleEditConflict, ScheduleEditError, ValueError, TypeError) as exc:
-                skipped += 1
-                logger.warning(f"[BusySchedule] Correction skipped invalid op: {exc}")
-                continue
+        current = active.data
+
+        def _apply_per_operation(base: ScheduleData) -> ScheduleData:
+            """Fallback: apply one op at a time, skipping broken ones."""
+            nonlocal applied_changes, applied, skipped
+            cursor = base
+            for operation in operations:
+                try:
+                    result = editor.apply(
+                        cursor,
+                        [operation],
+                        owner_date=owner_date,
+                        schedule_time=schedule_time,
+                        now=now,
+                        confirmed_important=False,
+                    )
+                except ScheduleEditNeedsConfirmation as exc:
+                    skipped += 1
+                    logger.info(
+                        f"[BusySchedule] Correction skipped op needing confirmation: {exc}"
+                    )
+                    continue
+                except (
+                    ScheduleEditConflict,
+                    ScheduleEditError,
+                    ValueError,
+                    TypeError,
+                ) as exc:
+                    skipped += 1
+                    logger.warning(
+                        f"[BusySchedule] Correction skipped invalid op: {exc}"
+                    )
+                    continue
+                cursor = result.data
+                applied_changes.extend(result.changes)
+                applied += 1
+            return cursor
+
+        try:
+            # Linked plans (extend an outing, then shift the next slots) only
+            # form a valid timeline when applied as one batch; applying them
+            # one-by-one trips the overlap check on intermediate states.
+            result = editor.apply(
+                active.data,
+                operations,
+                owner_date=owner_date,
+                schedule_time=schedule_time,
+                now=now,
+                confirmed_important=False,
+            )
             current = result.data
             applied_changes.extend(result.changes)
-            applied += 1
+            applied = len(operations)
+        except ScheduleEditNeedsConfirmation as exc:
+            logger.info(
+                f"[BusySchedule] Correction batch needs confirmation ({exc}); "
+                "falling back to per-operation"
+            )
+            current = _apply_per_operation(active.data)
+        except (
+            ScheduleEditConflict,
+            ScheduleEditError,
+            ValueError,
+            TypeError,
+        ) as exc:
+            logger.warning(
+                "[BusySchedule] Correction batch apply failed, falling back "
+                f"to per-operation: {exc}"
+            )
+            current = _apply_per_operation(active.data)
 
         if applied == 0:
             logger.warning(

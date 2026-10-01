@@ -304,6 +304,146 @@ def test_parse_repair_exhausted_returns_note(tmp_path):
     assert corrector._parse_repair_attempts() == 1
 
 
+def make_linked_schedule():
+    return ScheduleData(
+        date="2026-10-01",
+        outfit="甘雨cos装",
+        hairstyle="",
+        status="completed",
+        busy_periods=[
+            BusyPeriod(
+                start_time="14:00", end_time="15:00", activity="取包裹", is_busy=False
+            ),
+            BusyPeriod(
+                start_time="15:00", end_time="16:00", activity="玩主机游戏", is_busy=False
+            ),
+            BusyPeriod(
+                start_time="16:00", end_time="17:00", activity="微信闲聊", is_busy=False
+            ),
+            BusyPeriod(start_time="23:00", end_time=None, activity="睡觉"),
+        ],
+    )
+
+
+def test_linked_operations_apply_as_batch(tmp_path):
+    """Extend + shift slots only form a valid timeline when applied together."""
+
+    def after_apply():
+        pass
+
+    payload = {
+        "changed": True,
+        "reason": "延长外出并把后续活动顺延",
+        "operations": [
+            {
+                "action": "update",
+                "target_start_time": "14:00",
+                "end_time": "15:30",
+                "activity": "逛街拍视频顺路取包裹",
+                "is_busy": True,
+            },
+            {
+                "action": "update",
+                "target_start_time": "15:00",
+                "start_time": "15:30",
+                "end_time": "16:30",
+            },
+            {
+                "action": "update",
+                "target_start_time": "16:00",
+                "start_time": "16:30",
+            },
+        ],
+    }
+
+    corrector, mgr = make_corrector(
+        tmp_path,
+        generator=GeneratorStub(llm_json(payload)),
+        after_apply=after_apply,
+    )
+    # swap in the linked schedule
+    corrector.data_mgr.set(OWNER_DATE, make_linked_schedule())
+
+    outcome = asyncio.run(corrector.run_correction(OWNER_DATE, "umo", now=NOW))
+
+    assert outcome.triggered is True
+    assert outcome.changed is True
+    assert outcome.applied == 3
+    assert outcome.skipped == 0
+    periods = mgr.get(OWNER_DATE).busy_periods
+    assert [p.end_time for p in periods[:3]] == ["15:30", "16:30", "17:00"]
+    assert periods[1].start_time == "15:30"
+    assert periods[2].start_time == "16:30"
+    assert periods[0].activity == "逛街拍视频顺路取包裹"
+
+
+def test_batch_falls_back_to_per_op_when_group_invalid(tmp_path):
+    payload = {
+        "changed": True,
+        "reason": "一个坏操作拖累整组",
+        "operations": [
+            {
+                "action": "update",
+                "target_start_time": "14:00",
+                "end_time": "14:30",
+            },
+            {
+                # bad op: end must be later than start
+                "action": "update",
+                "target_start_time": "15:00",
+                "start_time": "16:00",
+                "end_time": "15:30",
+            },
+        ],
+    }
+    corrector, mgr = make_corrector(
+        tmp_path, generator=GeneratorStub(llm_json(payload))
+    )
+    corrector.data_mgr.set(OWNER_DATE, make_linked_schedule())
+
+    outcome = asyncio.run(corrector.run_correction(OWNER_DATE, "umo", now=NOW))
+
+    assert outcome.changed is True
+    assert outcome.applied == 1
+    assert outcome.skipped == 1
+    periods = mgr.get(OWNER_DATE).busy_periods
+    assert periods[0].end_time == "14:30"
+    assert periods[1].start_time == "15:00"  # untouched
+
+
+def test_batch_all_invalid_keeps_schedule(tmp_path):
+    payload = {
+        "changed": True,
+        "reason": "全是坏操作",
+        "operations": [
+            {
+                "action": "update",
+                "target_start_time": "14:00",
+                "start_time": "13:00",  # current activity start locked
+            },
+            {
+                "action": "update",
+                "target_start_time": "15:00",
+                "start_time": "16:00",
+                "end_time": "15:30",  # end before start
+            },
+        ],
+    }
+    corrector, mgr = make_corrector(
+        tmp_path, generator=GeneratorStub(llm_json(payload))
+    )
+    corrector.data_mgr.set(OWNER_DATE, make_linked_schedule())
+    before = mgr.get(OWNER_DATE).schedule
+
+    outcome = asyncio.run(corrector.run_correction(OWNER_DATE, "umo", now=NOW))
+
+    assert outcome.triggered is True
+    assert outcome.changed is False
+    assert outcome.applied == 0
+    assert outcome.skipped == 2
+    assert mgr.get(OWNER_DATE).schedule == before
+
+
 def test_template_renders_recent_chats(tmp_path):
     class ChatGenerator(GeneratorStub):
         async def _get_recent_chats(self, umo, rounds):
