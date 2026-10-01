@@ -264,29 +264,37 @@ class ScheduleEditor:
                     raise ScheduleEditConflict(
                         "active open sleep cannot be edited because its end comes from the next cycle"
                     )
-                forbidden = {
-                    "start_time",
-                    "activity",
-                    "is_busy",
-                }.intersection(operation)
-                if forbidden:
+                if "start_time" in operation:
                     raise ScheduleEditConflict(
-                        "the current activity only allows changing end_time"
+                        "the current activity start_time is locked; "
+                        "end_time, activity and is_busy may change"
                     )
                 end_time = str(operation.get("end_time", "")).strip()
-                if not end_time:
-                    raise ScheduleEditError(
-                        "updating the current activity requires end_time"
-                    )
-                parse_clock_time(end_time)
+                if end_time:
+                    parse_clock_time(end_time)
                 candidate = deepcopy(period)
-                candidate.end_time = end_time
+                if end_time:
+                    candidate.end_time = end_time
+                if "activity" in operation:
+                    activity = str(operation["activity"]).strip()
+                    if not activity:
+                        raise ScheduleEditError("activity must not be empty")
+                    candidate.activity = activity
+                if "is_busy" in operation:
+                    candidate.is_busy = bool(operation["is_busy"])
+                if not (end_time or "activity" in operation or "is_busy" in operation):
+                    raise ScheduleEditError(
+                        "updating the current activity requires "
+                        "end_time, activity or is_busy"
+                    )
                 _, candidate_end = _period_bounds(candidate, owner_date, schedule_time)
                 if candidate_end is None or candidate_end <= now:
                     raise ScheduleEditConflict(
                         "the current activity end must remain in the future"
                     )
-                period.end_time = end_time
+                period.end_time = candidate.end_time
+                period.activity = candidate.activity
+                period.is_busy = candidate.is_busy
             else:
                 if period.is_sleep:
                     forbidden = {

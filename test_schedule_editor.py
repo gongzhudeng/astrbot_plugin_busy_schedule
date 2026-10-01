@@ -92,3 +92,77 @@ def test_set_outfit_with_same_hairstyle_reports_unchanged():
 
     assert result.data.hairstyle == "双马尾"
     assert "hairstyle unchanged: 双马尾" in result.changes
+
+
+def make_schedule_with_current_activity():
+    return ScheduleData(
+        date="2026-08-25",
+        outfit="小裙子",
+        hairstyle="双马尾",
+        status="completed",
+        busy_periods=[
+            BusyPeriod(
+                start_time="19:00",
+                end_time="21:00",
+                activity="在驿站取包裹",
+                is_busy=False,
+            ),
+            BusyPeriod(start_time="23:00", end_time=None, activity="睡觉"),
+        ],
+    )
+
+
+def apply_operation(operation, schedule=None):
+    return ScheduleEditor().apply(
+        schedule or make_schedule_with_current_activity(),
+        [operation],
+        owner_date=OWNER_DATE,
+        schedule_time=SCHEDULE_TIME,
+        now=NOW,
+    )
+
+
+def test_update_current_activity_description_only():
+    result = apply_operation(
+        {
+            "action": "update",
+            "target_start_time": "19:00",
+            "activity": "先在街区逛拍街景和腿，最后顺路去驿站拿包裹",
+        }
+    )
+
+    period = result.data.busy_periods[0]
+    assert period.activity == "先在街区逛拍街景和腿，最后顺路去驿站拿包裹"
+    assert period.start_time == "19:00"
+    assert period.end_time == "21:00"
+
+
+def test_update_current_activity_end_time_and_busy_flag():
+    result = apply_operation(
+        {
+            "action": "update",
+            "target_start_time": "19:00",
+            "end_time": "22:00",
+            "is_busy": True,
+        }
+    )
+
+    period = result.data.busy_periods[0]
+    assert period.end_time == "22:00"
+    assert period.is_busy is True
+    assert period.activity == "在驿站取包裹"
+
+
+def test_update_current_activity_start_time_still_rejected():
+    import pytest
+
+    from core.schedule_editor import ScheduleEditConflict
+
+    with pytest.raises(ScheduleEditConflict):
+        apply_operation(
+            {
+                "action": "update",
+                "target_start_time": "19:00",
+                "start_time": "18:30",
+            }
+        )
