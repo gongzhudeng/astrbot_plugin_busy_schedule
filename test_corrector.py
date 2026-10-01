@@ -209,6 +209,24 @@ def test_llm_failure_returns_triggered_note(tmp_path):
     assert "模型调用失败" in outcome.note
 
 
+def test_template_renders_recent_chats(tmp_path):
+    class ChatGenerator(GeneratorStub):
+        async def _get_recent_chats(self, umo, rounds):
+            assert umo == "umo"
+            assert rounds == 6  # correction_recent_chat_rounds default
+            return "用户: 明天去山姆\n我: 好呀"
+
+    corrector, _mgr = make_corrector(tmp_path, generator=ChatGenerator())
+
+    prompt, ctx = asyncio.run(
+        corrector._build_context(OWNER_DATE, SCHEDULE_TIME, "umo", "", NOW)
+    )
+
+    assert "明天去山姆" in prompt
+    assert "{recent_chats}" not in prompt
+    assert "{work_status}" not in prompt  # removed from the default template
+
+
 def test_template_unknown_placeholder_tolerated(tmp_path):
     config = {
         "日程修正": {

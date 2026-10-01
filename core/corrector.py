@@ -68,7 +68,6 @@ _DEFAULT_TEMPLATE = (
     "而是判断当前安排是否需要小幅调整。\n\n"
     "## Context\n"
     "- 日期：{date_str} {weekday}\n"
-    "{work_status}\n"
     "- 当前时间：{current_time}\n"
     "- 今日天气（余下时段）：{weather_forecast}\n"
     "- 当前穿搭：{outfit}{hairstyle_line}\n\n"
@@ -78,6 +77,8 @@ _DEFAULT_TEMPLATE = (
     "{emotion_context}\n\n"
     "## 待关注事项（用户在聊天中提过的约定与要求）\n"
     "{attention_context}\n\n"
+    "## 近期聊天记录（兜底参考：防关注事项漏记、防记忆尚未沉淀）\n"
+    "{recent_chats}\n\n"
     "## 近期新记忆（上次日程节点以来）\n"
     "{memory_context}\n" + _CORRECTION_RULES_SUFFIX
 )
@@ -250,6 +251,12 @@ class ScheduleCorrector:
             )
         return "\n".join(lines) or "（今日已无剩余活动）"
 
+    def _recent_chat_rounds(self) -> int:
+        try:
+            return max(0, min(30, int(self._cfg("correction_recent_chat_rounds", 6))))
+        except (TypeError, ValueError):
+            return 6
+
     async def _build_context(
         self,
         owner_date: date,
@@ -317,6 +324,17 @@ class ScheduleCorrector:
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"[BusySchedule] Weather unavailable for correction: {exc}")
 
+        chats_text = "无近期对话记录。"
+        recent_rounds = self._recent_chat_rounds()
+        if recent_rounds > 0 and umo:
+            try:
+                chats_text = (
+                    await self.generator._get_recent_chats(umo, recent_rounds)
+                    or "无近期对话记录。"
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[BusySchedule] Recent chats unavailable: {exc}")
+
         ctx: dict[str, Any] = {
             **calendar,
             "current_time": now.strftime("%H:%M"),
@@ -326,6 +344,7 @@ class ScheduleCorrector:
             "remaining_schedule": remaining,
             "emotion_context": mood_text,
             "attention_context": attention_text,
+            "recent_chats": chats_text,
             "memory_context": memory_text,
         }
 

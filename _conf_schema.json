@@ -887,6 +887,17 @@
         },
         "default": 60
       },
+      "correction_recent_chat_rounds": {
+        "description": "注入近期聊天记录轮数",
+        "hint": "修正时兜底参考最近几轮对话原文，防关注事项漏记、防记忆尚未沉淀；0 表示不注入",
+        "type": "int",
+        "slider": {
+          "min": 0,
+          "max": 30,
+          "step": 1
+        },
+        "default": 6
+      },
       "correction_attention_max_items": {
         "description": "注入待关注事项条数上限",
         "hint": "来自内心世界的激活关注事项，0 表示不注入",
@@ -922,13 +933,13 @@
       },
       "correction_prompt_template": {
         "description": "日程修正提示词模板",
-        "hint": "支持占位符：{date_str}、{weekday}、{work_status}、{current_time}、{weather_forecast}、{outfit}、{hairstyle_line}、{remaining_schedule}、{emotion_context}（实时心情）、{attention_context}（待关注事项）、{memory_context}（近期新记忆）",
+        "hint": "支持占位符：{date_str}、{weekday}、{current_time}、{weather_forecast}、{outfit}、{hairstyle_line}、{remaining_schedule}、{emotion_context}（实时心情）、{attention_context}（待关注事项）、{recent_chats}（近期聊天记录）、{memory_context}（近期新记忆）",
         "type": "text",
         "obvious_hint": true,
         "editor_mode": true,
         "editor_language": "markdown",
         "editor_theme": "vs-dark",
-        "default": "# Role: Schedule Corrector\n你正在修正今天剩余的日程。这不是重新生成一整天，而是判断当前安排是否需要小幅调整。\n\n## Context\n- 日期：{date_str} {weekday}\n{work_status}\n- 当前时间：{current_time}\n- 今日天气（余下时段）：{weather_forecast}\n- 当前穿搭：{outfit}{hairstyle_line}\n\n## 今日剩余日程（标注了正在进行的活动）\n{remaining_schedule}\n\n## 当前内心状态（实时）\n{emotion_context}\n\n## 待关注事项（用户在聊天中提过的约定与要求）\n{attention_context}\n\n## 近期新记忆（上次日程节点以来）\n{memory_context}\n\n\n## 修正原则（必须遵循）\n1. 默认不动：如果没有明确理由，输出 changed=false，不要为了改而改。\n2. 需要修正的信号：待关注事项里有用户今天提出的约定或要求；心情与当前活动明显冲突；用户在聊天里明确要求改穿搭或改计划。\n3. 只处理今天的事：待关注事项中只有今天内、有明确时间、明确承诺、明确行为的条目才纳入修正；长期愿望（如“以后多拍视频给我”）、明天或更晚才执行的事一律不动；事项里写的具体日期若是今天（无论写“今天”还是“10月1号”这类日期写法），都按今天对待。\n4. operations 里每个对象是一次原子操作：add（start_time、end_time、activity、is_busy）；update/remove（target_start_time 定位，可选 target_activity，update 可改 start_time、end_time、activity、is_busy）；set_outfit（outfit，可选 outfit_style、hairstyle，hairstyle 传空字符串表示去掉发型）。\n5. set_outfit 仅在用户明确要求改穿搭时使用：如果只是小怡自己因为活动需要（如要出门、要运动）而临时调整穿着，不要修改今日穿搭，直接把穿着说明写进对应活动的描述里（如“小怡换上外出服后出门”）。\n6. 过去的活动不可修改；当前进行中的活动只能改 end_time；新增活动必须在未来且不与现有活动重叠，必要时先 update 挪开冲突；最后一条睡觉活动不可删除、不可改成普通活动。\n7. 分类标签照原格式写在活动描述末尾、状态标记之前，固定顺序【外出】→【用餐】→【主动分享】；涉及降雨的活动要带上天气提醒。\n8. 只输出一个 JSON 对象，不要输出任何解释文字：\n{{\"changed\": true, \"reason\": \"一句话中文说明\", \"operations\": [{{\"action\": \"add\", \"start_time\": \"15:00\", \"end_time\": \"16:00\", \"activity\": \"小怡在天台拍照\", \"is_busy\": false}}]}}\nchanged=false 时 operations 传空数组。"
+        "default": "# Role: Schedule Corrector\n你正在修正今天剩余的日程。这不是重新生成一整天，而是判断当前安排是否需要小幅调整。\n\n## Context\n- 日期：{date_str} {weekday}\n- 当前时间：{current_time}\n- 今日天气（余下时段）：{weather_forecast}\n- 当前穿搭：{outfit}{hairstyle_line}\n\n## 今日剩余日程（标注了正在进行的活动）\n{remaining_schedule}\n\n## 当前内心状态（实时）\n{emotion_context}\n\n## 待关注事项（用户在聊天中提过的约定与要求）\n{attention_context}\n\n## 近期聊天记录（兜底参考：防关注事项漏记、防记忆尚未沉淀）\n{recent_chats}\n\n## 近期新记忆（上次日程节点以来）\n{memory_context}\n\n\n## 修正原则（必须遵循）\n1. 默认不动：如果没有明确理由，输出 changed=false，不要为了改而改。\n2. 需要修正的信号：待关注事项里有用户今天提出的约定或要求；心情与当前活动明显冲突；用户在聊天里明确要求改穿搭或改计划。\n3. 只处理今天的事：待关注事项中只有今天内、有明确时间、明确承诺、明确行为的条目才纳入修正；长期愿望（如“以后多拍视频给我”）、明天或更晚才执行的事一律不动；事项里写的具体日期若是今天（无论写“今天”还是“10月1号”这类日期写法），都按今天对待。\n4. operations 里每个对象是一次原子操作：add（start_time、end_time、activity、is_busy）；update/remove（target_start_time 定位，可选 target_activity，update 可改 start_time、end_time、activity、is_busy）；set_outfit（outfit，可选 outfit_style、hairstyle，hairstyle 传空字符串表示去掉发型）。\n5. set_outfit 仅在用户明确要求改穿搭时使用：如果只是小怡自己因为活动需要（如要出门、要运动）而临时调整穿着，不要修改今日穿搭，直接把穿着说明写进对应活动的描述里（如“小怡换上外出服后出门”）。\n6. 过去的活动不可修改；当前进行中的活动只能改 end_time；新增活动必须在未来且不与现有活动重叠，必要时先 update 挪开冲突；最后一条睡觉活动不可删除、不可改成普通活动。\n7. 分类标签照原格式写在活动描述末尾、状态标记之前，固定顺序【外出】→【用餐】→【主动分享】；涉及降雨的活动要带上天气提醒。\n8. 只输出一个 JSON 对象，不要输出任何解释文字：\n{{\"changed\": true, \"reason\": \"一句话中文说明\", \"operations\": [{{\"action\": \"add\", \"start_time\": \"15:00\", \"end_time\": \"16:00\", \"activity\": \"小怡在天台拍照\", \"is_busy\": false}}]}}\nchanged=false 时 operations 传空数组。"
       }
     }
   }
