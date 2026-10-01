@@ -586,6 +586,8 @@ def test_rules_mention_chaining_outfit_format_and_future_freedom():
     assert "cos装格式" in _CORRECTION_RULES_SUFFIX
     assert "未来的活动可以自由调整" in _CORRECTION_RULES_SUFFIX
     assert "不要写状态标记【忙碌】/【可回消息】" in _CORRECTION_RULES_SUFFIX
+    assert "外出不等于忙碌" in _CORRECTION_RULES_SUFFIX
+    assert "=活动期间人在住所之外" in _CORRECTION_RULES_SUFFIX
 
 
 # ----------------------------------------------------------------------
