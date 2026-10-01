@@ -510,6 +510,14 @@ def test_correction_outcome_summary_shapes():
     assert "应用 2 项" in text and "跳过 1 项" in text and "a" in text
 
 
+def test_rules_mention_chaining_outfit_format_and_future_freedom():
+    from astrbot_plugin_busy_schedule.core.corrector import _CORRECTION_RULES_SUFFIX
+
+    assert "首尾相接" in _CORRECTION_RULES_SUFFIX
+    assert "cos装格式" in _CORRECTION_RULES_SUFFIX
+    assert "未来的活动可以自由调整" in _CORRECTION_RULES_SUFFIX
+
+
 # ----------------------------------------------------------------------
 # main: trigger logic in _maybe_trigger_correction
 # ----------------------------------------------------------------------
