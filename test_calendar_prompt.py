@@ -38,6 +38,8 @@ def test_schedule_prompt_replaces_all_calendar_placeholders():
 
     generator._get_persona_desc = text_stub
     generator._get_emotion_context = text_stub
+    generator._get_attention_context = text_stub
+    generator._get_recent_memories_context = text_stub
     generator._get_recent_chats = text_stub
     generator._get_rag_context = text_stub
     generator._get_history_schedules = lambda _target: "history"

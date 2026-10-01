@@ -811,6 +811,62 @@ class ScheduleGenerator:
             logger.warning(f"[BusySchedule] Emotion context unavailable: {exc}")
             return "暂无已结算心情参考。"
 
+    def _generation_attention_limit(self) -> int:
+        try:
+            return max(0, min(10, int(self._cfg("generation_attention_max_items", 5))))
+        except (TypeError, ValueError):
+            return 5
+
+    def _generation_memory_limits(self) -> tuple[int, int]:
+        try:
+            items = max(0, min(10, int(self._cfg("generation_memory_max_items", 2))))
+        except (TypeError, ValueError):
+            items = 2
+        try:
+            chars = max(
+                100, min(4000, int(self._cfg("generation_memory_max_chars", 500)))
+            )
+        except (TypeError, ValueError):
+            chars = 500
+        return items, chars
+
+    async def _get_attention_context(self, umo: str | None = None) -> str:
+        """Read active attention items (user promises/requests), low-sensitivity."""
+        callback = getattr(self.context, "_emotion_state_get_live_context", None)
+        if not callable(callback) or not umo:
+            return "暂无待关注事项。"
+        try:
+            live = await callback(umo, self._generation_attention_limit())
+            if isinstance(live, dict):
+                text = str(live.get("attention") or "").strip()
+                if text:
+                    return text
+        except Exception as exc:
+            logger.warning(f"[BusySchedule] Attention context unavailable: {exc}")
+        return "暂无待关注事项。"
+
+    async def _get_recent_memories_context(self, umo: str | None = None) -> str:
+        """Read the newest non-consolidated memories via livingmemory."""
+        callback = getattr(self.context, "_livingmemory_get_recent_memories", None)
+        if not callable(callback) or not umo:
+            return "暂无近期记忆。"
+        items_limit, chars_limit = self._generation_memory_limits()
+        if items_limit <= 0:
+            return "暂无近期记忆。"
+        try:
+            items = await callback(umo, "", items_limit)
+            lines = [
+                f"- [{str(item.get('time') or '').strip()}] "
+                f"{str(item.get('text') or '').strip()[:chars_limit]}"
+                for item in (items or [])
+                if isinstance(item, dict) and str(item.get("text") or "").strip()
+            ]
+            if lines:
+                return "\n".join(lines)
+        except Exception as exc:
+            logger.warning(f"[BusySchedule] Recent memories context unavailable: {exc}")
+        return "暂无近期记忆。"
+
     async def _build_prompt(
         self,
         target_date: date,
@@ -829,11 +885,16 @@ class ScheduleGenerator:
 
         creative = creative_context or self._select_creative_context(target_date)
         emotion_context = await self._get_emotion_context(umo, target_date)
+        attention_context = await self._get_attention_context(umo)
+        recent_memories = await self._get_recent_memories_context(umo)
 
         ctx = {
             **build_calendar_context(target_date, self.config),
             "persona_desc": await self._get_persona_desc(umo),
             "emotion_context": emotion_context,
+            "attention_context": attention_context,
+            "recent_memories": recent_memories,
+            "memory_context": recent_memories,
             **creative,
             "history_schedules": self._get_history_schedules(target_date),
             "last_yesterday_activity": self._get_yesterday_last_activity(target_date),
