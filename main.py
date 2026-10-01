@@ -23,6 +23,11 @@ from .core.chat_protection import (
     is_natural_spark_proactive,
     is_usable_assistant_response,
 )
+from .core.corrector import (
+    CorrectionOutcome,
+    ScheduleCorrector,
+    parse_correction_times,
+)
 from .core.data import (
     ActiveSchedule,
     BusyPeriod,
@@ -152,7 +157,7 @@ def _rebuild_system_prompt(prompt: str, blocks: dict[str, str]) -> str:
     "astrbot_plugin_busy_schedule",
     "灵犀 · AI忙碌时段管理",
     "让AI拥有真实的生活节奏！自动计算忙碌时段、智能拦截合并消息、特殊关键词唤醒",
-    "v2.12.5",
+    "v2.13.0",
     "https://github.com/gongzhudeng/astrbot_plugin_busy_schedule",
 )
 class BusySchedulePlugin(Star):
@@ -174,9 +179,16 @@ class BusySchedulePlugin(Star):
         self.interceptor: MessageInterceptor | None = None
         self.injector: PromptInjector | None = None
         self.schedule_editor: ScheduleEditor | None = None
+        self.corrector: ScheduleCorrector | None = None
         self.weather_service: WeatherService | None = None
         self.image_renderer = BusyScheduleImageRenderer(Path(__file__).parent)
         self._schedule_edit_lock = asyncio.Lock()
+
+        # Correction state (persisted via _save_state)
+        self._correction_task: asyncio.Task | None = None
+        self._corrections_done: dict[str, list[str]] = {}
+        self._correction_history: list[dict] = []
+        self._last_context_time: str = ""
 
         # Background tasks
         self._state_check_task: asyncio.Task | None = None
@@ -229,6 +241,13 @@ class BusySchedulePlugin(Star):
         )
         self.injector = PromptInjector(self.config)
         self.schedule_editor = ScheduleEditor()
+        self.corrector = ScheduleCorrector(
+            self.context,
+            self.config,
+            self.data_mgr,
+            self.generator,
+            after_apply=self._refresh_after_schedule_edit,
+        )
 
         # Set callbacks
         self.busy_mgr.set_callbacks(
@@ -309,6 +328,11 @@ class BusySchedulePlugin(Star):
         if self._busy_poll_task and not self._busy_poll_task.done():
             self._busy_poll_task.cancel()
         self._busy_poll_task = None
+
+        # Cancel in-flight correction task
+        if self._correction_task and not self._correction_task.done():
+            self._correction_task.cancel()
+        self._correction_task = None
 
         exported_callbacks = {
             "_busy_schedule_get_timeline": self._export_timeline,
@@ -622,6 +646,7 @@ class BusySchedulePlugin(Star):
             try:
                 await asyncio.sleep(30)  # Check every 30 seconds
                 await self.busy_mgr.check_and_update_state()
+                self._maybe_trigger_correction()
 
             except asyncio.CancelledError:
                 break
@@ -642,6 +667,105 @@ class BusySchedulePlugin(Star):
 
     def _current_period(self) -> BusyPeriod | None:
         return self.busy_mgr._current_busy_period
+
+    # ------------------------------------------------------------------
+    # Scheduled correction (日程修正)
+    # ------------------------------------------------------------------
+    def _correction_times(self) -> list[str]:
+        return parse_correction_times(
+            self._get_config("correction_times", ["12:00"])
+        )
+
+    def _maybe_trigger_correction(self):
+        """30s tick hook: fire one correction run per configured time point."""
+        if not self._get_config("correction_enabled", False):
+            return
+        if self.corrector is None or self.generator is None:
+            return
+        if self._correction_task and not self._correction_task.done():
+            return
+
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        current_hm = now.strftime("%H:%M")
+        try:
+            hour, minute = parse_schedule_time(
+                self._get_config("schedule_time", "07:00")
+            )
+            schedule_hm = f"{hour:02d}:{minute:02d}"
+        except ValueError:
+            schedule_hm = str(self._get_config("schedule_time", "07:00"))
+
+        done_today = self._corrections_done.setdefault(today, [])
+        for time_point in self._correction_times():
+            if time_point in done_today:
+                continue
+            if current_hm < time_point:
+                continue  # not reached yet today
+            done_today.append(time_point)
+            if time_point == schedule_hm:
+                # Same as the morning generation point — nothing to correct yet
+                self._save_state()
+                continue
+            if self._is_sleeping():
+                logger.info(
+                    f"[BusySchedule] Correction at {time_point} skipped (sleeping)"
+                )
+                self._save_state()
+                continue
+            self._save_state()
+            self._correction_task = asyncio.create_task(
+                self._run_correction(time_point)
+            )
+            return
+
+    async def _run_correction(
+        self, time_point: str, umo: str | None = None
+    ) -> CorrectionOutcome | None:
+        """Run one correction cycle under the schedule edit lock."""
+        try:
+            now = datetime.now()
+            schedule_time = parse_schedule_time(
+                self._get_config("schedule_time", "07:00")
+            )
+            owner_date = get_schedule_owner_date(now, schedule_time)
+            memory_since = self._last_context_time
+            if not memory_since:
+                memory_since = (
+                    f"{owner_date.isoformat()}T{schedule_time[0]:02d}:"
+                    f"{schedule_time[1]:02d}:00"
+                )
+            async with self._schedule_edit_lock:
+                outcome = await self.corrector.run_correction(
+                    owner_date, umo, memory_since=memory_since
+                )
+            self._last_context_time = now.strftime("%Y-%m-%dT%H:%M:%S")
+            entry = {
+                "date": owner_date.isoformat(),
+                "time": time_point,
+                "triggered": outcome.triggered,
+                "changed": outcome.changed,
+                "applied": outcome.applied,
+                "skipped": outcome.skipped,
+                "reason": outcome.reason[:200],
+            }
+            if not outcome.triggered and outcome.note:
+                entry["note"] = outcome.note[:200]
+            self._correction_history.append(entry)
+            self._correction_history = self._correction_history[-20:]
+            self._save_state()
+            logger.info(
+                f"[BusySchedule] Correction {time_point} done: "
+                f"triggered={outcome.triggered} changed={outcome.changed} "
+                f"applied={outcome.applied} skipped={outcome.skipped} "
+                f"reason={outcome.reason[:80]}"
+            )
+            return outcome
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[BusySchedule] Correction run failed: {e}")
+            return None
 
     def _is_sleeping(self) -> bool:
         period = self._current_period()
@@ -1118,6 +1242,23 @@ class BusySchedulePlugin(Star):
                 self.media_execution = MediaExecutionStore(
                     MediaExecutionRecord.from_dict(media_record)
                 )
+            corrections_done = data.get("corrections_done")
+            if isinstance(corrections_done, dict):
+                self._corrections_done = {
+                    str(day): [
+                        str(t) for t in times if isinstance(t, str)
+                    ]
+                    for day, times in corrections_done.items()
+                    if isinstance(times, list)
+                }
+            history = data.get("correction_history")
+            if isinstance(history, list):
+                self._correction_history = [
+                    item for item in history if isinstance(item, dict)
+                ][-20:]
+            last_context_time = data.get("last_context_time")
+            if isinstance(last_context_time, str):
+                self._last_context_time = last_context_time
             if self._schedule_target_umo:
                 logger.info(
                     f"[BusySchedule] Loaded schedule_target_umo: {self._schedule_target_umo}"
@@ -1133,6 +1274,9 @@ class BusySchedulePlugin(Star):
             data = {
                 "schedule_target_umo": self._schedule_target_umo or "",
                 "media_execution": self.media_execution.to_dict(),
+                "corrections_done": self._corrections_done,
+                "correction_history": self._correction_history[-20:],
+                "last_context_time": self._last_context_time,
             }
             self._state_file.write_text(
                 json.dumps(data, ensure_ascii=False), encoding="utf-8"
@@ -1152,6 +1296,7 @@ class BusySchedulePlugin(Star):
             "关键词设置",
             "消息合并",
             "日程生成",
+            "日程修正",
             "天气服务",
         ]:
             group = self.config.get(group_name, {})
@@ -1739,6 +1884,31 @@ class BusySchedulePlugin(Star):
 
         except Exception as e:
             yield event.plain_result(f"日程重写失败：{e}")
+
+    @filter.command("忙碌修正", alias={"busy correct"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def cmd_run_correction(self, event: AstrMessageEvent):
+        """手动立即触发一次日程修正"""
+        if not self._get_config("correction_enabled", False):
+            yield event.plain_result(
+                "日程修正未启用，请先在配置中开启「日程修正」的 correction_enabled"
+            )
+            return
+        if self.corrector is None or self.generator is None:
+            yield event.plain_result("修正器尚未初始化，请稍后再试")
+            return
+        if self._correction_task and not self._correction_task.done():
+            yield event.plain_result("已有一轮修正正在运行，请等它结束后再试")
+            return
+
+        yield event.plain_result("正在执行日程修正...")
+        outcome = await self._run_correction(
+            "manual", umo=event.unified_msg_origin
+        )
+        if outcome is None:
+            yield event.plain_result("修正运行失败，详见后台日志")
+        else:
+            yield event.plain_result(outcome.summary())
 
     @filter.command("忙碌状态", alias={"busy status"})
     async def cmd_busy_status(self, event: AstrMessageEvent):

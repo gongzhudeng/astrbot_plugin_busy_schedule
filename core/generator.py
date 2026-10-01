@@ -221,12 +221,14 @@ class ScheduleGenerator:
         except Exception:
             return type(provider).__name__
 
-    def _get_providers(self) -> list[object]:
+    def _get_providers(self, primary_override: str | None = None) -> list[object]:
         """Build the ordered provider chain for schedule generation."""
         providers: list[object] = []
         seen_ids: set[str] = set()
 
-        primary_id = str(self._cfg("llm_provider_schedule", "") or "").strip()
+        primary_id = str(
+            primary_override or self._cfg("llm_provider_schedule", "") or ""
+        ).strip()
         primary = (
             self.context.get_provider_by_id(primary_id)
             if primary_id
@@ -1063,15 +1065,23 @@ class ScheduleGenerator:
         providers: list[object],
         session_id: str,
         system_prompt: str = "",
+        max_retries: int | None = None,
+        timeout_seconds: float | None = None,
     ) -> tuple[str, object]:
         """Call each provider in order, then switch immediately after its attempts."""
         if not providers:
             raise RuntimeError("No LLM provider available")
 
         last_error = "all providers returned empty responses"
-        max_retries = self._schedule_model_max_retries()
+        if max_retries is None:
+            max_retries = self._schedule_model_max_retries()
+        else:
+            max_retries = max(0, min(10, int(max_retries)))
         max_attempts = max_retries + 1
-        timeout_seconds = self._schedule_model_timeout_seconds()
+        if timeout_seconds is None:
+            timeout_seconds = self._schedule_model_timeout_seconds()
+        else:
+            timeout_seconds = max(1.0, min(3600.0, float(timeout_seconds)))
         for provider_index, provider in enumerate(providers):
             provider_id = self._provider_id(provider)
             if provider_index > 0:
