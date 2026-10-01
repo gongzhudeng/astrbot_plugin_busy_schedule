@@ -39,7 +39,8 @@ _CORRECTION_RULES_SUFFIX = (
     "\n\n## 修正原则（必须遵循）\n"
     "1. 默认不动：如果没有明确理由，输出 changed=false，不要为了改而改。\n"
     "2. 需要修正的信号：待关注事项里有用户今天提出的约定或要求；"
-    "心情与当前活动明显冲突；用户在聊天里明确要求改穿搭或改计划。\n"
+    "心情与当前活动明显冲突；用户在聊天里明确要求改穿搭或改计划；"
+    "「用户手动指令」段有内容时优先执行——它等同用户当面提出的要求，但同样只作用于今天。\n"
     "3. 只处理今天的事：待关注事项中只有今天内、有明确时间、明确承诺、明确行为的条目"
     "才纳入修正；长期愿望（如“以后多拍视频给我”）、明天或更晚才执行的事一律不动；"
     "事项里写的具体日期若是今天（无论写“今天”还是“10月1号”这类日期写法），都按今天对待。\n"
@@ -89,7 +90,9 @@ _DEFAULT_TEMPLATE = (
     "## 近期聊天记录（兜底参考：防关注事项漏记、防记忆尚未沉淀）\n"
     "{recent_chats}\n\n"
     "## 近期新记忆（上次日程节点以来）\n"
-    "{memory_context}\n" + _CORRECTION_RULES_SUFFIX
+    "{memory_context}\n\n"
+    "## 用户手动指令（「忙碌修正」命令附带的具体要求）\n"
+    "{manual_instruction}\n" + _CORRECTION_RULES_SUFFIX
 )
 
 
@@ -347,6 +350,7 @@ class ScheduleCorrector:
         umo: str | None,
         memory_since: str,
         now: datetime,
+        manual_instruction: str = "",
     ) -> tuple[str, dict[str, Any]]:
         active = self.data_mgr.get_active(owner_date)
         assert active is not None  # run_correction guarantees this
@@ -418,6 +422,15 @@ class ScheduleCorrector:
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"[BusySchedule] Recent chats unavailable: {exc}")
 
+        instruction_text = str(manual_instruction or "").strip()
+        if instruction_text:
+            manual_text = (
+                "【用户通过「忙碌修正」命令附带的具体要求，等同用户当面提出，"
+                "优先级最高，仅作用于今天】\n" + instruction_text[:500]
+            )
+        else:
+            manual_text = "（无——本次为自动修正，按常规原则执行）"
+
         ctx: dict[str, Any] = {
             **calendar,
             "current_time": now.strftime("%H:%M"),
@@ -429,6 +442,7 @@ class ScheduleCorrector:
             "attention_context": attention_text,
             "recent_chats": chats_text,
             "memory_context": memory_text,
+            "manual_instruction": manual_text,
         }
 
         template = str(self._cfg("correction_prompt_template", "") or "").strip()
@@ -456,6 +470,7 @@ class ScheduleCorrector:
         *,
         memory_since: str = "",
         now: datetime | None = None,
+        manual_instruction: str | None = None,
     ) -> CorrectionOutcome:
         now = now or datetime.now()
         schedule_time = parse_schedule_time(self._cfg("schedule_time", "07:00"))
@@ -467,7 +482,12 @@ class ScheduleCorrector:
 
         try:
             prompt, _ctx = await self._build_context(
-                owner_date, schedule_time, umo, memory_since, now
+                owner_date,
+                schedule_time,
+                umo,
+                memory_since,
+                now,
+                manual_instruction=manual_instruction or "",
             )
         except Exception as exc:  # noqa: BLE001
             logger.error(f"[BusySchedule] Correction prompt build failed: {exc}")

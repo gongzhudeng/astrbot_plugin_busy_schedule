@@ -462,6 +462,55 @@ def test_template_renders_recent_chats(tmp_path):
     assert "{work_status}" not in prompt  # removed from the default template
 
 
+def test_template_renders_manual_instruction(tmp_path):
+    corrector, _mgr = make_corrector(tmp_path)
+
+    prompt, ctx = asyncio.run(
+        corrector._build_context(
+            OWNER_DATE,
+            SCHEDULE_TIME,
+            "umo",
+            "",
+            NOW,
+            manual_instruction="把今日穿搭里的配饰和发型部分都去掉",
+        )
+    )
+
+    assert "## 用户手动指令（「忙碌修正」命令附带的具体要求）" in prompt
+    assert "把今日穿搭里的配饰和发型部分都去掉" in prompt
+    assert "等同用户当面提出" in prompt
+    assert ctx["manual_instruction"].startswith(
+        "【用户通过「忙碌修正」命令附带的具体要求"
+    )
+
+
+def test_template_manual_instruction_placeholder_when_absent(tmp_path):
+    corrector, _mgr = make_corrector(tmp_path)
+
+    prompt, ctx = asyncio.run(
+        corrector._build_context(OWNER_DATE, SCHEDULE_TIME, "umo", "", NOW)
+    )
+
+    assert "（无——本次为自动修正，按常规原则执行）" in prompt
+    assert ctx["manual_instruction"] == "（无——本次为自动修正，按常规原则执行）"
+
+
+def test_run_correction_passes_manual_instruction_to_prompt(tmp_path):
+    payload = {"changed": False, "reason": "无需求", "operations": []}
+    gen = GeneratorStub(llm_json(payload))
+    corrector, _mgr = make_corrector(tmp_path, generator=gen)
+
+    outcome = asyncio.run(
+        corrector.run_correction(
+            OWNER_DATE, "umo", now=NOW, manual_instruction="下午出去走走"
+        )
+    )
+
+    assert outcome.triggered is True
+    assert gen.prompts, "LLM should have been called once"
+    assert "下午出去走走" in gen.prompts[0]
+
+
 def test_template_unknown_placeholder_tolerated(tmp_path):
     config = {
         "日程修正": {

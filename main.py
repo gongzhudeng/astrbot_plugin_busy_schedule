@@ -157,7 +157,7 @@ def _rebuild_system_prompt(prompt: str, blocks: dict[str, str]) -> str:
     "astrbot_plugin_busy_schedule",
     "灵犀 · AI忙碌时段管理",
     "让AI拥有真实的生活节奏！自动计算忙碌时段、智能拦截合并消息、特殊关键词唤醒",
-    "v2.14.6",
+    "v2.14.7",
     "https://github.com/gongzhudeng/astrbot_plugin_busy_schedule",
 )
 class BusySchedulePlugin(Star):
@@ -720,7 +720,11 @@ class BusySchedulePlugin(Star):
             return
 
     async def _run_correction(
-        self, time_point: str, umo: str | None = None
+        self,
+        time_point: str,
+        umo: str | None = None,
+        *,
+        manual_instruction: str | None = None,
     ) -> CorrectionOutcome | None:
         """Run one correction cycle under the schedule edit lock."""
         try:
@@ -737,7 +741,10 @@ class BusySchedulePlugin(Star):
                 )
             async with self._schedule_edit_lock:
                 outcome = await self.corrector.run_correction(
-                    owner_date, umo, memory_since=memory_since
+                    owner_date,
+                    umo,
+                    memory_since=memory_since,
+                    manual_instruction=manual_instruction,
                 )
             self._last_context_time = now.strftime("%Y-%m-%dT%H:%M:%S")
             entry = {
@@ -1887,8 +1894,10 @@ class BusySchedulePlugin(Star):
 
     @filter.command("忙碌修正", alias={"busy correct"})
     @filter.permission_type(filter.PermissionType.ADMIN)
-    async def cmd_run_correction(self, event: AstrMessageEvent):
-        """手动立即触发一次日程修正"""
+    async def cmd_run_correction(
+        self, event: AstrMessageEvent, extra: str = ""
+    ):
+        """手动立即触发一次日程修正（可附加具体要求）"""
         if not self._get_config("correction_enabled", False):
             yield event.plain_result(
                 "日程修正未启用，请先在配置中开启「日程修正」的 correction_enabled"
@@ -1901,9 +1910,16 @@ class BusySchedulePlugin(Star):
             yield event.plain_result("已有一轮修正正在运行，请等它结束后再试")
             return
 
-        yield event.plain_result("正在执行日程修正...")
+        if extra:
+            yield event.plain_result(
+                f"正在按附加要求执行日程修正：{extra}"
+            )
+        else:
+            yield event.plain_result("正在执行日程修正...")
         outcome = await self._run_correction(
-            "manual", umo=event.unified_msg_origin
+            "manual",
+            umo=event.unified_msg_origin,
+            manual_instruction=extra or None,
         )
         if outcome is None:
             yield event.plain_result("修正运行失败，详见后台日志")
@@ -2015,7 +2031,8 @@ class BusySchedulePlugin(Star):
 
 📋 命令列表：
 • 忙碌日程 / busy show - 查看今日日程和忙碌时段
-• 忙碌重写 / busy renew - 重写今日日程（管理员）
+• 忙碌重写 / busy renew - 重写今日日程（管理员），可附加补充要求
+• 忙碌修正 / busy correct - 立即修正今日日程（管理员），可附加具体要求，如「忙碌修正 下午出去走走」
 • 忙碌状态 / busy status - 查看当前忙碌状态
 • 忙碌预览 / busy preview - 查看当前注入的提示词内容
 • 设置忙碌 / busy set - 手动进入忙碌状态
