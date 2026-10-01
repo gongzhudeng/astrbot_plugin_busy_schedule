@@ -209,6 +209,80 @@ class ScheduleCorrector:
             timeout = 60.0
         return retries, timeout
 
+    _PARSE_REPAIR_MAX = 3
+
+    def _parse_repair_attempts(self) -> int:
+        try:
+            return max(
+                0,
+                min(
+                    self._PARSE_REPAIR_MAX,
+                    int(self._cfg("correction_parse_repair_attempts", 1)),
+                ),
+            )
+        except (TypeError, ValueError):
+            return 1
+
+    async def _parse_with_repair(
+        self,
+        prompt: str,
+        first_text: str,
+        providers: list[object],
+        retries: int,
+        timeout: float,
+    ) -> tuple[dict | None, str]:
+        """Parse the model response; re-ask within the same run when unparsable.
+
+        Mirrors the generation flow's format repair: an unparseable response
+        no longer discards the whole correction slot. The repair prompt
+        re-sends the original task plus a strict JSON-only reminder and the
+        head of the previous output.
+        """
+        attempts = self._parse_repair_attempts()
+        current = first_text
+        error = "correction response is not a JSON object"
+        for attempt in range(attempts + 1):
+            payload = _extract_json_obj(current)
+            if isinstance(payload, dict):
+                if attempt > 0:
+                    logger.info(
+                        "[BusySchedule] Correction parse repaired on retry "
+                        f"{attempt}/{attempts}"
+                    )
+                return payload, ""
+            if attempt >= attempts:
+                break
+            logger.warning(
+                "[BusySchedule] Correction parse failed, repairing in-run "
+                f"({attempt + 1}/{attempts}): {error}"
+            )
+            snippet = str(current).strip()[:2000]
+            repair_prompt = (
+                f"{prompt}\n\n"
+                "## 重要：输出格式重申\n"
+                f"你上一次的输出无法解析为 JSON 对象（原因：{error}）。\n"
+                f"你上一次的输出开头为：\"\"\"{snippet}\"\"\"\n\n"
+                "请重新完成上面的修正任务，并严格遵守：只输出一个 JSON 对象本体，"
+                "不要 Markdown 代码块标记，不要任何解释或分析文字。\n"
+                '格式：{"changed": true, "reason": "一句话中文说明", '
+                '"operations": []}；changed=false 时 operations 传空数组，'
+                "operations 每项的字段要求与最初任务相同。"
+            )
+            repair_session = (
+                f"busy_schedule_correction_repair_{uuid.uuid4().hex[:8]}"
+            )
+            try:
+                current, _provider = await self.generator._call_llm(
+                    repair_prompt,
+                    providers,
+                    repair_session,
+                    max_retries=retries,
+                    timeout_seconds=timeout,
+                )
+            except Exception as exc:  # noqa: BLE001
+                return None, f"修复调用失败：{exc}"
+        return None, error
+
     # ------------------------------------------------------------------
     # context builders
     # ------------------------------------------------------------------
@@ -406,13 +480,20 @@ class ScheduleCorrector:
             logger.error(f"[BusySchedule] Correction LLM call failed: {exc}")
             return CorrectionOutcome(triggered=True, note=f"模型调用失败：{exc}")
 
-        try:
-            payload = _extract_json_obj(text)
-            if not isinstance(payload, dict):
-                raise ValueError("correction response is not a JSON object")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"[BusySchedule] Correction response parse failed: {exc}")
-            return CorrectionOutcome(triggered=True, note=f"模型输出解析失败：{exc}")
+        payload, parse_error = await self._parse_with_repair(
+            prompt, text, providers, retries, timeout
+        )
+        if payload is None:
+            logger.warning(
+                f"[BusySchedule] Correction response parse failed: {parse_error}"
+            )
+            logger.debug(
+                "[BusySchedule] Correction raw response (first 600 chars): "
+                f"{str(text)[:600]}"
+            )
+            return CorrectionOutcome(
+                triggered=True, note=f"模型输出解析失败：{parse_error}"
+            )
 
         changed = bool(payload.get("changed", False))
         reason = str(payload.get("reason", "") or "").strip()[:300]

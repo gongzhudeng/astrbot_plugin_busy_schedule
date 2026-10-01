@@ -887,6 +887,17 @@
         },
         "default": 60
       },
+      "correction_parse_repair_attempts": {
+        "description": "解析失败当场重问次数",
+        "hint": "模型输出无法解析成 JSON 时，同一次修正内带着原任务与严格格式要求当场重问 N 次（与日程生成的格式修复机制同款）；0 表示不重问，沿用旧行为",
+        "type": "int",
+        "slider": {
+          "min": 0,
+          "max": 3,
+          "step": 1
+        },
+        "default": 1
+      },
       "correction_recent_chat_rounds": {
         "description": "注入近期聊天记录轮数",
         "hint": "修正时兜底参考最近几轮对话原文，防关注事项漏记、防记忆尚未沉淀；0 表示不注入",

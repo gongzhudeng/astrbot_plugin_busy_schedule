@@ -209,6 +209,101 @@ def test_llm_failure_returns_triggered_note(tmp_path):
     assert "模型调用失败" in outcome.note
 
 
+def test_parse_failure_repairs_in_run(tmp_path):
+    class ProseThenJsonGenerator(GeneratorStub):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        async def _call_llm(
+            self, prompt, providers, session_id, max_retries=None, timeout_seconds=None
+        ):
+            self.calls += 1
+            self.prompts.append(prompt)
+            if self.calls == 1:
+                return (
+                    "我看了一下今天的日程，用户下午提到了拍照，我觉得应该加一个活动，"
+                    "具体来说就是 15:00 到 16:00 上街拍照比较合适。",
+                    providers[0],
+                )
+            return (
+                llm_json(
+                    {
+                        "changed": True,
+                        "reason": "用户下午想拍照",
+                        "operations": [
+                            {
+                                "action": "add",
+                                "start_time": "15:00",
+                                "end_time": "16:00",
+                                "activity": "小怡上街拍照【外出】",
+                                "is_busy": False,
+                            }
+                        ],
+                    }
+                ),
+                providers[0],
+            )
+
+    gen = ProseThenJsonGenerator()
+    corrector, mgr = make_corrector(tmp_path, generator=gen)
+
+    outcome = asyncio.run(corrector.run_correction(OWNER_DATE, "umo", now=NOW))
+
+    assert outcome.triggered is True
+    assert outcome.changed is True
+    assert outcome.applied == 1
+    assert gen.calls == 2
+    # repair prompt restates the original task and the strict format demand
+    repair_prompt = gen.prompts[1]
+    assert "输出格式重申" in repair_prompt
+    assert "无法解析" in repair_prompt
+    assert "上街拍照" in repair_prompt  # previous output fed back
+    assert any("上街拍照" in p.activity for p in mgr.get(OWNER_DATE).busy_periods)
+
+
+def test_parse_repair_disabled_keeps_old_behavior(tmp_path):
+    class ProseGenerator(GeneratorStub):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        async def _call_llm(self, *args, **kwargs):
+            self.calls += 1
+            return "纯分析文字，没有 JSON。", ["stub-provider"][0]
+
+    config = {"日程修正": {"correction_parse_repair_attempts": 0}}
+    corrector, _mgr = make_corrector(tmp_path, config=config, generator=ProseGenerator())
+
+    outcome = asyncio.run(corrector.run_correction(OWNER_DATE, "umo", now=NOW))
+
+    assert outcome.triggered is True
+    assert outcome.changed is False
+    assert "解析失败" in outcome.note
+    assert corrector._parse_repair_attempts() == 0
+
+
+def test_parse_repair_exhausted_returns_note(tmp_path):
+    class AlwaysProseGenerator(GeneratorStub):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        async def _call_llm(self, *args, **kwargs):
+            self.calls += 1
+            return f"还是不是 JSON 第 {self.calls} 次。", ["stub-provider"][0]
+
+    gen = AlwaysProseGenerator()
+    corrector, _mgr = make_corrector(tmp_path, generator=gen)
+
+    outcome = asyncio.run(corrector.run_correction(OWNER_DATE, "umo", now=NOW))
+
+    assert outcome.triggered is True
+    assert "解析失败" in outcome.note
+    assert gen.calls == 2  # 1 original + 1 repair (default attempts = 1)
+    assert corrector._parse_repair_attempts() == 1
+
+
 def test_template_renders_recent_chats(tmp_path):
     class ChatGenerator(GeneratorStub):
         async def _get_recent_chats(self, umo, rounds):
