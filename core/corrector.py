@@ -47,12 +47,15 @@ _CORRECTION_RULES_SUFFIX = (
     "update/remove（target_start_time 定位，可选 target_activity，update 可改 "
     "start_time、end_time、activity、is_busy）；"
     "set_outfit（outfit，可选 outfit_style、hairstyle，hairstyle 传空字符串表示去掉发型）。\n"
-    "5. 过去的活动不可修改；当前进行中的活动只能改 end_time；"
+    "5. set_outfit 仅在用户明确要求改穿搭时使用：如果只是小怡自己因为活动需要"
+    "（如要出门、要运动）而临时调整穿着，不要修改今日穿搭，"
+    "直接把穿着说明写进对应活动的描述里（如“小怡换上外出服后出门”）。\n"
+    "6. 过去的活动不可修改；当前进行中的活动只能改 end_time；"
     "新增活动必须在未来且不与现有活动重叠，必要时先 update 挪开冲突；"
     "最后一条睡觉活动不可删除、不可改成普通活动。\n"
-    "6. 分类标签照原格式写在活动描述末尾、状态标记之前，固定顺序"
+    "7. 分类标签照原格式写在活动描述末尾、状态标记之前，固定顺序"
     "【外出】→【用餐】→【主动分享】；涉及降雨的活动要带上天气提醒。\n"
-    "7. 只输出一个 JSON 对象，不要输出任何解释文字：\n"
+    "8. 只输出一个 JSON 对象，不要输出任何解释文字：\n"
     '{{"changed": true, "reason": "一句话中文说明", '
     '"operations": [{{"action": "add", "start_time": "15:00", '
     '"end_time": "16:00", "activity": "小怡在天台拍照", "is_busy": false}}]}}\n'
