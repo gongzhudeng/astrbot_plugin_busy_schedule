@@ -819,3 +819,63 @@ def test_trigger_resets_next_day(monkeypatch):
 
     assert fired == ["12:00"]
     assert "2026-10-01" in plugin._corrections_done
+
+
+# ----------------------------------------------------------------------
+# main: _run_correction umo fallback (v2.14.11)
+# ----------------------------------------------------------------------
+class CorrectorUmoSpy:
+    def __init__(self, outcome: CorrectionOutcome):
+        self.outcome = outcome
+        self.seen_umo: str | None = None
+        self.seen_kwargs: dict = {}
+
+    async def run_correction(self, owner_date, umo, **kwargs):
+        self.seen_umo = umo
+        self.seen_kwargs = kwargs
+        return self.outcome
+
+
+def _make_run_correction_plugin(target_umo: str | None):
+    plugin = _make_plugin(_correction_config(["12:00"]))
+    plugin._schedule_target_umo = target_umo
+    plugin._schedule_edit_lock = asyncio.Lock()
+    return plugin
+
+
+def test_run_correction_falls_back_to_target_umo():
+    """定时路径不传 umo 时，应兜底用日程归属会话（否则上下文注入全短路）。"""
+    outcome = CorrectionOutcome(triggered=False, note="无待关注事项，跳过修正")
+    spy = CorrectorUmoSpy(outcome)
+    plugin = _make_run_correction_plugin("aiocqhttp:FriendMessage:123")
+    plugin.corrector = spy
+
+    result = asyncio.run(plugin._run_correction("12:00"))
+
+    assert result is outcome
+    assert spy.seen_umo == "aiocqhttp:FriendMessage:123"
+    assert spy.seen_kwargs["skip_without_attention"] is True
+
+
+def test_run_correction_prefers_explicit_umo():
+    """手动命令显式传参时不被兜底覆盖。"""
+    outcome = CorrectionOutcome(triggered=False, reason="noop")
+    spy = CorrectorUmoSpy(outcome)
+    plugin = _make_run_correction_plugin("aiocqhttp:FriendMessage:123")
+    plugin.corrector = spy
+
+    asyncio.run(plugin._run_correction("12:00", "aiocqhttp:GroupMessage:456"))
+
+    assert spy.seen_umo == "aiocqhttp:GroupMessage:456"
+
+
+def test_run_correction_no_target_umo_keeps_none():
+    """归属会话也未就绪时保持 None（照跑但不跳过，行为与旧版一致）。"""
+    outcome = CorrectionOutcome(triggered=False, reason="noop")
+    spy = CorrectorUmoSpy(outcome)
+    plugin = _make_run_correction_plugin(None)
+    plugin.corrector = spy
+
+    asyncio.run(plugin._run_correction("12:00"))
+
+    assert spy.seen_umo is None

@@ -157,7 +157,7 @@ def _rebuild_system_prompt(prompt: str, blocks: dict[str, str]) -> str:
     "astrbot_plugin_busy_schedule",
     "灵犀 · AI忙碌时段管理",
     "让AI拥有真实的生活节奏！自动计算忙碌时段、智能拦截合并消息、特殊关键词唤醒",
-    "v2.14.10",
+    "v2.14.11",
     "https://github.com/gongzhudeng/astrbot_plugin_busy_schedule",
 )
 class BusySchedulePlugin(Star):
@@ -730,6 +730,10 @@ class BusySchedulePlugin(Star):
     ) -> CorrectionOutcome | None:
         """Run one correction cycle under the schedule edit lock."""
         try:
+            # 定时触发等路径不携带会话标识；不兜底的话 corrector 的
+            # 待关注事项/心情/记忆/近期聊天四路注入会全部短路成占位文案，
+            # 省流跳过检查也随之失效（v2.14.11）。
+            umo = umo or self._schedule_target_umo
             now = datetime.now()
             schedule_time = parse_schedule_time(
                 self._get_config("schedule_time", "07:00")
