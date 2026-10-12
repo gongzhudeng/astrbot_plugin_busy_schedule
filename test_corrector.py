@@ -118,6 +118,11 @@ def test_changed_false_leaves_data_untouched(tmp_path):
 
 
 def test_applies_valid_op_and_skips_invalid_op(tmp_path):
+    """v2.14.13: a batch with any invalid op is abandoned as a whole.
+
+    It used to fall back to per-operation, which left a half-applied schedule
+    (valid op applied, conflicting op skipped). Now nothing is written.
+    """
     refreshed = []
 
     async def after_apply():
@@ -140,21 +145,31 @@ def test_applies_valid_op_and_skips_invalid_op(tmp_path):
     corrector, mgr = make_corrector(
         tmp_path, generator=GeneratorStub(llm_json(payload)), after_apply=after_apply
     )
+    before = mgr.get(OWNER_DATE).schedule
 
     outcome = asyncio.run(corrector.run_correction(OWNER_DATE, "umo", now=NOW))
 
     assert outcome.triggered is True
-    assert outcome.changed is True
-    assert outcome.applied == 1
-    assert outcome.skipped == 1
-    data = mgr.get(OWNER_DATE)
-    assert any("天台拍照" in p.activity for p in data.busy_periods)
-    assert any(p.is_sleep for p in data.busy_periods)
-    assert refreshed == [True]
-    assert any("天台拍照" in change for change in outcome.changes)
+    assert outcome.changed is False
+    assert outcome.applied == 0
+    assert outcome.skipped == 2
+    assert "保持原样" in outcome.note
+    assert mgr.get(OWNER_DATE).schedule == before
+    assert refreshed == []
 
 
-def test_important_removal_needs_confirmation_skipped(tmp_path):
+def test_important_removal_no_longer_needs_confirmation(tmp_path):
+    """v2.14.13: the unattended correction may remove keyword-matched items.
+
+    ``confirmed_important=True`` is passed on the correction path because
+    there is nobody to answer a confirmation prompt; leaving it False made
+    the op get skipped silently (an old 点外卖/取外卖 removal was lost this
+    way and broke the linked ops after it).
+
+    NOW is pulled back before the 午餐 slot so the removal targets a *future*
+    activity — the guard under test only ever applies to removable (non-past)
+    items.
+    """
     payload = {
         "changed": True,
         "reason": "想取消午餐",
@@ -163,16 +178,19 @@ def test_important_removal_needs_confirmation_skipped(tmp_path):
     corrector, mgr = make_corrector(
         tmp_path, generator=GeneratorStub(llm_json(payload))
     )
-    before = mgr.get(OWNER_DATE).schedule
 
-    outcome = asyncio.run(corrector.run_correction(OWNER_DATE, "umo", now=NOW))
+    outcome = asyncio.run(
+        corrector.run_correction(
+            OWNER_DATE, "umo", now=datetime(2026, 10, 1, 10, 0)
+        )
+    )
 
     assert outcome.triggered is True
-    assert outcome.changed is False
-    assert outcome.applied == 0
-    assert outcome.skipped == 1
-    assert "保持原样" in outcome.note
-    assert mgr.get(OWNER_DATE).schedule == before
+    assert outcome.changed is True
+    assert outcome.applied == 1
+    assert outcome.skipped == 0
+    data = mgr.get(OWNER_DATE)
+    assert not any(p.start_time == "12:00" for p in data.busy_periods)
 
 
 def test_all_ops_rejected_keeps_schedule(tmp_path):
@@ -378,7 +396,13 @@ def test_linked_operations_apply_as_batch(tmp_path):
     assert periods[0].activity == "逛街拍视频顺路取包裹"
 
 
-def test_batch_falls_back_to_per_op_when_group_invalid(tmp_path):
+def test_batch_abandoned_when_group_invalid(tmp_path):
+    """v2.14.13: one bad op no longer lets the good ones through.
+
+    Previously the batch fell back to per-operation and applied op 1 while
+    skipping op 2, producing a half-adjusted timeline. Now the whole batch is
+    abandoned and the schedule keeps its original shape.
+    """
     payload = {
         "changed": True,
         "reason": "一个坏操作拖累整组",
@@ -401,14 +425,17 @@ def test_batch_falls_back_to_per_op_when_group_invalid(tmp_path):
         tmp_path, generator=GeneratorStub(llm_json(payload))
     )
     corrector.data_mgr.set(OWNER_DATE, make_linked_schedule())
+    before = mgr.get(OWNER_DATE).schedule
 
     outcome = asyncio.run(corrector.run_correction(OWNER_DATE, "umo", now=NOW))
 
-    assert outcome.changed is True
-    assert outcome.applied == 1
-    assert outcome.skipped == 1
+    assert outcome.changed is False
+    assert outcome.applied == 0
+    assert outcome.skipped == 2
+    assert "保持原样" in outcome.note
+    assert mgr.get(OWNER_DATE).schedule == before
     periods = mgr.get(OWNER_DATE).busy_periods
-    assert periods[0].end_time == "14:30"
+    assert periods[0].end_time == "15:00"  # untouched
     assert periods[1].start_time == "15:00"  # untouched
 
 
@@ -443,6 +470,86 @@ def test_batch_all_invalid_keeps_schedule(tmp_path):
     assert outcome.applied == 0
     assert outcome.skipped == 2
     assert mgr.get(OWNER_DATE).schedule == before
+
+
+def make_takeout_schedule():
+    """Mirrors the 2026-10-12 shape: a 外卖 evening opposite a home-cook plan."""
+    return ScheduleData(
+        date="2026-10-01",
+        outfit="甘雨cos装",
+        hairstyle="",
+        status="completed",
+        busy_periods=[
+            BusyPeriod(
+                start_time="15:41", end_time="16:38", activity="取包裹【外出】",
+                is_busy=False,
+            ),
+            BusyPeriod(
+                start_time="17:26", end_time="17:58", activity="点外卖下单",
+                is_busy=False,
+            ),
+            BusyPeriod(
+                start_time="17:58", end_time="18:21", activity="开门取外卖",
+                is_busy=False,
+            ),
+            BusyPeriod(
+                start_time="18:21", end_time="19:07", activity="吃晚饭【用餐】",
+                is_busy=False,
+            ),
+            BusyPeriod(start_time="23:00", end_time=None, activity="睡觉"),
+        ],
+    )
+
+
+def test_takeout_removal_and_linked_shift_all_apply(tmp_path):
+    """Regression for 2026-10-12: the 大餐 correction must land as a whole.
+
+    The model's plan removed the 取外卖 slot (keyword-matched, so it used to
+    need confirmation and get skipped) and then shifted the following slots.
+    With the removal skipped, every following op tripped the overlap check and
+    the schedule ended up half-changed: 买菜/做大餐 added while 点外卖/取外卖
+    were still there.
+    """
+    payload = {
+        "changed": True,
+        "reason": "今晚在家做大餐，取消外卖并把后续顺延",
+        "operations": [
+            {
+                "action": "update",
+                "target_start_time": "17:26",
+                "start_time": "17:26",
+                "end_time": "18:35",
+                "activity": "小怡在厨房备菜下厨，做晚上的丰盛大餐",
+                "is_busy": False,
+            },
+            {
+                "action": "remove",
+                "target_start_time": "17:58",
+                "target_activity": "开门取外卖",
+            },
+            {
+                "action": "update",
+                "target_start_time": "18:21",
+                "start_time": "18:35",
+                "end_time": "19:25",
+                "activity": "小怡吃自己做的丰盛大餐【用餐】",
+                "is_busy": False,
+            },
+        ],
+    }
+    corrector, mgr = make_corrector(
+        tmp_path, generator=GeneratorStub(llm_json(payload))
+    )
+    corrector.data_mgr.set(OWNER_DATE, make_takeout_schedule())
+
+    outcome = asyncio.run(corrector.run_correction(OWNER_DATE, "umo", now=NOW))
+
+    assert outcome.changed is True
+    assert outcome.applied == 3
+    assert outcome.skipped == 0
+    activities = [p.activity for p in mgr.get(OWNER_DATE).busy_periods]
+    assert not any("外卖" in act for act in activities)
+    assert any("丰盛大餐" in act for act in activities)
 
 
 def test_template_renders_recent_chats(tmp_path):
@@ -652,6 +759,40 @@ def test_rules_mention_chaining_outfit_format_and_future_freedom():
     assert "不要写状态标记【忙碌】/【可回消息】" in _CORRECTION_RULES_SUFFIX
     assert "外出不等于忙碌" in _CORRECTION_RULES_SUFFIX
     assert "=活动期间人在住所之外" in _CORRECTION_RULES_SUFFIX
+
+
+def test_rules_require_separate_entries_and_full_cascade():
+    """v2.14.13: new tasks must be standalone entries and must displace the
+    old arrangement as a whole, so the schedule never shows two overlapping
+    plans (买菜做大餐 + 点外卖吃外卖)."""
+    from astrbot_plugin_busy_schedule.core.corrector import _CORRECTION_RULES_SUFFIX
+
+    assert "6.1 新事项独立成条" in _CORRECTION_RULES_SUFFIX
+    assert "6.2 新计划顶掉旧安排" in _CORRECTION_RULES_SUFFIX
+    assert "6.3 一次改到位" in _CORRECTION_RULES_SUFFIX
+    assert "**独立活动**" in _CORRECTION_RULES_SUFFIX
+    assert "不允许新旧两套安排并存" in _CORRECTION_RULES_SUFFIX
+    assert "整批都不会生效" in _CORRECTION_RULES_SUFFIX
+
+
+def test_conf_schema_default_template_matches_rules_suffix():
+    """The shipped schema default and the code default must stay in sync.
+
+    The prompt is maintained in two places (``_CORRECTION_RULES_SUFFIX`` and
+    the ``correction_prompt_template`` schema default). They drifted before,
+    so the rule blocks are asserted here against the packaged schema file.
+    """
+    import json
+    from pathlib import Path
+
+    from astrbot_plugin_busy_schedule.core.corrector import _CORRECTION_RULES_SUFFIX
+
+    schema_path = Path(__file__).with_name("_conf_schema.json")
+    schema = json.loads(schema_path.read_text(encoding="utf-8-sig"))
+    default = schema["日程修正"]["items"]["correction_prompt_template"]["default"]
+    for marker in ("6.1 新事项独立成条", "6.2 新计划顶掉旧安排", "6.3 一次改到位"):
+        assert marker in default, marker
+        assert marker in _CORRECTION_RULES_SUFFIX, marker
 
 
 # ----------------------------------------------------------------------

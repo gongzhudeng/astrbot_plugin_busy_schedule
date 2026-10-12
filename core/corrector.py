@@ -19,7 +19,6 @@ from astrbot.api import logger
 from .calendar_context import build_calendar_context
 from .data import (
     ResolvedPeriod,
-    ScheduleData,
     ScheduleDataManager,
     parse_clock_time,
     parse_schedule_time,
@@ -64,6 +63,18 @@ _CORRECTION_RULES_SUFFIX = (
     "最后一条睡觉活动不可删除、不可改成普通活动。\n"
     "   活动之间保持首尾相接、不留新的时间空档：顺延或提前某个活动时，"
     "把受影响的后续活动逐个 update 顺延/提前，保持整体衔接；原有空档保持原样。\n"
+    "6.1 新事项独立成条：用户新提出的约定如果包含具体动作"
+    "（买菜、取件、做饭、运动、出门等），必须作为**独立活动**写进日程，"
+    "不要塞进某个现有活动的描述里、也不要和别的活动并成一条——"
+    "日程要能看出她此刻正处在哪一步，合并会让对话里说不清她在做什么。\n"
+    "6.2 新计划顶掉旧安排：当新事项与已有活动功能重叠时"
+    "（例如已约定在家做晚饭，就不能再有点外卖/取外卖；已约定出门买菜，"
+    "就不能再有别的出门安排），必须 remove 或改写成新的那条，"
+    "并把受影响的后续活动逐个顺延/提前保持首尾相接。"
+    "**不允许新旧两套安排并存**——改了一半、旧的还留着，比起不改更糟。\n"
+    "6.3 一次改到位：把需要联动修改的 remove/update/add 全部写进同一批 operations，"
+    "不要只改前一半。这批操作会被整体校验，"
+    "只要其中任何一条不合法，整批都不会生效；宁可少改也不要留半成品。\n"
     "7. 分类标签写在活动描述末尾，固定顺序"
     "【外出】→【用餐】→【主动分享】：【外出】=活动期间人在住所之外；"
     "【用餐】=实际进食正餐或加餐；"
@@ -594,86 +605,58 @@ class ScheduleCorrector:
         skipped = 0
         current = active.data
 
-        def _apply_per_operation(base: ScheduleData) -> ScheduleData:
-            """Fallback: apply one op at a time, skipping broken ones."""
-            nonlocal applied_changes, applied, skipped
-            cursor = base
-            for operation in operations:
-                try:
-                    result = editor.apply(
-                        cursor,
-                        [operation],
-                        owner_date=owner_date,
-                        schedule_time=schedule_time,
-                        now=now,
-                        confirmed_important=False,
-                    )
-                except ScheduleEditNeedsConfirmation as exc:
-                    skipped += 1
-                    logger.info(
-                        f"[BusySchedule] Correction skipped op needing confirmation: {exc}"
-                    )
-                    continue
-                except (
-                    ScheduleEditConflict,
-                    ScheduleEditError,
-                    ValueError,
-                    TypeError,
-                ) as exc:
-                    skipped += 1
-                    logger.warning(
-                        f"[BusySchedule] Correction skipped invalid op: {exc}"
-                    )
-                    continue
-                cursor = result.data
-                applied_changes.extend(result.changes)
-                applied += 1
-            return cursor
-
         try:
             # Linked plans (extend an outing, then shift the next slots) only
             # form a valid timeline when applied as one batch; applying them
             # one-by-one trips the overlap check on intermediate states.
+            #
+            # confirmed_important=True: the correction is an unattended task —
+            # nobody can answer a confirmation prompt, so leaving it False would
+            # silently skip any removal that hits IMPORTANT_ACTIVITY_KEYWORDS
+            # (v2.14.13 fix: an old 点外卖/取外卖 op was rejected this way, which
+            # broke the linked operations that followed and left a half-applied
+            # schedule). The manual edit tool keeps its own confirm flow.
             result = editor.apply(
                 active.data,
                 operations,
                 owner_date=owner_date,
                 schedule_time=schedule_time,
                 now=now,
-                confirmed_important=False,
+                confirmed_important=True,
             )
             current = result.data
             applied_changes.extend(result.changes)
             applied = len(operations)
         except ScheduleEditNeedsConfirmation as exc:
-            logger.info(
-                f"[BusySchedule] Correction batch needs confirmation ({exc}); "
-                "falling back to per-operation"
+            skipped = len(operations)
+            logger.warning(
+                f"[BusySchedule] Correction batch rejected (needs confirmation): {exc}"
             )
-            current = _apply_per_operation(active.data)
         except (
             ScheduleEditConflict,
             ScheduleEditError,
             ValueError,
             TypeError,
         ) as exc:
+            skipped = len(operations)
             logger.warning(
-                "[BusySchedule] Correction batch apply failed, falling back "
-                f"to per-operation: {exc}"
+                f"[BusySchedule] Correction batch apply failed: {exc}"
             )
-            current = _apply_per_operation(active.data)
 
+        # v2.14.13: never fall back to per-operation. Linked corrections form a
+        # valid timeline only as a whole; applying a partial subset used to
+        # leave a half-adjusted schedule (new activity added, the conflicting
+        # old one kept). Abandon the batch instead.
         if applied == 0:
             logger.warning(
-                "[BusySchedule] Correction produced no applicable operation; "
-                "schedule unchanged"
+                "[BusySchedule] Correction batch not applied; schedule unchanged"
             )
             return CorrectionOutcome(
                 triggered=True,
                 changed=False,
                 skipped=skipped,
                 reason=reason,
-                note="所有操作都被校验拒绝，日程保持原样",
+                note="操作未通过校验，日程保持原样",
             )
 
         self.data_mgr.set(owner_date, current)
