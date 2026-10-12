@@ -6,7 +6,7 @@ import random
 import re
 import time
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
@@ -582,21 +582,78 @@ class ScheduleGenerator:
     async def _get_recent_chats(
         self, umo: str | None = None, rounds: int | None = None
     ) -> str:
-        """Get recent conversation rounds for schedule generation."""
+        """Get recent conversation rounds for schedule generation.
+
+        v2.14.12: prefer LivingMemory's full message store. The AstrBot
+        conversation keeps only the most recent ~14 turns (max_context_length),
+        and media-heavy windows squeeze the actual text out of it (10-12: the
+        generator only saw 4 messages from a whole night). Fall back to the
+        AstrBot window when the sibling callback is unavailable.
+        """
         if rounds is None:
             rounds = int(self._cfg("reference_recent_count", 10))
         if not umo or rounds <= 0:
             return "无近期对话"
 
+        source = "livingmemory"
+        formatted = await self._get_recent_chats_via_livingmemory(umo, rounds)
+        if formatted is None:
+            source = "conversation"
+            formatted = await self._get_recent_chats_via_conversation(umo, rounds)
+
+        logger.info(
+            f"[BusySchedule] Recent chats selected: source={source}, "
+            f"rounds={rounds}, messages={len(formatted)}, "
+            f"chars={sum(len(item) for item in formatted)}"
+        )
+        return "\n".join(formatted) if formatted else "无近期对话记录"
+
+    async def _get_recent_chats_via_livingmemory(
+        self, umo: str, rounds: int
+    ) -> list[str] | None:
+        """Recent chats from the sibling full-history store (v2.14.12).
+
+        Returns None when the callback is missing or fails, so the caller can
+        fall back to the AstrBot conversation window. One round is roughly two
+        messages, so request about ``rounds * 2`` entries.
+        """
+        callback = getattr(self.context, "_livingmemory_get_attention_history", None)
+        if not callable(callback):
+            return None
+        try:
+            items = await callback(umo, "", max(2, int(rounds) * 2))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"[BusySchedule] LivingMemory recent chats unavailable: {exc}"
+            )
+            return None
+        if not isinstance(items, list) or not items:
+            return None
+        formatted: list[str] = []
+        for msg in items:
+            if not isinstance(msg, dict):
+                continue
+            text = str(msg.get("text") or "").strip()
+            if not text:
+                continue
+            if len(text) > 200:
+                text = text[:200] + "..."
+            speaker = "我" if msg.get("speaker") == "assistant" else "用户"
+            stamp = self._local_message_stamp(msg.get("at"))
+            prefix = f"[{stamp}] " if stamp else ""
+            formatted.append(f"{prefix}{speaker}: {text}")
+        return formatted or None
+
+    async def _get_recent_chats_via_conversation(
+        self, umo: str, rounds: int
+    ) -> list[str]:
+        """Legacy source: the AstrBot conversation window (~14 turns)."""
         contexts = await self._get_conversation_contexts(
             umo,
             rounds,
             include_datetime=True,
         )
-        if not contexts:
-            return "无近期对话记录"
-
-        formatted = []
+        formatted: list[str] = []
         for msg in contexts:
             raw_content = msg.get("content", "")
             content = extract_history_text(raw_content, exclude_datetime=True)
@@ -609,12 +666,18 @@ class ScheduleGenerator:
                 content = f"{content} {reminder}"
             speaker = "用户" if msg.get("role") == "user" else "我"
             formatted.append(f"{speaker}: {content}")
+        return formatted
 
-        logger.info(
-            f"[BusySchedule] Recent chats selected: rounds={rounds}, "
-            f"messages={len(contexts)}, chars={sum(len(item) for item in formatted)}"
-        )
-        return "\n".join(formatted) if formatted else "无近期对话记录"
+    @staticmethod
+    def _local_message_stamp(value: object) -> str:
+        """UTC ISO timestamp -> local 'MM-DD HH:MM' recency cue."""
+        try:
+            moment = datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return ""
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return moment.astimezone().strftime("%m-%d %H:%M")
 
     async def _get_conversation_contexts(
         self,
