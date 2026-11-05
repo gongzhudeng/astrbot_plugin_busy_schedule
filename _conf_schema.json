@@ -552,6 +552,17 @@
         },
         "default": 2
       },
+      "cycle_schedule_level": {
+        "description": "生理期对日程的影响程度",
+        "hint": "来自内心世界的生理期状态；轻=只影响饮食与作息，中=减少外出和剧烈活动，重=以休息为主。对方未配置生理期时不生效。",
+        "type": "string",
+        "options": [
+          "轻",
+          "中",
+          "重"
+        ],
+        "default": "轻"
+      },
       "generation_memory_max_chars": {
         "description": "单条记忆字数上限",
         "hint": "超出截断；最小 100",

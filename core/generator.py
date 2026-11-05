@@ -893,6 +893,45 @@ class ScheduleGenerator:
             chars = 500
         return items, chars
 
+    async def _get_cycle_context(
+        self, umo: str | None = None, target_date: date | None = None
+    ) -> str:
+        """读内心世界给出的生理期段落；没有就返回空串（不留占位）。
+
+        影响多深由本插件配置的 ``cycle_schedule_level`` 决定——日程归这里管，
+        对方只负责把「第几天」翻译成一句话。
+
+        回调不存在（没装 / 版本旧）、抛异常、或对方说 available=False，
+        一律当成「今天没有这回事」，不降级成任何默认值。
+        """
+        context = getattr(self, "context", None)
+        callback = getattr(context, "_emotion_state_cycle_context", None)
+        if not callable(callback):
+            return ""
+        # 面板上是中文（轻/中/重），顶层函数收的是英文档位；两种都认。
+        raw_level = str(self._cfg("cycle_schedule_level", "轻") or "轻").strip()
+        level = {"轻": "light", "中": "medium", "重": "heavy"}.get(
+            raw_level, raw_level.lower()
+        )
+        if level not in ("light", "medium", "heavy"):
+            level = "light"
+        try:
+            result = await callback(umo or "", target_date, level)
+        except Exception as exc:
+            logger.warning(f"[BusySchedule] Cycle context unavailable: {exc}")
+            return ""
+        if not isinstance(result, dict) or not result.get("available"):
+            return ""
+        line = str(result.get("line") or "").strip()
+        if not line:
+            return ""
+        # 整段作为占位符传入：没有内容时渲染成空串，模板里不会留下「暂无」这类噪音。
+        return (
+            "## 今日身体状态（软参考）\n"
+            f"{line}\n"
+            "只体现在活动内容和强度上，不要在日程文本里写「经期第几天」这类说明。"
+        )
+
     async def _get_attention_context(self, umo: str | None = None) -> str:
         """Read active attention items (user promises/requests), low-sensitivity."""
         callback = getattr(self.context, "_emotion_state_get_live_context", None)
@@ -958,6 +997,7 @@ class ScheduleGenerator:
             "attention_context": attention_context,
             "recent_memories": recent_memories,
             "memory_context": recent_memories,
+            "cycle_block": await self._get_cycle_context(umo, target_date),
             **creative,
             "history_schedules": self._get_history_schedules(target_date),
             "last_yesterday_activity": self._get_yesterday_last_activity(target_date),
@@ -999,6 +1039,12 @@ class ScheduleGenerator:
                 ]
             )
             prompt += "\n".join(fallback_lines)
+
+        # 生理期：模板里没写占位符时兜底追加。默认模板与用户的自定义模板是两份，
+        # 改默认那份对已自定义的人无效——兜底是这里唯一保证「升级后立刻生效」的路。
+        cycle_block = str(ctx.get("cycle_block") or "").strip()
+        if cycle_block and "{cycle_block}" not in template:
+            prompt += "\n\n" + cycle_block
 
         if extra:
             prompt += f"\n\n## 用户补充要求\n{extra}"
