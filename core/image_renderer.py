@@ -91,6 +91,7 @@ class BusyScheduleImageRenderer:
             date.fromisoformat(str(getattr(data, "date"))),
             local_now,
         )
+        self._sync_busy_flags(entries, getattr(data, "busy_periods", None))
         return self._render_schedule(
             data, local_now, is_busy, entries, source_note, calendar_context, theme
         )
@@ -204,6 +205,29 @@ class BusyScheduleImageRenderer:
                 }
             )
         return entries
+
+    @staticmethod
+    def _sync_busy_flags(entries: list[dict[str, Any]], periods: Any) -> None:
+        """Align rendered busy pills with the stored periods.
+
+        ``busy_periods`` is what the runtime actually acts on (message queuing,
+        prompt injection), so the image must not re-derive the flag from text
+        markers: a line whose marker is missing would otherwise show「可回复」
+        while the plugin stays busy.
+        """
+        if not periods:
+            return
+        flags: dict[tuple[str, str], bool] = {}
+        for period in periods:
+            start = str(getattr(period, "start_time", "") or "")
+            end = str(getattr(period, "end_time", "") or "")
+            if start:
+                flags[(start, end)] = bool(getattr(period, "is_busy", False))
+        for entry in entries:
+            end = "" if entry["end"] == "—" else str(entry["end"])
+            key = (str(entry["start"]), end)
+            if key in flags:
+                entry["busy"] = flags[key]
 
     @staticmethod
     def _outfit_items(data: Any) -> list[tuple[str, str]]:

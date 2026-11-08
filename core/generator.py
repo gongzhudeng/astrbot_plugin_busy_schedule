@@ -42,6 +42,19 @@ except ImportError:
 _CLASSIFICATION_TAGS: tuple[str, ...] = ("外出", "用餐", "主动分享")
 _TAG_ORDER: dict[str, int] = {tag: i for i, tag in enumerate(_CLASSIFICATION_TAGS)}
 
+# Legacy heuristic used only when a schedule line has no status marker and
+# strict parsing is disabled (last-resort fallback).
+_NON_BUSY_KEYWORDS: tuple[str, ...] = (
+    "刷手机",
+    "休息",
+    "散步",
+    "闲逛",
+    "发呆",
+    "赖床",
+    "看剧",
+    "玩",
+)
+
 # Canonical sleep tag instruction injected into repair prompts.
 _DSL_TAG_PROTOCOL = (
     "活动分类标签规则（必须遵循）：\n"
@@ -57,7 +70,7 @@ def _load_schema_defaults() -> dict:
     """Load default values from _conf_schema.json."""
     schema_path = Path(__file__).parent.parent / "_conf_schema.json"
     try:
-        with open(schema_path, encoding="utf-8") as f:
+        with open(schema_path, encoding="utf-8-sig") as f:
             schema = json.load(f)
         defaults = {}
         for _group_name, group in schema.items():
@@ -1100,8 +1113,18 @@ class ScheduleGenerator:
         if "主动分享" in class_tags and ("外出" in class_tags or "用餐" in class_tags):
             raise ValueError(f"【主动分享】不能与【外出】或【用餐】叠加：{activity}")
 
-    def _parse_busy_periods_from_schedule(self, schedule_text: str) -> list[BusyPeriod]:
-        """Parse ranged activities and one final open-ended sleep entry."""
+    def _parse_busy_periods_from_schedule(
+        self, schedule_text: str, strict: bool = True
+    ) -> list[BusyPeriod]:
+        """Parse ranged activities and one final open-ended sleep entry.
+
+        Args:
+            schedule_text: Schedule DSL text.
+            strict: Require an explicit 【忙碌】/【可回消息】 marker on every
+                ordinary activity.  When False, a missing marker falls back to
+                the legacy keyword heuristic (used only as a last resort so a
+                whole day never ends up without a schedule).
+        """
         schedule_text = self._normalize_schedule_text(schedule_text)
         lines = [line.strip() for line in schedule_text.splitlines() if line.strip()]
         line_pattern = re.compile(
@@ -1167,19 +1190,17 @@ class ScheduleGenerator:
                         "统一使用「小怡醒来」"
                     )
 
-            is_busy = marker != "可回消息"
-            if marker is None and not is_sleep:
-                non_busy_keywords = [
-                    "刷手机",
-                    "休息",
-                    "散步",
-                    "闲逛",
-                    "发呆",
-                    "赖床",
-                    "看剧",
-                    "玩",
-                ]
-                is_busy = not any(kw in activity_desc for kw in non_busy_keywords)
+            if is_sleep:
+                is_busy = True
+            elif marker is not None:
+                is_busy = marker != "可回消息"
+            elif strict:
+                raise ValueError(
+                    f"普通活动缺少状态标记【忙碌】或【可回消息】：{line}；"
+                    "分类标签不能代替状态标记，每行末尾必须写【忙碌】或【可回消息】"
+                )
+            else:
+                is_busy = not any(kw in activity_desc for kw in _NON_BUSY_KEYWORDS)
 
             periods.append(
                 BusyPeriod(
@@ -1196,6 +1217,25 @@ class ScheduleGenerator:
         if not periods[-1].is_open_sleep:
             raise ValueError("日程最后一项必须是没有结束时间的睡眠活动")
         return periods
+
+    @staticmethod
+    def _render_schedule_text(periods: list[BusyPeriod]) -> str:
+        """Rebuild schedule text so every line ends with its status marker.
+
+        Keeps answers/image rendering and runtime busy state on one truth: the
+        marker written here always matches ``BusyPeriod.is_busy``.
+        """
+        lines = []
+        for period in periods:
+            marker = "忙碌" if period.is_busy else "可回消息"
+            if period.is_open_sleep:
+                lines.append(f"{period.start_time} {period.activity}【{marker}】")
+            else:
+                lines.append(
+                    f"{period.start_time}-{period.end_time} "
+                    f"{period.activity}【{marker}】"
+                )
+        return "\n".join(lines)
 
     @staticmethod
     def _validate_period_order(
@@ -1378,7 +1418,7 @@ class ScheduleGenerator:
                             target_date,
                             schedule_time,
                         )
-                        result["schedule"] = normalized_schedule
+                        result["schedule"] = self._render_schedule_text(periods)
                         validation_error = ""
                         break
                     except (TypeError, ValueError) as exc:
@@ -1409,6 +1449,8 @@ class ScheduleGenerator:
                     "只有这一行可以省略结束时间\n"
                     "如果普通活动缺少结束时间，必须为它补上合理的结束时间，"
                     "不要通过修改【忙碌/可回消息】来规避错误。\n"
+                    "每行最后一个方括号必须是【忙碌】或【可回消息】，"
+                    "不能以【外出】/【用餐】/【主动分享】结尾。\n"
                     + _DSL_TAG_PROTOCOL
                     + "保留原有活动内容和明确计划，保留原有分类标签，只调整不符合协议的格式。\n"
                     "删除所有说明、标题、注释，包括任何“未标注时段”说明行。\n\n"
@@ -1424,6 +1466,30 @@ class ScheduleGenerator:
                     repair_prompt, repair_providers, sid
                 )
                 result = _extract_json_obj(content)
+
+            if validation_error and result and isinstance(
+                result.get("schedule"), str
+            ):
+                # Last resort: keep the day usable instead of failing outright.
+                # Missing markers fall back to the legacy keyword heuristic; the
+                # rebuilt text stays consistent with the runtime busy state.
+                try:
+                    normalized_schedule = self._normalize_schedule_text(
+                        result["schedule"]
+                    )
+                    periods = self._parse_busy_periods_from_schedule(
+                        normalized_schedule, strict=False
+                    )
+                    self._validate_period_order(periods, target_date, schedule_time)
+                    result["schedule"] = self._render_schedule_text(periods)
+                    logger.warning(
+                        "[BusySchedule] Strict schedule validation failed after "
+                        f"{self._FORMAT_REPAIR_ATTEMPTS} repair attempt(s); "
+                        f"kept with lenient parsing ({validation_error})"
+                    )
+                    validation_error = ""
+                except (TypeError, ValueError):
+                    pass
 
             if not result or not result.get("schedule") or validation_error:
                 reason = validation_error or "缺少有效 schedule"
